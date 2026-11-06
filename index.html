@@ -15,7 +15,7 @@ header .host{color:#9ca3af;font-size:12px}
 header nav{margin-left:auto;display:flex;gap:6px}
 header nav button{background:transparent;color:#cbd5e1;border:1px solid #374151;border-radius:8px;padding:6px 14px;cursor:pointer}
 header nav button.on{background:#fff;color:#111827;border-color:#fff}
-main{max-width:1180px;margin:18px auto;padding:0 14px}
+main{max-width:1360px;margin:18px auto;padding:0 14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
 .card h2{font-size:15px;margin:0 0 12px}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
@@ -52,6 +52,9 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
 .ck input{margin:0}
+.tag{white-space:nowrap}th{white-space:nowrap}td.mono{white-space:nowrap}
+.bar{height:5px;background:#eef2f7;border-radius:3px;overflow:hidden;margin:3px 0;width:100px}.bar i{display:block;height:100%}
+.dupbox{margin-top:6px;font-size:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:6px 8px}.dupbox select{margin-top:4px;width:100%;font-size:12px;padding:4px 6px}
 .warnbox{background:#fff7ed;border:1px solid #fdba74;color:#7c2d12;border-radius:12px;padding:14px 16px;margin-bottom:16px;line-height:1.7}
 tbody.grp{border-bottom:2px solid #dbe2ec}tbody.grp tr.sub td{border-bottom:1px dashed var(--line)}tbody.grp tr.sub{background:#fbfcfe}.branch{color:#94a3b8;margin-right:6px}.sib{font-size:11px;color:var(--muted);margin-top:2px}
 .kv{display:grid;grid-template-columns:70px 1fr auto;gap:6px 8px;align-items:center;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
@@ -125,6 +128,8 @@ function renderCreate(){
       <label class="ck"><input type="checkbox" value="socks">SOCKS5</label></span></label>
     <label>到期 <select id="days"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option><option value="0">永久</option><option value="custom">指定日期…</option></select></label>
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
+    <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
+    <label>设备数（0=不限）<input id="qdev" type="number" min="0" step="1" value="${esc(saved.qdev??0)}" style="width:110px"></label>
   </div>
   <div style="margin-top:12px"><textarea id="txt" placeholder="每行一条落地，支持：
 socks5://账号:密码@IP:端口
@@ -145,23 +150,36 @@ function selProtos(sel="#protos"){return [...document.querySelectorAll(sel+" inp
 function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"){const d=$("#cdate").value;if(!d)throw new Error("请选择到期日期");return Math.floor(new Date(d).getTime()/1000)}return Math.floor(Date.now()/1000)+parseInt(v)*86400}
 async function doPreview(){
   const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
-  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value}));
+  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value,qgb:$("#qgb").value,qdev:$("#qdev").value}));
   try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;H("#resbox","");renderPreview()}
   catch(e){toast(e.message)}finally{const bb=$("#pv");if(bb){bb.disabled=false;bb.textContent="解析预览"}}
 }
+function pvMode(x){if(x.mode)return x.mode;return (x.dup||[]).length?"attach:"+x.dup[0].tag:"new"}
 function renderPreview(){
   const it=state.preview||[];const good=it.filter(x=>!x.error).length;
   if(!$("#pvbox"))return;
-  $("#pvbox").innerHTML=`<div class="card"><h2>2. 确认线路（${good} 条可建${it.length-good?`，${it.length-good} 条有误`:""}）</h2>
+  it.forEach(x=>{if(!x.error)x.mode=pvMode(x)});
+  const cnt=m=>it.filter(x=>!x.error&&(m==="attach"?x.mode.startsWith("attach:"):x.mode===m)).length;
+  const nNew=cnt("new"),nAtt=cnt("attach"),nDup=it.filter(x=>!x.error&&((x.dup||[]).length||x.dup_in_batch!==undefined)).length;
+  $("#pvbox").innerHTML=`<div class="card"><h2>2. 确认线路（${good} 条可用${it.length-good?`，${it.length-good} 条有误`:""}${nDup?`，<span style="color:var(--warn)">${nDup} 条落地重复</span>`:""}）</h2>
   <div style="overflow:auto"><table><tr><th>#</th><th>节点名（可改）</th><th>落地</th><th class="hide-sm">类型</th><th>检测</th></tr>
   ${it.map((x,i)=>x.error?`<tr><td>${i+1}</td><td colspan="4"><span class="err">✗ ${esc(x.error)}</span> <span class="mono muted">${esc(x.raw)}</span></td></tr>`:
-  `<tr><td>${i+1}</td><td><input data-i="${i}" class="nm" value="${esc(x.name)}" style="width:100%;min-width:180px"></td>
+  `<tr><td>${i+1}</td><td><input data-i="${i}" class="nm" value="${esc(x.name)}" style="width:100%;min-width:180px" ${x.mode==="new"?"":"disabled"}>
+   ${(x.dup||[]).length||x.dup_in_batch!==undefined?`<div class="dupbox">
+     ${(x.dup||[]).length?`⚠ 这个落地已被「${esc(x.dup[0].tag)}」使用（${x.dup[0].types.map(y=>esc(protoName[y]||y)).join("、")}）${x.dup.length>1?` 等 ${x.dup.length} 条线路`:""}`:""}
+     ${x.dup_in_batch!==undefined?`⚠ 和本次第 ${x.dup_in_batch} 行是同一个落地`:""}
+     <select data-m="${i}">
+       ${(x.dup||[]).map(d=>`<option value="attach:${esc(d.tag)}" ${x.mode==="attach:"+d.tag?"selected":""}>挂到「${esc(d.tag)}」上（加协议，共用落地，到期跟原线路）</option>`).join("")}
+       <option value="new" ${x.mode==="new"?"selected":""}>新建独立线路（单独的出站和到期）</option>
+       <option value="skip" ${x.mode==="skip"?"selected":""}>跳过这条</option>
+     </select></div>`:""}</td>
    <td class="mono">${esc(x.outbound.server)}:${esc(x.outbound.server_port)}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
    <td class="hide-sm">${esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
   </table></div>
-  <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${good?"":"disabled"}>创建 ${good} 条中转</button>
-  <span class="hint">创建后会自动重启一次 s-ui 让路由生效，所有线路约断 3 秒。</span></div></div>`;
+  <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${nNew+nAtt?"":"disabled"}>${nNew?`新建 ${nNew} 条`:""}${nNew&&nAtt?" + ":""}${nAtt?`挂到原线路 ${nAtt} 条`:""}${!nNew&&!nAtt?"没有要处理的":""}</button>
+  <span class="hint">完成后会自动重启 s-ui 让路由生效，所有线路约断 3 秒。</span></div></div>`;
   document.querySelectorAll(".nm").forEach(n=>n.oninput=()=>{state.preview[n.dataset.i].name=n.value.trim()});
+  document.querySelectorAll("[data-m]").forEach(s=>s.onchange=()=>{state.preview[s.dataset.m].mode=s.value;renderPreview()});
   $("#pchk").onclick=preCheck;$("#mk").onclick=doCreate;
 }
 function pcHtml(c){if(!c)return '<span class="muted">-</span>';if(c==="..")return '<span class="spin"></span>';return c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`}
@@ -174,17 +192,26 @@ async function preCheck(){
 }
 async function doCreate(){
   let expiry;try{expiry=expiryTs()}catch(e){return toast(e.message)}
-  const items=state.preview.filter(x=>!x.error&&x.name);
+  const valid=state.preview.filter(x=>!x.error&&x.name);
+  const items=valid.filter(x=>x.mode==="new");
+  const attach=[...new Set(valid.filter(x=>x.mode.startsWith("attach:")).map(x=>x.mode.slice(7)))];
   const protos=selProtos();if(!protos.length)return toast("请至少勾选一个入站协议");
+  if(!items.length&&!attach.length)return toast("没有要处理的线路");
   const badN=Object.values(state.pvcheck||{}).filter(c=>c&&c!==".."&&!c.ok).length;
-  if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起创建。\n\n`:""}确定创建 ${items.length} 条落地 × ${protos.length} 种协议 = ${items.length*protos.length} 个节点？\n创建后会重启 s-ui 让路由生效，所有线路约断 3 秒。`))return;
-  const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
-  try{const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim()});
-    state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
+  const lines=[];if(items.length)lines.push(`新建 ${items.length} 条落地 × ${protos.length} 种协议 = ${items.length*protos.length} 个节点`);
+  if(attach.length)lines.push(`给 ${attach.length} 条已有线路加上所选协议（已有的协议自动跳过）`);
+  if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起处理。\n\n`:""}${lines.join("\n")}\n\n完成后会重启 s-ui 让路由生效，所有线路约断 3 秒。确定？`))return;
+  const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 处理中…';
+  try{let results=[],core="ok";
+    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0});results=results.concat(r.results);core=r.core}
+    let skipped=0;
+    if(attach.length){const r=await api("add_protocol",{tags:attach,protocols:protos});skipped=r.results.filter(z=>z.skipped).length;results=results.concat(r.results.filter(z=>!z.skipped));if(r.core!=="ok")core=r.core}
+    state.results=results;const ok=results.filter(x=>x.ok).length;
+    if(!results.length&&skipped){toast(`原线路已经有所选的协议，没有新增节点（跳过 ${skipped} 个）`,6000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}return}
     state.preview=null;H("#pvbox","");state.text="";const tx=$("#txt");if(tx)tx.value="";  // 防止同一批重复创建
-    toast(`成功 ${ok} 个节点${ok<r.results.length?`，失败 ${r.results.length-ok} 个`:""}${coreMsg(r.core)}`,5000);
-    if(state.tab==="create")renderResults();else toast(`成功 ${ok} 个节点${coreMsg(r.core)}，回到「一键中转」查看链接`,6000)}
-  catch(e){toast(e.message,5000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="创建"}}
+    toast(`成功 ${ok} 个节点${ok<results.length?`，失败 ${results.length-ok} 个`:""}${skipped?`，原线路已有的协议跳过 ${skipped} 个`:""}${coreMsg(core)}`,5000);
+    if(state.tab==="create")renderResults();else toast(`成功 ${ok} 个节点${coreMsg(core)}，回到「一键中转」查看链接`,6000)}
+  catch(e){toast(e.message,5000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}}
 }
 async function renderResults(){
   const rs=state.results||[];const ok=rs.filter(x=>x.ok);
@@ -202,6 +229,14 @@ async function renderResults(){
   document.querySelectorAll("[data-dl]").forEach(b=>b.onclick=()=>downloadQR(ok[b.dataset.dl].name,ok[b.dataset.dl].svg,ok[b.dataset.dl].port));
   $("#dlall").onclick=()=>downloadAllZip(ok.map(x=>({name:x.name,svg:x.svg,port:x.port,uri:(x.links||[])[0]})),($("#cust")&&$("#cust").value.trim()||"中转")+"_二维码");
 }
+const fmtB=b=>{b=b||0;const u=["B","KB","MB","GB","TB"];let i=0;while(b>=1024&&i<4){b/=1024;i++}return (i?b.toFixed(b<10?2:1):b)+" "+u[i]};
+const okeyOf=r=>r.outbound_tag||("#"+r.tag);
+function trafficCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},used=g.reduce((s,r)=>s+(r.up||0)+(r.down||0),0),q=(L.quota_gb||0)*1073741824;
+  const pct=q?Math.min(100,used/q*100):0,col=L.over||pct>=100?"var(--bad)":pct>=80?"var(--warn)":"var(--ok)";
+  return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}`}
+function deviceCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
+  const tip=(O.active||[]).map(ip=>ip+((O.rejected||[]).includes(ip)?"（被拒）":"")).join("\n");
+  return `<span title="${esc(tip)}" class="tag ${lim&&O.full?"warn":n?"ok":"gray"}">${n}${lim?` / ${lim}`:""} 台</span>${(O.rejected||[]).length?`<div class="sib" style="color:var(--bad)">拒绝 ${O.rejected.length} 个新设备</div>`:""}`}
 const safeName=n=>String(n||"qr").replace(/[\\/:*?"<>|\r\n]/g,"_").trim()||"qr";
 function qrPng(name,svg,port){
   return new Promise(res=>{
@@ -260,7 +295,7 @@ async function downloadAllZip(items,zipName){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   H("#secbox",n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
@@ -302,10 +337,10 @@ function drawTable(){
   const nsel=state.sel.size;const selG=all.filter(g=>g.some(r=>state.sel.has(r.tag))).length;
   $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条线路（${nodes} 个节点）${nsel?`，已选 ${selG} 条`:""}</span>
    <button class="sm" id="selall">全选当前搜索</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
-   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
+   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
    <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
-  $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>检测</th><th>操作</th></tr>
+  $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>流量</th><th>设备</th><th>检测</th><th>操作</th></tr>
   ${gs.map(g=>{const n=g.length,m=g[0],on=g.every(r=>state.sel.has(r.tag));
    return `<tbody class="grp">${g.map((r,i)=>`<tr class="${i?"sub":""}">
   ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
@@ -313,12 +348,14 @@ function drawTable(){
   <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
   ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
+  ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
   ${i===0?`<td rowspan="${n}">${pcHtml(state.checks[r.tag])}</td>`:""}
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
-  <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>`:""}
+  <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
+  <button class="sm" data-a="lim" data-t="${esc(r.tag)}">限额</button>`:""}
   <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</tbody>`}).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
   if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
@@ -326,10 +363,10 @@ function drawTable(){
   $("#selall").onclick=()=>{all.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable()};
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
     const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
-    $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());
+    $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -407,6 +444,25 @@ async function showNew(ok,bad){
   for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;H("#nq"+i,q.svg)}catch(e){}}
   document.querySelectorAll("[data-ndl]").forEach(b=>b.onclick=()=>{const x=ok[b.dataset.ndl];downloadQR(x.name,x.svg,x.port)});
 }
+function limitDlg(tags){
+  const gs=[];const seen=new Set();for(const t of tags){const g=groupOf(t);if(!g.length)continue;const k=okeyOf(g[0]);if(!seen.has(k)){seen.add(k);gs.push(g)}}
+  if(!gs.length)return;
+  const L=gs.length===1?((state.limits||{})[okeyOf(gs[0][0])]||{}):{};
+  const used=gs.length===1?gs[0].reduce((s,r)=>s+(r.up||0)+(r.down||0),0):null;
+  modal(`<h2 style="margin-top:0">限额（${gs.length} 条线路）</h2>
+  <p class="hint">按整条线路算：同一落地的几个协议节点流量合计、设备合计。流量用完整条线路自动停用；设备满了以后新设备连不上，旧设备断开约 3～4 分钟后释放名额。设备按客户的 IP 地址算，同一网络下的多台电脑算 1 台。</p>
+  ${used!==null?`<p>当前已用：<b>${fmtB(used)}</b>${L.over?' <span class="tag bad">超流量，已停用</span>':""}</p>`:""}
+  <div class="row"><label>流量上限 GB（0=不限）<input id="lq" type="number" min="0" step="1" value="${gs.length===1?(L.quota_gb||0):""}" placeholder="不修改" style="width:140px"></label>
+  <label>设备数（0=不限）<input id="ld" type="number" min="0" step="1" value="${gs.length===1?(L.devices||0):""}" placeholder="不修改" style="width:120px"></label></div>
+  <div class="row" style="margin-top:14px"><button class="pri" id="lok">保存</button><button id="lrst">流量清零</button><button id="lcl">取消</button></div>`);
+  $("#lcl").onclick=closeModal;
+  const tagsOf=()=>gs.map(g=>g[0].tag);
+  $("#lok").onclick=async()=>{const body={tags:tagsOf()};if($("#lq").value!=="")body.quota_gb=parseFloat($("#lq").value)||0;if($("#ld").value!=="")body.devices=parseInt($("#ld").value)||0;
+    if(!("quota_gb" in body)&&!("devices" in body))return toast("没有要修改的");
+    try{await api("set_limits",body);closeModal();toast("已保存限额");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+  $("#lrst").onclick=async()=>{if(!confirm(`把 ${gs.length} 条线路的已用流量清零？超流量停用的会自动恢复（未过期的）。`))return;
+    try{await api("reset_traffic",{tags:tagsOf()});closeModal();toast("已清零流量");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+}
 function renewDlg(tags){
   const gmap=new Map();for(const t of expand(tags)){const r=byTag(t);if(r&&r.client_id){const k=gkey(r);if(!gmap.has(k))gmap.set(k,[]);gmap.get(k).push(r)}}
   const gs=[...gmap.values()];if(!gs.length)return toast("所选线路没有用户");
@@ -416,6 +472,7 @@ function renewDlg(tags){
   <div class="row"><label>方式<select id="rm"><option value="add">在原到期时间上延长</option><option value="set">设为指定日期</option><option value="forever">改为永久</option></select></label>
   <label id="ral">延长天数<input id="rd" type="number" value="30" min="1" style="width:100px"></label>
   <label id="rsl" style="display:none">到期日期<input id="rdt" type="datetime-local"></label></div>
+  <label class="ck" style="margin-top:8px"><input type="checkbox" id="rrst" checked>同时清零流量（流量限额重新计算）</label>
   <p class="hint">从这组里最晚的到期时间开始延长；已过期的从今天开始算；续期后自动重新启用。</p>
   <div class="row" style="margin-top:12px"><button class="pri" id="rnok">确定</button><button id="rncl">取消</button></div>`);
   const sync=()=>{const v=$("#rm").value;$("#ral").style.display=v==="add"?"flex":"none";$("#rsl").style.display=v==="set"?"flex":"none"};$("#rm").onchange=sync;
@@ -427,7 +484,7 @@ function renewDlg(tags){
         else if(mode==="set"){if(!$("#rdt").value)throw new Error("请选择日期");e=Math.floor(new Date($("#rdt").value).getTime()/1000)}
         else{const base=g.some(r=>!r.expiry)?now:Math.max(...g.map(r=>r.expiry));e=Math.max(base,now)+parseInt($("#rd").value||"0")*86400}
         for(const r of g)(byExp[e]=byExp[e]||new Set()).add(r.client_id)}
-      let fail=0;for(const[e,ids]of Object.entries(byExp)){const x=await api("update_clients",{client_ids:[...ids],expiry:parseInt(e)});fail+=x.results.filter(z=>!z.ok).length}
+      let fail=0;for(const[e,ids]of Object.entries(byExp)){const x=await api("update_clients",{client_ids:[...ids],expiry:parseInt(e),reset_traffic:$("#rrst").checked});fail+=x.results.filter(z=>!z.ok).length}
       closeModal();toast(fail?`${fail} 个失败`:`已续期 ${nn} 个节点`);await loadRelays();drawTable()}catch(e){toast(e.message)}};
 }
 async function setEnable(tags,en){

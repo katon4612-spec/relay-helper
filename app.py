@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -609,13 +609,46 @@ def op_preview(body):
         except Exception as e:
             items.append({"raw": raw, "error": str(e)})
     geo = geo_lookup([it.get("ip") for it in items if not it.get("error")])
-    for it in items:
+    # 已有线路用过的落地：按「落地地址 + 端口 + 账号（或 uuid/密码）」判断是不是同一个落地
+    existing = {}
+    for g in groups_by_landing(build_relays(data), data):
+        existing.setdefault(g["key"], []).append(g)
+    seen = {}
+    for i, it in enumerate(items):
         if it.get("error"):
             continue
         it["country"] = geo.get(it["ip"], "")
         base = it["name_override"] or ("%s%s%s" % (it["country"], customer, it["host"]))
         it["name"] = unique_name(base, taken)
+        k = landing_key(it["outbound"])
+        it["dup"] = [{"tag": g["main"], "types": g["types"], "tags": g["tags"]} for g in existing.get(k, [])]
+        if k in seen:
+            it["dup_in_batch"] = seen[k] + 1  # 与本次粘贴的第几行重复（从 1 数）
+        else:
+            seen[k] = i
     return {"items": items}
+
+
+def landing_key(ob):
+    """同一个落地的判断依据：类型 + 地址 + 端口 + 身份（账号 / uuid / 密码）。"""
+    ident = ob.get("username") or ob.get("uuid") or ob.get("password") or ""
+    return "%s|%s|%s|%s" % (ob.get("type"), str(ob.get("server", "")).lower(), ob.get("server_port"), ident)
+
+
+def groups_by_landing(rows, data):
+    """把线路按落地出站分组，返回 [{key, main, tags, types}]。"""
+    obs = {o.get("tag"): o for o in data.get("outbounds") or []}
+    by_out = {}
+    for r in rows:
+        if r.get("outbound_tag") in obs:
+            by_out.setdefault(r["outbound_tag"], []).append(r)
+    order = {"vless": 0, "hysteria2": 1, "socks": 2}
+    out = []
+    for ot, rs in by_out.items():
+        rs.sort(key=lambda r: (order.get(r["type"], 9), r.get("inbound_id") or 0))
+        out.append({"key": landing_key(obs[ot]), "main": rs[0]["tag"], "tags": [r["tag"] for r in rs],
+                    "types": sorted({r["type"] for r in rs}, key=lambda x: order.get(x, 9))})
+    return out
 
 
 PROTO_SUFFIX = {"vless": "", "hysteria2": "-HY2", "socks": "-S5"}
@@ -755,6 +788,8 @@ def op_create(body):
                 new_outbounds.append(base)
             results.extend(made)
         core = _apply_rules(results, new_outbounds)
+        init_group_limits([o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)],
+                          body.get("quota_gb"), body.get("devices"))
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
@@ -814,8 +849,10 @@ def client_links(cid):
 
 def op_list(body):
     data = SUI.load_all()
+    with LIM_LOCK:
+        lim = json.loads(json.dumps(LIMITS))
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
-            "unprotected": [t for t, _ in unprotected_inbounds(data)]}
+            "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE)}
 
 
 def op_links(body):
@@ -928,10 +965,21 @@ def op_update_clients(body):
                         c["enable"] = True
                 if "enable" in body:
                     c["enable"] = bool(body["enable"])
+                if body.get("reset_traffic"):
+                    c["up"] = c["down"] = 0
                 SUI.save("clients", "edit", c)
                 out.append({"client_id": cid, "ok": True})
             except Exception as e:
                 out.append({"client_id": cid, "ok": False, "error": str(e)})
+    if body.get("reset_traffic"):  # 续期并清零流量：清掉这些线路的“超流量”标记
+        data = SUI.load_all()
+        ids = set(ids)
+        keys = {okey_of(r) for r in build_relays(data) if r.get("client_id") in ids}
+        with LIM_LOCK:
+            for k in keys:
+                if (LIMITS.get(k) or {}).get("over"):
+                    LIMITS[k]["over"] = False
+            save_limits()
     return {"results": out}
 
 
@@ -994,6 +1042,7 @@ def op_delete(body):
                 if ot and ot not in still_used and ot != "direct":
                     try:
                         SUI.save("outbounds", "del", ot)
+                        drop_group_limits([ot])
                     except Exception:
                         pass
     return {"results": out, "core": core}
@@ -1057,6 +1106,352 @@ OPS = {
     "check": op_check, "check_raw": op_check_raw, "replace": op_replace, "add_protocol": op_add_protocol,
     "update_clients": op_update_clients, "secure": op_secure, "delete": op_delete, "links": op_links, "qr": op_qr,
 }
+
+# ---------------------------------------------------- 流量限额 / 设备数限制 --
+# 每条线路（同一个落地出站的几个协议节点）一组：流量合计、设备数合计。
+LIMITS_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "limits.json")
+LIM_LOCK = threading.Lock()
+LIMITS = {}          # okey -> {"quota_gb": float, "devices": int, "over": bool}
+ONLINE = {}          # okey -> {"active": [ip...], "allowed": [ip...], "full": bool}
+DEVICE_IDLE = 180    # 设备断开多少秒后释放名额
+SEEN = {}            # okey -> {ip: [first_seen, last_seen]}
+ALLOWED = {}         # okey -> [ip...]（按先来后到）
+CHAIN = "RELAYHELPER"
+_last_rules = {"4": None, "6": None}
+
+
+def load_limits():
+    global LIMITS
+    try:
+        with open(LIMITS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        LIMITS = d if isinstance(d, dict) else {}
+    except Exception:
+        LIMITS = {}
+
+
+def save_limits():
+    tmp = LIMITS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(LIMITS, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, LIMITS_PATH)
+
+
+def okey_of(row):
+    return row.get("outbound_tag") or ("#" + row["tag"])
+
+
+def group_rows(rows):
+    g = {}
+    for r in rows:
+        g.setdefault(okey_of(r), []).append(r)
+    return g
+
+
+def group_usage(rs):
+    return sum((r.get("up") or 0) + (r.get("down") or 0) for r in rs)
+
+
+def set_group_enable(rs, enable):
+    for r in rs:
+        if not r.get("client_id"):
+            continue
+        try:
+            c = full_client(r["client_id"])
+            if bool(c.get("enable")) != enable:
+                c["enable"] = enable
+                SUI.save("clients", "edit", c)
+        except Exception as e:
+            sys.stderr.write("set_group_enable: %s\n" % e)
+
+
+def _hex_ip(h):
+    if len(h) == 8:
+        return socket.inet_ntop(socket.AF_INET, bytes.fromhex(h)[::-1])
+    b = b"".join(bytes.fromhex(h[i:i + 8])[::-1] for i in range(0, 32, 8))
+    ip = socket.inet_ntop(socket.AF_INET6, b)
+    return ip[7:] if ip.startswith("::ffff:") and "." in ip else ip
+
+
+def tcp_peers(ports):
+    """{本地端口: {对端IP}}。除监听外的所有状态都算（含刚关闭的 TIME_WAIT），短连接也不会漏掉。"""
+    out = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    p = line.split()
+                    if p[3] == "0A" or p[2].startswith("00000000:") or p[2].startswith("0" * 32 + ":"):
+                        continue
+                    lip, lport = p[1].split(":")
+                    lport = int(lport, 16)
+                    if lport in ports:
+                        rip = _hex_ip(p[2].split(":")[0])
+                        out.setdefault(lport, set()).add(rip)
+        except Exception:
+            pass
+    return out
+
+
+def udp_peers(ports):
+    """hysteria2 走 UDP：从连接跟踪表里找对端 IP。"""
+    out = {}
+    lines = []
+    try:
+        with open("/proc/net/nf_conntrack") as f:
+            lines = f.readlines()
+    except Exception:
+        if shutil.which("conntrack"):
+            try:
+                lines = subprocess.run(["conntrack", "-L", "-p", "udp"], capture_output=True, text=True, timeout=10).stdout.splitlines()
+            except Exception:
+                lines = []
+    for line in lines:
+        if " udp " not in " %s " % line and "udp" not in line.split()[:3]:
+            continue
+        m_src = re.search(r"src=(\S+)", line)
+        m_dp = re.search(r"dport=(\d+)", line)
+        if m_src and m_dp and int(m_dp.group(1)) in ports:
+            out.setdefault(int(m_dp.group(1)), set()).add(m_src.group(1))
+    return out
+
+
+LOG_RE = re.compile(r"inbound/[\w-]+\[(.+?)\]\s*inbound connection from \[?([0-9a-fA-F:.]+?)\]?:\d+\s*$")
+_log_prev = None
+
+
+def log_peers(tags):
+    """
+    从 s-ui 内存日志里找「某 IP 连入某节点」（hysteria2 等 UDP 协议用这个，系统连接表看不到对端）。
+    只统计上次巡检之后新出现的日志行；第一次只记位置。需要 s-ui 日志级别为 info 或更详细。
+    返回 {tag: {ip}}
+    """
+    global _log_prev
+    out = {}
+    if not tags:
+        return out
+    try:
+        lines = SUI.call("GET", "logs", params={"c": "5000", "l": "info"}, timeout=15) or []
+    except Exception:
+        return out
+    cur = set(lines)
+    if _log_prev is None:
+        _log_prev = cur
+        return out
+    for line in lines:
+        if line in _log_prev:
+            continue
+        m = LOG_RE.search(line)
+        if m and m.group(1) in tags:
+            ip = m.group(2)
+            if ip.startswith("::ffff:"):
+                ip = ip[7:]
+            out.setdefault(m.group(1), set()).add(ip)
+    _log_prev = cur
+    return out
+
+
+def _ipt(v):
+    return "iptables" if v == "4" else "ip6tables"
+
+
+def apply_firewall(blocks):
+    """blocks: [(proto, port, [允许的IP])]：这些端口只放行列出的 IP，其余拒绝。"""
+    for v in ("4", "6"):
+        if not shutil.which(_ipt(v)) or not shutil.which(_ipt(v) + "-restore"):
+            continue
+        lines = ["*filter", ":%s - [0:0]" % CHAIN]
+        for proto, port, allowed in blocks:
+            for ip in allowed:
+                if (":" in ip) == (v == "6"):
+                    lines.append("-A %s -p %s --dport %d -s %s -j RETURN" % (CHAIN, proto, port, ip))
+            if proto == "tcp":
+                lines.append("-A %s -p tcp --dport %d -j REJECT --reject-with tcp-reset" % (CHAIN, port))
+            else:
+                lines.append("-A %s -p udp --dport %d -j DROP" % (CHAIN, port))
+        lines.append("COMMIT")
+        rules = "\n".join(lines) + "\n"
+        try:
+            # 自己的链挂在 INPUT 最前面；只改这条链，不碰系统原有规则（ufw/firewalld 重载后会自动补回）
+            subprocess.run([_ipt(v), "-N", CHAIN], capture_output=True)
+            if subprocess.run([_ipt(v), "-C", "INPUT", "-j", CHAIN], capture_output=True).returncode != 0:
+                subprocess.run([_ipt(v), "-I", "INPUT", "1", "-j", CHAIN], capture_output=True)
+                _last_rules[v] = None
+            if rules != _last_rules[v]:
+                r = subprocess.run([_ipt(v) + "-restore", "-n"], input=rules, text=True, capture_output=True)
+                if r.returncode == 0:
+                    _last_rules[v] = rules
+                else:
+                    sys.stderr.write("%s-restore: %s\n" % (_ipt(v), r.stderr.strip()))
+        except Exception as e:
+            sys.stderr.write("apply_firewall: %s\n" % e)
+
+
+def monitor_once():
+    data = SUI.load_all()
+    rows = build_relays(data)
+    groups = group_rows(rows)
+    now = time.time()
+    with LIM_LOCK:
+        lim = json.loads(json.dumps(LIMITS))
+    # ---- 流量：整条线路合计，超了整组停用
+    changed = False
+    for k, L in lim.items():
+        rs = groups.get(k)
+        if not rs:
+            continue
+        q = float(L.get("quota_gb") or 0)
+        if q > 0 and group_usage(rs) >= q * 1024 ** 3:
+            if any(r.get("enable") for r in rs):
+                with LOCK:
+                    set_group_enable(rs, False)
+                sys.stderr.write("线路 %s 流量用完，已停用\n" % k)
+            if not L.get("over"):
+                with LIM_LOCK:
+                    LIMITS.setdefault(k, {})["over"] = True
+                changed = True
+    if changed:
+        with LIM_LOCK:
+            save_limits()
+    # ---- 设备：整条线路所有端口上的不同客户 IP
+    ports = {}
+    for k, rs in groups.items():
+        for r in rs:
+            if r.get("port"):
+                ports[int(r["port"])] = (k, "udp" if r["type"] in ("hysteria2", "hysteria", "tuic") else "tcp")
+    tp = tcp_peers({p for p, (k, pr) in ports.items() if pr == "tcp"})
+    up = udp_peers({p for p, (k, pr) in ports.items() if pr == "udp"})
+    udp_tags = {r["tag"]: okey_of(r) for r in rows if r.get("port") and ports.get(int(r["port"]), ("", ""))[1] == "udp"}
+    lp = log_peers(set(udp_tags))
+    seen_now = {}
+    keep = lambda i: i not in ("127.0.0.1", "::1") or CFG.get("count_loopback")
+    for p, ips in list(tp.items()) + list(up.items()):
+        seen_now.setdefault(ports[p][0], set()).update(i for i in ips if keep(i))
+    for tag, ips in lp.items():
+        seen_now.setdefault(udp_tags[tag], set()).update(i for i in ips if keep(i))
+    blocks, online = [], {}
+    for k, rs in groups.items():
+        S = SEEN.setdefault(k, {})
+        for ip in seen_now.get(k, ()):
+            S.setdefault(ip, [now, now])[1] = now
+        for ip in [ip for ip, (f, l) in S.items() if now - l > int(CFG.get("device_idle", DEVICE_IDLE))]:
+            del S[ip]
+        active = sorted(S, key=lambda ip: S[ip][0])
+        n = int((lim.get(k) or {}).get("devices") or 0)
+        A = [ip for ip in ALLOWED.get(k, []) if ip in S]
+        if n > 0:
+            for ip in active:
+                if len(A) >= n:
+                    break
+                if ip not in A:
+                    A.append(ip)
+            ALLOWED[k] = A
+            full = len(A) >= n
+            if full:
+                for r in rs:
+                    if r.get("port"):
+                        blocks.append((ports[int(r["port"])][1], int(r["port"]), A))
+        else:
+            ALLOWED.pop(k, None)
+            full = False
+        if active or n:
+            online[k] = {"active": active, "allowed": A if n else active, "full": full,
+                         "rejected": [ip for ip in active if n and ip not in A]}
+    for k in list(SEEN):
+        if k not in groups:
+            SEEN.pop(k, None)
+    ONLINE.clear()
+    ONLINE.update(online)
+    apply_firewall(blocks)
+
+
+def monitor_loop():
+    while True:
+        try:
+            monitor_once()
+        except Exception as e:
+            sys.stderr.write("monitor: %s\n" % e)
+        time.sleep(int(CFG.get("monitor_interval", 10)))
+
+
+def op_set_limits(body):
+    tags = body.get("tags") or []
+    data = SUI.load_all()
+    rows = {r["tag"]: r for r in build_relays(data)}
+    groups = group_rows(rows.values())
+    keys = {okey_of(rows[t]) for t in tags if t in rows}
+    reenable = []
+    with LIM_LOCK:
+        for k in keys:
+            L = LIMITS.setdefault(k, {})
+            if "quota_gb" in body:
+                L["quota_gb"] = max(0.0, float(body.get("quota_gb") or 0))
+            if "devices" in body:
+                L["devices"] = max(0, int(body.get("devices") or 0))
+            q = float(L.get("quota_gb") or 0)
+            if L.get("over") and (q == 0 or group_usage(groups.get(k, [])) < q * 1024 ** 3):
+                L["over"] = False
+                reenable.append(k)
+            if not L.get("quota_gb") and not L.get("devices") and not L.get("over"):
+                LIMITS.pop(k, None)
+        save_limits()
+    _reenable(reenable, groups)
+    return {"updated": len(keys)}
+
+
+def _reenable(keys, groups):
+    now = time.time()
+    with LOCK:
+        for k in keys:
+            rs = [r for r in groups.get(k, []) if not r.get("expiry") or r["expiry"] > now]
+            set_group_enable(rs, True)
+
+
+def op_reset_traffic(body):
+    tags = body.get("tags") or []
+    data = SUI.load_all()
+    rows = {r["tag"]: r for r in build_relays(data)}
+    groups = group_rows(rows.values())
+    keys = {okey_of(rows[t]) for t in tags if t in rows}
+    with LOCK:
+        for k in keys:
+            for r in groups.get(k, []):
+                if r.get("client_id"):
+                    c = full_client(r["client_id"])
+                    c["up"] = c["down"] = 0
+                    SUI.save("clients", "edit", c)
+    over = []
+    with LIM_LOCK:
+        for k in keys:
+            if (LIMITS.get(k) or {}).get("over"):
+                LIMITS[k]["over"] = False
+                over.append(k)
+        save_limits()
+    _reenable(over, groups)
+    return {"reset": len(keys)}
+
+
+def init_group_limits(okeys, quota_gb, devices):
+    if not (quota_gb or devices):
+        return
+    with LIM_LOCK:
+        for k in okeys:
+            LIMITS[k] = {"quota_gb": float(quota_gb or 0), "devices": int(devices or 0), "over": False}
+        save_limits()
+
+
+def drop_group_limits(okeys):
+    with LIM_LOCK:
+        hit = [k for k in okeys if k in LIMITS]
+        for k in hit:
+            LIMITS.pop(k, None)
+        if hit:
+            save_limits()
+
+
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic})
+
 
 # ------------------------------------------------------------- web server --
 SESSIONS = {}
@@ -1171,6 +1566,8 @@ def main():
         reserve_ports()
     except Exception as e:
         print("警告：暂时无法登录 s-ui：", e)
+    load_limits()
+    threading.Thread(target=monitor_loop, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)
     scheme = "http"
     if CFG.get("cert_file") and CFG.get("key_file"):
