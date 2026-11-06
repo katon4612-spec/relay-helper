@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -56,6 +56,7 @@ DEFAULTS = {
     "geo_lookup": True,
     "auto_firewall": True,
     "sui_restart_cmd": "systemctl restart s-ui",
+    "reserve_ports": True,
     "cert_file": "",
     "key_file": "",
 }
@@ -511,26 +512,81 @@ def wait_core(seconds=8):
 def ensure_core():
     """
     保存路由规则后调用。s-ui 1.3.10 在进程内重启 sing-box 不可靠：
-      - hysteria2 的 UDP 端口经常不被释放，内核启动失败（address already in use），所有节点掉线；
+      - 旧内核的监听端口（尤其 hysteria2 的 UDP）经常没释放，新内核启动失败（address already in use），所有节点掉线；
       - 异步重启和后续请求会竞争，内核状态错乱，之后的操作可能卡死。
-    所以这里直接重启整个 s-ui 服务（干净启动，约 2~4 秒），再等内核恢复。
+    所以这里直接重启整个 s-ui 服务（干净启动，约 2~4 秒），内核没起来就再重启，最多 3 次。
     返回: "restarted" | "ok"(未配置重启命令但内核在跑) | "down"
     """
+    reserve_ports()
     cmd = CFG.get("sui_restart_cmd") or ""
     if not cmd:
         return "ok" if wait_core(8) else "down"
     time.sleep(0.5)
-    try:
-        subprocess.run(cmd, shell=True, timeout=60, capture_output=True)
-    except Exception:
-        return "ok" if wait_core(8) else "down"
-    deadline = time.time() + 40
-    time.sleep(2)
-    while time.time() < deadline:
-        if core_running():
-            return "restarted"
-        time.sleep(1)
+    for attempt in range(3):
+        try:
+            subprocess.run(cmd, shell=True, timeout=60, capture_output=True)
+        except Exception:
+            pass
+        deadline = time.time() + 20
+        time.sleep(2)
+        while time.time() < deadline:
+            if core_running():
+                return "restarted"
+            time.sleep(1)
+        sys.stderr.write("s-ui 内核未启动，第 %d 次重启后重试\n" % (attempt + 1))
     return "down"
+
+
+RESERVED_FILE = "/etc/sysctl.d/99-relay-helper.conf"
+
+
+def reserve_ports():
+    """
+    把所有入站端口加入 net.ipv4.ip_local_reserved_ports：系统给往外的连接分配本地端口时会避开它们，
+    防止重启 s-ui 那一刻某个节点端口正好被往外的连接占着、导致内核启动失败。只影响自动分配，不影响程序主动监听。
+    """
+    if not CFG.get("reserve_ports", True):
+        return
+    try:
+        data = SUI.load_all()
+        ports = sorted({int(i.get("listen_port")) for i in data.get("inbounds") or [] if str(i.get("listen_port") or "").isdigit()})
+        path = "/proc/sys/net/ipv4/ip_local_reserved_ports"
+        if not ports or not os.access(path, os.W_OK):
+            return
+        cur = open(path).read().strip()
+        mine_old = ""
+        if os.path.exists(RESERVED_FILE):
+            for line in open(RESERVED_FILE):
+                if line.startswith("net.ipv4.ip_local_reserved_ports"):
+                    mine_old = line.split("=", 1)[1].strip()
+        # 保留别人设置的保留端口，替换掉我们自己上次写的部分
+        def expand(s):
+            out = set()
+            for part in [x for x in s.replace(" ", "").split(",") if x]:
+                a, _, b = part.partition("-")
+                out.update(range(int(a), int(b or a) + 1)) if a.isdigit() else None
+            return out
+        others = expand(cur) - expand(mine_old)
+        allp = sorted(others | set(ports))
+        # 压缩成区间
+        ranges, start, prev = [], None, None
+        for p in allp:
+            if start is None:
+                start = prev = p
+            elif p == prev + 1:
+                prev = p
+            else:
+                ranges.append("%d-%d" % (start, prev) if prev > start else str(start)); start = prev = p
+        if start is not None:
+            ranges.append("%d-%d" % (start, prev) if prev > start else str(start))
+        value = ",".join(ranges)
+        with open(path, "w") as f:
+            f.write(value)
+        mine = ",".join(str(p) for p in ports)
+        with open(RESERVED_FILE, "w") as f:
+            f.write("# 由中转助手维护：s-ui 入站端口，避免被系统分配给往外的连接\nnet.ipv4.ip_local_reserved_ports = %s\n" % mine)
+    except Exception as e:
+        sys.stderr.write("reserve_ports: %s\n" % e)
 
 
 # ----------------------------------------------------------- operations --
@@ -1064,6 +1120,7 @@ def main():
     try:
         SUI.login()
         print("已连接 s-ui：", CFG["sui_url"])
+        reserve_ports()
     except Exception as e:
         print("警告：暂时无法登录 s-ui：", e)
     srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)

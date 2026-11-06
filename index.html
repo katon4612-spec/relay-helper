@@ -51,7 +51,8 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .modal .box{background:#fff;border-radius:12px;padding:18px;max-width:560px;width:100%;max-height:90vh;overflow:auto}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
-.ck input{margin:0}.sib{font-size:11px;color:var(--muted);margin-top:2px}
+.ck input{margin:0}
+tbody.grp{border-bottom:2px solid #dbe2ec}tbody.grp tr.sub td{border-bottom:1px dashed var(--line)}tbody.grp tr.sub{background:#fbfcfe}.branch{color:#94a3b8;margin-right:6px}.sib{font-size:11px;color:var(--muted);margin-top:2px}
 .kv{display:grid;grid-template-columns:70px 1fr auto;gap:6px 8px;align-items:center;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
 .kv b{font-weight:500;color:var(--muted);font-size:12px}.kv span{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
 .muted{color:var(--muted)}
@@ -268,35 +269,53 @@ async function renderManage(){
   $("#rf").onclick=async()=>{await loadRelays();drawTable()};
   try{await loadRelays();drawTable()}catch(e){toast(e.message)}
 }
-function filtered(){const q=state.q.toLowerCase();return state.relays.filter(r=>!q||[r.tag,r.landing,r.port,r.outbound_tag].join(" ").toLowerCase().includes(q))}
+/* 同一落地（同一个落地出站）的节点算一组：同一客户同一条线路的不同协议 */
+const PORD={vless:0,hysteria2:1,socks:2};
+const gkey=r=>r.outbound_tag?"o:"+r.outbound_tag:"t:"+r.tag;
+function groupsOf(list){
+  const m=new Map();for(const r of list){const k=gkey(r);if(!m.has(k))m.set(k,[]);m.get(k).push(r)}
+  const gs=[...m.values()];
+  gs.forEach(g=>g.sort((a,b)=>((PORD[a.type]??9)-(PORD[b.type]??9))||((a.inbound_id||0)-(b.inbound_id||0))));
+  gs.sort((a,b)=>Math.max(...b.map(x=>x.inbound_id||0))-Math.max(...a.map(x=>x.inbound_id||0)));
+  return gs;
+}
+const groupOf=t=>{const r=byTag(t);if(!r)return [];const k=gkey(r);return state.relays.filter(x=>gkey(x)===k)};
+const expand=tags=>[...new Set(tags.flatMap(t=>groupOf(t).map(x=>x.tag)))];
+function filtered(){const q=state.q.toLowerCase();
+  return groupsOf(state.relays).filter(g=>!q||g.some(r=>[r.tag,r.landing,r.port,r.outbound_tag].join(" ").toLowerCase().includes(q)))}
 function drawTable(){
   if(!$("#tbl"))return;
   const all=filtered();const per=20;const pages=Math.max(1,Math.ceil(all.length/per));if(state.page>pages)state.page=pages;
-  const rows=all.slice((state.page-1)*per,state.page*per);
-  const nsel=state.sel.size;
-  $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条${nsel?`，已选 ${nsel} 条`:""}</span>
+  const gs=all.slice((state.page-1)*per,state.page*per);
+  const nodes=all.reduce((s,g)=>s+g.length,0);
+  const nsel=state.sel.size;const selG=all.filter(g=>g.some(r=>state.sel.has(r.tag))).length;
+  $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条线路（${nodes} 个节点）${nsel?`，已选 ${selG} 条`:""}</span>
    <button class="sm" id="selall">全选当前搜索</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
    <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
    <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
+  const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
   $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>检测</th><th>操作</th></tr>
-  ${rows.map(r=>`<tr><td><input type="checkbox" data-s="${esc(r.tag)}" ${state.sel.has(r.tag)?"checked":""}></td>
-  <td style="word-break:break-all;min-width:150px">${esc(r.tag)}${(r.siblings||[]).length?`<div class="sib">同落地：${r.siblings.map(s=>esc(protoName[s.type]||s.type)+" "+esc(s.port)).join("、")}</div>`:""}</td>
+  ${gs.map(g=>{const n=g.length,m=g[0],on=g.every(r=>state.sel.has(r.tag));
+   return `<tbody class="grp">${g.map((r,i)=>`<tr class="${i?"sub":""}">
+  ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
+  <td style="word-break:break-all;min-width:150px">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
   <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
-  <td class="mono">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>
+  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
-  <td>${pcHtml(state.checks[r.tag])}</td>
+  ${i===0?`<td rowspan="${n}">${pcHtml(state.checks[r.tag])}</td>`:""}
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
-  <button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
+  ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
-  <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>续期</button>
-  <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</table>`;
+  <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>`:""}
+  <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</tbody>`}).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
   if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
-  document.querySelectorAll("[data-s]").forEach(c=>c.onchange=()=>{c.checked?state.sel.add(c.dataset.s):state.sel.delete(c.dataset.s);drawTable()});
-  $("#selall").onclick=()=>{all.forEach(r=>state.sel.add(r.tag));drawTable()};
+  document.querySelectorAll("[data-g]").forEach(c=>c.onchange=()=>{groupOf(c.dataset.g).forEach(r=>c.checked?state.sel.add(r.tag):state.sel.delete(r.tag));drawTable()});
+  $("#selall").onclick=()=>{all.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable()};
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
-    $("#bchk").onclick=()=>checkTags([...state.sel]);$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg([...state.sel]);
+    const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
+    $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
   document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
@@ -378,29 +397,36 @@ async function showNew(ok,bad){
   document.querySelectorAll("[data-ndl]").forEach(b=>b.onclick=()=>{const x=ok[b.dataset.ndl];downloadQR(x.name,x.svg,x.port)});
 }
 function renewDlg(tags){
-  const rs=tags.map(byTag).filter(r=>r&&r.client_id);if(!rs.length)return toast("所选线路没有用户");
-  modal(`<h2 style="margin-top:0">续期 ${rs.length} 条</h2>
+  const gmap=new Map();for(const t of expand(tags)){const r=byTag(t);if(r&&r.client_id){const k=gkey(r);if(!gmap.has(k))gmap.set(k,[]);gmap.get(k).push(r)}}
+  const gs=[...gmap.values()];if(!gs.length)return toast("所选线路没有用户");
+  const nn=gs.reduce((s,g)=>s+g.length,0);
+  modal(`<h2 style="margin-top:0">续期 ${gs.length} 条线路（${nn} 个节点）</h2>
+  ${nn>gs.length?'<p class="hint">同一落地的其他协议节点会一起续期，到期时间统一成同一天。</p>':""}
   <div class="row"><label>方式<select id="rm"><option value="add">在原到期时间上延长</option><option value="set">设为指定日期</option><option value="forever">改为永久</option></select></label>
   <label id="ral">延长天数<input id="rd" type="number" value="30" min="1" style="width:100px"></label>
   <label id="rsl" style="display:none">到期日期<input id="rdt" type="datetime-local"></label></div>
-  <p class="hint">已过期的从今天开始算；续期后自动重新启用。</p>
+  <p class="hint">从这组里最晚的到期时间开始延长；已过期的从今天开始算；续期后自动重新启用。</p>
   <div class="row" style="margin-top:12px"><button class="pri" id="rnok">确定</button><button id="rncl">取消</button></div>`);
   const sync=()=>{const v=$("#rm").value;$("#ral").style.display=v==="add"?"flex":"none";$("#rsl").style.display=v==="set"?"flex":"none"};$("#rm").onchange=sync;
   $("#rncl").onclick=closeModal;
   $("#rnok").onclick=async()=>{const mode=$("#rm").value;const now=Math.floor(Date.now()/1000);
-    try{let groups={};
-      for(const r of rs){let e;if(mode==="forever")e=0;else if(mode==="set"){if(!$("#rdt").value)throw new Error("请选择日期");e=Math.floor(new Date($("#rdt").value).getTime()/1000)}
-        else{e=Math.max(r.expiry||now,now)+parseInt($("#rd").value||"0")*86400}(groups[e]=groups[e]||[]).push(r.client_id)}
-      let fail=0;for(const[e,ids]of Object.entries(groups)){const x=await api("update_clients",{client_ids:ids,expiry:parseInt(e)});fail+=x.results.filter(z=>!z.ok).length}
-      closeModal();toast(fail?`${fail} 条失败`:"已续期");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+    try{let byExp={};
+      for(const g of gs){let e;
+        if(mode==="forever")e=0;
+        else if(mode==="set"){if(!$("#rdt").value)throw new Error("请选择日期");e=Math.floor(new Date($("#rdt").value).getTime()/1000)}
+        else{const base=g.some(r=>!r.expiry)?now:Math.max(...g.map(r=>r.expiry));e=Math.max(base,now)+parseInt($("#rd").value||"0")*86400}
+        for(const r of g)(byExp[e]=byExp[e]||new Set()).add(r.client_id)}
+      let fail=0;for(const[e,ids]of Object.entries(byExp)){const x=await api("update_clients",{client_ids:[...ids],expiry:parseInt(e)});fail+=x.results.filter(z=>!z.ok).length}
+      closeModal();toast(fail?`${fail} 个失败`:`已续期 ${nn} 个节点`);await loadRelays();drawTable()}catch(e){toast(e.message)}};
 }
 async function setEnable(tags,en){
-  const ids=[...new Set(tags.map(byTag).filter(r=>r&&r.client_id).map(r=>r.client_id))];
-  if(!en&&!confirm(`停用 ${ids.length} 个用户？停用后客户无法连接。`))return;
+  const ids=[...new Set(expand(tags).map(byTag).filter(r=>r&&r.client_id).map(r=>r.client_id))];
+  if(!en&&!confirm(`停用 ${ids.length} 个节点（含同落地的其他协议）？停用后客户无法连接。`))return;
   try{const x=await api("update_clients",{client_ids:ids,enable:en});toast(en?"已启用":"已停用");await loadRelays();drawTable()}catch(e){toast(e.message)}
 }
 async function delTags(tags){
-  if(!confirm(`确定删除 ${tags.length} 条线路？\n会删除入站、用户、路由和落地出站，并重启 s-ui（约 3 秒断线）。此操作不可恢复。`))return;
+  const set=new Set(tags);const left=[...new Set(tags.flatMap(t=>groupOf(t).filter(x=>!set.has(x.tag)).map(x=>x.tag)))];
+  if(!confirm(`确定删除 ${tags.length} 个节点？${left.length?`\n同落地的这些节点会保留：${left.join("、")}`:"\n落地出站没有其他节点使用时会一起删除。"}\n删除后会重启 s-ui（约 3 秒断线），不可恢复。`))return;
   toast("删除中…",15000);
   try{const x=await api("delete",{tags});const bad=x.results.filter(r=>!r.ok);
     tags.forEach(t=>state.sel.delete(t));toast((bad.length?`${bad.length} 条失败：${bad.map(b=>b.error).join("；")}`:"已删除")+coreMsg(x.core),5000);
