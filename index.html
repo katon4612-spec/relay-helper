@@ -50,6 +50,10 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .modal.show{display:flex}
 .modal .box{background:#fff;border-radius:12px;padding:18px;max-width:560px;width:100%;max-height:90vh;overflow:auto}
 .login{max-width:360px;margin:12vh auto}
+.protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
+.ck input{margin:0}.sib{font-size:11px;color:var(--muted);margin-top:2px}
+.kv{display:grid;grid-template-columns:70px 1fr auto;gap:6px 8px;align-items:center;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
+.kv b{font-weight:500;color:var(--muted);font-size:12px}.kv span{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
 .muted{color:var(--muted)}
 .err{color:var(--bad)}
 .pager{display:flex;gap:6px;align-items:center;justify-content:flex-end;margin-top:10px}
@@ -112,8 +116,10 @@ function renderCreate(){
   m.innerHTML=`<div class="card"><h2>1. 粘贴落地</h2>
   <div class="row">
     <label>客户名 <input id="cust" placeholder="如：见山" value="${esc(saved.cust||"")}"></label>
-    <label>入站协议（客户连接用）<select id="proto">
-      <option value="vless">VLESS-Reality（推荐）</option><option value="hysteria2">Hysteria2（UDP）</option><option value="socks">SOCKS5</option></select></label>
+    <label>入站协议（客户连接用，可多选）<span class="protos" id="protos">
+      <label class="ck"><input type="checkbox" value="vless">VLESS-Reality</label>
+      <label class="ck"><input type="checkbox" value="hysteria2">Hysteria2</label>
+      <label class="ck"><input type="checkbox" value="socks">SOCKS5</label></span></label>
     <label>到期 <select id="days"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option><option value="0">永久</option><option value="custom">指定日期…</option></select></label>
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
   </div>
@@ -122,18 +128,20 @@ socks5://账号:密码@IP:端口
 IP:端口:账号:密码
 vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
 也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
-  <p class="hint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。</p>
+  <p class="hint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
   <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button></div></div>
   <div id="pvbox"></div><div id="resbox"></div>`;
-  $("#proto").value=saved.proto||"vless";$("#days").value=saved.days||"30";
+  const sp=saved.protos||[saved.proto||"vless"];document.querySelectorAll("#protos input").forEach(c=>c.checked=sp.includes(c.value));
+  $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
   $("#pv").onclick=doPreview;
   if(state.preview)renderPreview();if(state.results)renderResults();
 }
+function selProtos(sel="#protos"){return [...document.querySelectorAll(sel+" input:checked")].map(c=>c.value)}
 function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"){const d=$("#cdate").value;if(!d)throw new Error("请选择到期日期");return Math.floor(new Date(d).getTime()/1000)}return Math.floor(Date.now()/1000)+parseInt(v)*86400}
 async function doPreview(){
   const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
-  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,proto:$("#proto").value,days:$("#days").value}));
+  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value}));
   try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;$("#resbox").innerHTML="";renderPreview()}
   catch(e){toast(e.message)}finally{b.disabled=false;b.textContent="解析预览"}
 }
@@ -162,10 +170,11 @@ async function preCheck(){
 async function doCreate(){
   let expiry;try{expiry=expiryTs()}catch(e){return toast(e.message)}
   const items=state.preview.filter(x=>!x.error&&x.name);
+  const protos=selProtos();if(!protos.length)return toast("请至少勾选一个入站协议");
   const badN=Object.values(state.pvcheck||{}).filter(c=>c&&c!==".."&&!c.ok).length;
-  if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起创建。\n\n`:""}确定创建 ${items.length} 条中转？\n创建后会重启 s-ui 让路由生效，所有线路约断 3 秒。`))return;
+  if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起创建。\n\n`:""}确定创建 ${items.length} 条落地 × ${protos.length} 种协议 = ${items.length*protos.length} 个节点？\n创建后会重启 s-ui 让路由生效，所有线路约断 3 秒。`))return;
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
-  try{const r=await api("create",{items,protocol:$("#proto").value,expiry,customer:$("#cust").value.trim()});
+  try{const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim()});
     state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
     state.preview=null;$("#pvbox").innerHTML="";  // 防止同一批重复创建
     toast(`成功 ${ok} 条${ok<r.results.length?`，失败 ${r.results.length-ok} 条`:""}${coreMsg(r.core)}`,5000);renderResults()}
@@ -177,7 +186,7 @@ async function renderResults(){
   <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码</button>
   ${ok.some(x=>!x.firewall)?'<span class="hint">提醒：确认服务器防火墙 / 云安全组已放行这些端口</span>':""}</div>
   ${rs.filter(x=>!x.ok).map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
-  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">端口 ${x.port}</div>
+  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
   <div class="qr" id="rq${i}"><span class="spin"></span></div><div class="link mono">${esc((x.links||[])[0]||"")}</div>
   <div class="acts" style="justify-content:center"><button class="sm" data-cp="${i}">复制链接</button><button class="sm" data-dl="${i}">下载二维码</button></div></div>`).join("")}</div></div>`;
   $("#cpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
@@ -216,11 +225,11 @@ function drawTable(){
   const nsel=state.sel.size;
   $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条${nsel?`，已选 ${nsel} 条`:""}</span>
    <button class="sm" id="selall">全选当前搜索</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
-   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
+   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
    <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>检测</th><th>操作</th></tr>
   ${rows.map(r=>`<tr><td><input type="checkbox" data-s="${esc(r.tag)}" ${state.sel.has(r.tag)?"checked":""}></td>
-  <td style="word-break:break-all;min-width:150px">${esc(r.tag)}</td>
+  <td style="word-break:break-all;min-width:150px">${esc(r.tag)}${(r.siblings||[]).length?`<div class="sib">同落地：${r.siblings.map(s=>esc(protoName[s.type]||s.type)+" "+esc(s.port)).join("、")}</div>`:""}</td>
   <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
   <td class="mono">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
@@ -228,6 +237,7 @@ function drawTable(){
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   <button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
+  <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>续期</button>
   <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
@@ -235,10 +245,10 @@ function drawTable(){
   document.querySelectorAll("[data-s]").forEach(c=>c.onchange=()=>{c.checked?state.sel.add(c.dataset.s):state.sel.delete(c.dataset.s);drawTable()});
   $("#selall").onclick=()=>{all.forEach(r=>state.sel.add(r.tag));drawTable()};
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
-    $("#bchk").onclick=()=>checkTags([...state.sel]);$("#bren").onclick=()=>renewDlg([...state.sel]);
+    $("#bchk").onclick=()=>checkTags([...state.sel]);$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg([...state.sel]);
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,ren:t=>renewDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -270,15 +280,50 @@ async function exportLinks(tags){
 }
 function replaceDlg(tag){
   const r=byTag(tag);
-  modal(`<h2 style="margin-top:0">更换落地：${esc(tag)}</h2><p class="muted">当前落地：<span class="mono">${esc(r.landing)}</span></p>
+  const L=r.landing_info||{};const sib=r.siblings||[];
+  const row=(k,v,c)=>v===undefined||v===""?"":`<b>${k}</b><span>${esc(v)}</span>${c?`<button class="sm" data-cp="${esc(v)}">复制</button>`:"<i></i>"}`;
+  modal(`<h2 style="margin-top:0">更换落地：${esc(tag)}</h2>
+  <div class="muted" style="font-size:12px">当前落地（${esc(protoName[L.type]||L.type||"")}）</div>
+  <div class="kv">${row("完整",L.url,1)}${row("简写",L.plain,1)}${row("IP",L.server,0)}${row("端口",L.port,0)}${row("账号",L.username,1)}${row("密码",L.password,1)}
+  ${row("UUID",L.uuid,1)}${row("加密",L.method,0)}${row("SNI",L.sni,0)}${row("公钥",L.public_key,1)}${row("ShortID",L.short_id,0)}</div>
+  ${sib.length?`<p class="hint" style="color:var(--warn)">⚠ 这个落地还被 ${sib.length} 个节点共用（${sib.map(s=>esc(s.tag)).join("、")}），会一起换。</p>`:""}
   <p class="hint">客户的链接和二维码不变，只换出口。</p>
   <input id="nl" style="width:100%" placeholder="socks5://账号:密码@IP:端口 或 IP:端口:账号:密码 或 vless://…">
   <div class="row" style="margin-top:12px"><button class="pri" id="rok">替换并检测</button><button id="rcl">取消</button></div><p id="rmsg"></p>`);
-  $("#rcl").onclick=closeModal;
+  $("#rcl").onclick=closeModal;document.querySelectorAll("#mbox [data-cp]").forEach(b=>b.onclick=()=>copy(b.dataset.cp));
   $("#rok").onclick=async()=>{const b=$("#rok");b.disabled=true;b.innerHTML='<span class="spin"></span> 替换中';
     try{const x=await api("replace",{tag,landing:$("#nl").value.trim()});state.checks[tag]=x.check;
       $("#rmsg").innerHTML=x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`;
       await loadRelays();drawTable()}catch(e){$("#rmsg").innerHTML=`<span class="err">${esc(e.message)}</span>`}finally{b.disabled=false;b.textContent="替换并检测"}};
+}
+function addProtoDlg(tags){
+  const rs=tags.map(byTag).filter(r=>r&&r.outbound_tag);if(!rs.length)return toast("所选线路没有落地");
+  const have=new Set();if(rs.length===1){have.add(rs[0].type);(rs[0].siblings||[]).forEach(s=>have.add(s.type))}
+  const opt=[["vless","VLESS-Reality"],["hysteria2","Hysteria2"],["socks","SOCKS5"]];
+  modal(`<h2 style="margin-top:0">加协议（${rs.length} 条线路）</h2>
+  <p class="hint">给同一个落地再加其他协议的节点：共用这个落地出口，到期时间跟原线路一致。客户可以按网络情况选用。</p>
+  <div class="protos" id="aps" style="margin:10px 0">${opt.map(([v,l])=>`<label class="ck"><input type="checkbox" value="${v}" ${have.has(v)?"disabled":""}>${l}${have.has(v)?"（已有）":""}</label>`).join("")}</div>
+  ${rs.length>1?'<p class="hint">已有的协议会自动跳过。</p>':""}
+  <div class="row"><button class="pri" id="apok">添加</button><button id="apcl">取消</button></div>`);
+  $("#apcl").onclick=closeModal;
+  $("#apok").onclick=async()=>{const protos=selProtos("#aps");if(!protos.length)return toast("请选择协议");
+    if(!confirm("添加后会重启 s-ui 让路由生效，所有线路约断 3 秒。继续？"))return;
+    const b=$("#apok");b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中…';
+    try{const x=await api("add_protocol",{tags:rs.map(r=>r.tag),protocols:protos});
+      const ok=x.results.filter(z=>z.ok),skip=x.results.filter(z=>z.skipped),bad=x.results.filter(z=>!z.ok&&!z.skipped);
+      toast(`新增 ${ok.length} 个节点${skip.length?`，跳过 ${skip.length} 个`:""}${bad.length?`，失败 ${bad.length} 个`:""}${coreMsg(x.core)}`,5000);
+      await loadRelays();drawTable();showNew(ok,bad)}catch(e){toast(e.message,5000);b.disabled=false;b.textContent="添加"}};
+}
+async function showNew(ok,bad){
+  if(!ok.length&&!bad.length)return closeModal();
+  modal(`<h2 style="margin-top:0">新增节点（${ok.length}）</h2>${bad.map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
+  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
+  <div class="qr" id="nq${i}"><span class="spin"></span></div><div class="acts" style="justify-content:center"><button class="sm" data-ncp="${i}">复制链接</button><button class="sm" data-ndl="${i}">下载二维码</button></div></div>`).join("")}</div>
+  <div class="row" style="margin-top:12px"><button class="pri" id="ncpall">复制全部链接</button><button id="ncl">关闭</button></div>`);
+  $("#ncl").onclick=closeModal;$("#ncpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
+  document.querySelectorAll("[data-ncp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.ncp].links[0]));
+  for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;$("#nq"+i).innerHTML=q.svg}catch(e){}}
+  document.querySelectorAll("[data-ndl]").forEach(b=>b.onclick=()=>{const x=ok[b.dataset.ndl];downloadQR(x.name,x.svg,x.port)});
 }
 function renewDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&r.client_id);if(!rs.length)return toast("所选线路没有用户");

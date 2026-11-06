@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -417,6 +417,7 @@ def build_relays(data):
             "landing_type": ob.get("type") if ob else None,
             "landing": ("%s:%s" % (ob.get("server"), ob.get("server_port"))) if ob and ob.get("server") else (ot or ""),
             "landing_user": (ob or {}).get("username", ""),
+            "landing_info": landing_info(ob) if ob else None,
             "client_id": main.get("id") if main else None,
             "client_name": main.get("name") if main else None,
             "clients": len(cl),
@@ -425,8 +426,40 @@ def build_relays(data):
             "up": main.get("up") if main else 0,
             "down": main.get("down") if main else 0,
         })
+    # 共用同一个落地出站的其他节点（同一落地的不同协议）
+    by_out = {}
+    for r in rows:
+        if r["outbound_tag"]:
+            by_out.setdefault(r["outbound_tag"], []).append(r)
+    for r in rows:
+        r["siblings"] = [{"tag": x["tag"], "type": x["type"], "port": x["port"]}
+                         for x in by_out.get(r["outbound_tag"], []) if x["tag"] != r["tag"]]
     rows.sort(key=lambda r: r.get("inbound_id") or 0, reverse=True)
     return rows
+
+
+def landing_info(ob):
+    """落地出站的完整信息（含账号密码），供页面展示和复制。"""
+    q = urllib.parse.quote
+    typ, host, port = ob.get("type"), ob.get("server", ""), ob.get("server_port", "")
+    user, pw = ob.get("username", ""), ob.get("password", "")
+    info = {"type": typ, "server": host, "port": port, "username": user, "password": pw}
+    if typ in ("socks", "http"):
+        scheme = "socks5" if typ == "socks" else ("https" if (ob.get("tls") or {}).get("enabled") else "http")
+        auth = "%s:%s@" % (q(user, safe=""), q(pw, safe="")) if user else ""
+        info["url"] = "%s://%s%s:%s" % (scheme, auth, host, port)
+        info["plain"] = "%s:%s:%s:%s" % (host, port, user, pw) if user else "%s:%s" % (host, port)
+    else:
+        for k in ("uuid", "method", "flow"):
+            if ob.get(k):
+                info[k] = ob[k]
+        tls = ob.get("tls") or {}
+        if tls.get("server_name"):
+            info["sni"] = tls["server_name"]
+        if (tls.get("reality") or {}).get("public_key"):
+            info["public_key"] = tls["reality"]["public_key"]
+            info["short_id"] = tls["reality"].get("short_id", "")
+    return info
 
 
 def find_tls(data, kind):
@@ -529,106 +562,179 @@ def op_preview(body):
     return {"items": items}
 
 
-def op_create(body):
-    items = [it for it in body.get("items") or [] if not it.get("error") and it.get("name")]
-    proto = body.get("protocol") or "vless"
-    expiry = int(body.get("expiry") or 0)
-    if not items:
-        raise SuiError("没有可创建的线路")
-    with LOCK:
-        data = SUI.load_all()
-        taken_names = {i.get("tag") for i in data.get("inbounds") or []} | {o.get("tag") for o in data.get("outbounds") or []} | {c.get("name") for c in data.get("clients") or []}
-        taken_ports = used_ports(data)
-        settings = SUI.get("settings") or {}
-        for k in ("webPort", "subPort"):
-            try:
-                taken_ports.add(int(settings.get(k)))
-            except (TypeError, ValueError):
-                pass
-        tls_id = 0
+PROTO_SUFFIX = {"vless": "", "hysteria2": "-HY2", "socks": "-S5"}
+PROTO_LABEL = {"vless": "VLESS-Reality", "hysteria2": "Hysteria2", "socks": "SOCKS5"}
+
+
+def _prepare(data, protos):
+    """检查协议需要的 TLS 配置，返回 {proto: tls_id}，以及已占用的名字和端口。"""
+    tls = {}
+    for proto in protos:
         if proto == "vless":
-            tls_id = find_tls(data, "reality")
-            if not tls_id:
+            tls[proto] = find_tls(data, "reality")
+            if not tls[proto]:
                 raise SuiError("s-ui 里没有 Reality 配置。请先在面板「TLS 设置」里添加一个 reality 类型的配置")
         elif proto == "hysteria2":
-            tls_id = find_tls(data, "cert")
-            if not tls_id:
+            tls[proto] = find_tls(data, "cert")
+            if not tls[proto]:
                 raise SuiError("s-ui 里没有证书类 TLS 配置（hysteria2 需要）。请先在面板「TLS 设置」里添加")
-        elif proto != "socks":
-            raise SuiError("不支持的入站协议：" + proto)
-
-        results = []
-        new_rules = []
-        for it in items:
-            name = it["name"]
-            if name in taken_names:
-                name = unique_name(name, taken_names)
-            else:
-                taken_names.add(name)
-            created = {}
-            try:
-                ob = dict(it["outbound"])
-                ob["tag"] = name
-                SUI.save("outbounds", "new", ob)
-                created["outbound"] = name
-                port = pick_port(taken_ports, proto == "hysteria2")
-                inb = {"type": proto, "tag": name, "listen": "::", "listen_port": port, "tls_id": tls_id, "addrs": [], "out_json": {}}
-                if proto == "hysteria2":
-                    inb["ignore_client_bandwidth"] = True
-                if proto == "vless":
-                    inb["transport"] = {}
-                res = SUI.save("inbounds", "new", inb, init_users="")
-                inb_id = next((i["id"] for i in (res or {}).get("inbounds") or [] if i.get("tag") == name), None)
-                if not inb_id:
-                    raise SuiError("入站创建后未找到 id")
-                created["inbound"] = name
-                client = {"enable": True, "name": name, "config": client_config(name), "inbounds": [inb_id],
-                          "links": [], "volume": 0, "expiry": expiry, "up": 0, "down": 0,
-                          "desc": "中转助手创建", "group": body.get("customer") or ""}
-                res = SUI.save("clients", "new", client)
-                cid = next((c["id"] for c in (res or {}).get("clients") or [] if c.get("name") == name), None)
-                created["client"] = cid
-                new_rules.append({"inbound": [name], "auth_user": [name], "action": "route", "outbound": name})
-                fw = open_firewall(port, proto == "hysteria2")
-                results.append({"name": name, "port": port, "client_id": cid, "ok": True, "firewall": fw})
-            except Exception as e:
-                # roll back the pieces of this one relay
-                try:
-                    if created.get("client"):
-                        SUI.save("clients", "del", created["client"])
-                    if created.get("inbound"):
-                        SUI.save("inbounds", "del", name)
-                    if created.get("outbound"):
-                        SUI.save("outbounds", "del", name)
-                except Exception:
-                    pass
-                results.append({"name": name, "ok": False, "error": str(e)})
-        if new_rules:
-            cfg = SUI.get("config")
-            cfg = cfg.get("config", cfg) if isinstance(cfg, dict) and "config" in cfg and isinstance(cfg.get("config"), dict) else cfg
-            rules = cfg.setdefault("route", {}).setdefault("rules", [])
-            pos = 0
-            while pos < len(rules) and rules[pos].get("action") in ("sniff", "hijack-dns"):
-                pos += 1
-            rules[pos:pos] = new_rules
-            try:
-                SUI.save("config", "edit", cfg)
-            except Exception as e:
-                # 路由没保存成功：回滚这一批，避免留下没有路由（会从中转机直出）的入站
-                for r in results:
-                    if r.get("ok"):
-                        for obj, key in (("clients", r.get("client_id")), ("inbounds", r["name"]), ("outbounds", r["name"])):
-                            try:
-                                if key:
-                                    SUI.save(obj, "del", key)
-                            except Exception:
-                                pass
-                        r.update(ok=False, error="保存路由失败，已回滚：%s" % e)
-                return {"results": results, "core": "ok"}
-            core = ensure_core()
+        elif proto == "socks":
+            tls[proto] = 0
         else:
-            core = "ok"
-    # links
+            raise SuiError("不支持的入站协议：" + proto)
+    taken_names = {i.get("tag") for i in data.get("inbounds") or []} | {o.get("tag") for o in data.get("outbounds") or []} | {c.get("name") for c in data.get("clients") or []}
+    taken_ports = used_ports(data)
+    settings = SUI.get("settings") or {}
+    for k in ("webPort", "subPort"):
+        try:
+            taken_ports.add(int(settings.get(k)))
+        except (TypeError, ValueError):
+            pass
+    return tls, taken_names, taken_ports
+
+
+def _make_inbound(name, proto, tls_id, expiry, group, taken_ports, outbound_tag):
+    """建一个入站 + 用户。成功返回结果 dict（含要加的路由规则）；失败时回滚自己建的部分并抛异常。"""
+    created = {}
+    try:
+        port = pick_port(taken_ports, proto == "hysteria2")
+        inb = {"type": proto, "tag": name, "listen": "::", "listen_port": port, "tls_id": tls_id, "addrs": [], "out_json": {}}
+        if proto == "hysteria2":
+            inb["ignore_client_bandwidth"] = True
+        if proto == "vless":
+            inb["transport"] = {}
+        res = SUI.save("inbounds", "new", inb, init_users="")
+        inb_id = next((i["id"] for i in (res or {}).get("inbounds") or [] if i.get("tag") == name), None)
+        if not inb_id:
+            raise SuiError("入站创建后未找到 id")
+        created["inbound"] = name
+        client = {"enable": True, "name": name, "config": client_config(name), "inbounds": [inb_id],
+                  "links": [], "volume": 0, "expiry": int(expiry or 0), "up": 0, "down": 0,
+                  "desc": "中转助手创建", "group": group or ""}
+        res = SUI.save("clients", "new", client)
+        cid = next((c["id"] for c in (res or {}).get("clients") or [] if c.get("name") == name), None)
+        created["client"] = cid
+        fw = open_firewall(port, proto == "hysteria2")
+        return {"name": name, "protocol": proto, "port": port, "client_id": cid, "ok": True, "firewall": fw,
+                "outbound": outbound_tag,
+                "rule": {"inbound": [name], "auth_user": [name], "action": "route", "outbound": outbound_tag}}
+    except Exception:
+        _rollback({"client_id": created.get("client"), "name": name if created.get("inbound") else None})
+        raise
+
+
+def _rollback(r, outbound=None):
+    for obj, key in (("clients", r.get("client_id")), ("inbounds", r.get("name")), ("outbounds", outbound)):
+        try:
+            if key:
+                SUI.save(obj, "del", key)
+        except Exception:
+            pass
+
+
+def _apply_rules(results, new_outbounds):
+    """一次性写入这批路由规则并重启 s-ui；失败则整批回滚。返回 core 状态。"""
+    new_rules = [r.pop("rule") for r in results if r.get("ok") and "rule" in r]
+    if not new_rules:
+        return "ok"
+    cfg = SUI.get("config")
+    cfg = cfg.get("config", cfg) if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict) else cfg
+    rules = cfg.setdefault("route", {}).setdefault("rules", [])
+    pos = 0
+    while pos < len(rules) and rules[pos].get("action") in ("sniff", "hijack-dns"):
+        pos += 1
+    rules[pos:pos] = new_rules
+    try:
+        SUI.save("config", "edit", cfg)
+    except Exception as e:
+        # 路由没保存成功：回滚这一批，避免留下没有路由（会从中转机直出）的入站
+        for r in results:
+            if r.get("ok"):
+                _rollback(r)
+                r.update(ok=False, error="保存路由失败，已回滚：%s" % e)
+        for ob in new_outbounds:
+            _rollback({}, ob)
+        return "ok"
+    return ensure_core()
+
+
+def op_create(body):
+    items = [it for it in body.get("items") or [] if not it.get("error") and it.get("name")]
+    protos = body.get("protocols") or [body.get("protocol") or "vless"]
+    protos = [p for p in dict.fromkeys(protos) if p]
+    expiry = int(body.get("expiry") or 0)
+    group = body.get("customer") or ""
+    if not items:
+        raise SuiError("没有可创建的线路")
+    if not protos:
+        raise SuiError("请至少选择一个入站协议")
+    with LOCK:
+        data = SUI.load_all()
+        tls, taken_names, taken_ports = _prepare(data, protos)
+        results, new_outbounds = [], []
+        for it in items:
+            base = unique_name(it["name"], taken_names) if it["name"] in taken_names else it["name"]
+            taken_names.add(base)
+            ob = dict(it["outbound"])
+            ob["tag"] = base
+            try:
+                SUI.save("outbounds", "new", ob)
+            except Exception as e:
+                results.append({"name": base, "ok": False, "error": "落地出站创建失败：%s" % e})
+                continue
+            made = []
+            for i, proto in enumerate(protos):
+                name = base if i == 0 else unique_name(base + PROTO_SUFFIX[proto], taken_names)
+                taken_names.add(name)
+                try:
+                    made.append(_make_inbound(name, proto, tls[proto], expiry, group, taken_ports, base))
+                except Exception as e:
+                    made.append({"name": name, "protocol": proto, "ok": False, "error": str(e)})
+            if not any(m["ok"] for m in made):
+                _rollback({}, base)  # 一个入站都没建成：落地出站也删掉
+            else:
+                new_outbounds.append(base)
+            results.extend(made)
+        core = _apply_rules(results, new_outbounds)
+    for r in results:
+        if r.get("ok") and r.get("client_id"):
+            r["links"] = client_links(r["client_id"])
+    return {"results": results, "core": core}
+
+
+def op_add_protocol(body):
+    """给已有线路加其他协议的入站，共用同一个落地出站，到期时间和客户分组跟原线路一致。"""
+    tags = list(dict.fromkeys(body.get("tags") or []))
+    protos = [p for p in dict.fromkeys(body.get("protocols") or []) if p]
+    if not tags or not protos:
+        raise SuiError("请选择线路和要添加的协议")
+    with LOCK:
+        data = SUI.load_all()
+        rows = {r["tag"]: r for r in build_relays(data)}
+        groups = {c.get("id"): c.get("group", "") for c in data.get("clients") or []}
+        tls, taken_names, taken_ports = _prepare(data, protos)
+        results = []
+        for t in tags:
+            row = rows.get(t)
+            if not row or not row.get("outbound_tag"):
+                results.append({"name": t, "ok": False, "error": "找不到这条线路的落地"})
+                continue
+            have = {s["type"] for s in row.get("siblings") or []} | {row["type"]}
+            base = re.sub(r"-(HY2|S5|VL)(-\d+)?$", "", t)
+            for proto in protos:
+                if proto in have:
+                    results.append({"name": t, "protocol": proto, "ok": False, "skipped": True,
+                                    "error": "这个落地已经有 %s 节点" % PROTO_LABEL.get(proto, proto)})
+                    continue
+                suffix = PROTO_SUFFIX[proto] or "-VL"
+                name = unique_name(base + suffix, taken_names)
+                taken_names.add(name)
+                try:
+                    results.append(_make_inbound(name, proto, tls[proto], row.get("expiry") or 0,
+                                                 groups.get(row.get("client_id"), ""), taken_ports, row["outbound_tag"]))
+                except Exception as e:
+                    results.append({"name": name, "protocol": proto, "ok": False, "error": str(e)})
+        core = _apply_rules(results, [])
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
@@ -844,7 +950,7 @@ def op_status(body):
 
 OPS = {
     "status": op_status, "list": op_list, "preview": op_preview, "create": op_create,
-    "check": op_check, "check_raw": op_check_raw, "replace": op_replace,
+    "check": op_check, "check_raw": op_check_raw, "replace": op_replace, "add_protocol": op_add_protocol,
     "update_clients": op_update_clients, "delete": op_delete, "links": op_links, "qr": op_qr,
 }
 
