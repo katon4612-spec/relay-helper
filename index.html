@@ -188,7 +188,7 @@ async function renderResults(){
   const rs=state.results||[];const ok=rs.filter(x=>x.ok);
   if(!$("#resbox"))return;
   $("#resbox").innerHTML=`<div class="card"><h2>3. 客户链接（${ok.length} 条）</h2>
-  <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码</button>
+  <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码（压缩包）</button>
   ${ok.some(x=>!x.firewall)?'<span class="hint">提醒：确认服务器防火墙 / 云安全组已放行这些端口</span>':""}</div>
   ${rs.filter(x=>!x.ok).map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
   <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
@@ -198,18 +198,63 @@ async function renderResults(){
   document.querySelectorAll("[data-cp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.cp].links[0]));
   for(let i=0;i<ok.length;i++){try{if(!ok[i].svg){const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg}H("#rq"+i,ok[i].svg)}catch(e){}}
   document.querySelectorAll("[data-dl]").forEach(b=>b.onclick=()=>downloadQR(ok[b.dataset.dl].name,ok[b.dataset.dl].svg,ok[b.dataset.dl].port));
-  $("#dlall").onclick=async()=>{for(const x of ok){await downloadQR(x.name,x.svg,x.port);await new Promise(r=>setTimeout(r,350))}};
+  $("#dlall").onclick=()=>downloadAllZip(ok.map(x=>({name:x.name,svg:x.svg,port:x.port,uri:(x.links||[])[0]})),($("#cust")&&$("#cust").value.trim()||"中转")+"_二维码");
 }
-function downloadQR(name,svg,port){
+const safeName=n=>String(n||"qr").replace(/[\\/:*?"<>|\r\n]/g,"_").trim()||"qr";
+function qrPng(name,svg,port){
   return new Promise(res=>{
-    if(!svg)return res();
-    const img=new Image();img.onload=()=>{const W=600,H=700,c=document.createElement("canvas");c.width=W;c.height=H;const g=c.getContext("2d");
-      g.fillStyle="#fff";g.fillRect(0,0,W,H);g.imageSmoothingEnabled=false;g.drawImage(img,40,30,520,520);
+    if(!svg)return res(null);
+    const img=new Image();img.onload=()=>{const W=600,HH=700,c=document.createElement("canvas");c.width=W;c.height=HH;const g=c.getContext("2d");
+      g.fillStyle="#fff";g.fillRect(0,0,W,HH);g.imageSmoothingEnabled=false;g.drawImage(img,40,30,520,520);
       g.fillStyle="#111";g.textAlign="center";g.font="bold 30px 'PingFang SC','Microsoft YaHei',sans-serif";g.fillText(name,W/2,600,W-30);
       g.fillStyle="#666";g.font="20px sans-serif";g.fillText(state.host+(port?":"+port:""),W/2,645,W-30);
-      c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=name.replace(/[\\/:*?"<>|]/g,"_")+".png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);res()},"image/png")};
+      c.toBlob(b=>res(b),"image/png")};
+    img.onerror=()=>res(null);
     img.src="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);
   });
+}
+function saveBlob(blob,filename){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),5000)}
+async function downloadQR(name,svg,port){const b=await qrPng(name,svg,port);if(b)saveBlob(b,safeName(name)+".png")}
+
+/* 最小 ZIP 打包（不压缩，PNG 本身已压缩）；文件名用 UTF-8 并设置 UTF-8 标志，Windows 自带解压能正确显示中文 */
+const CRC_T=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
+function crc32(u8){let c=0xFFFFFFFF;for(let i=0;i<u8.length;i++)c=CRC_T[(c^u8[i])&0xFF]^(c>>>8);return (c^0xFFFFFFFF)>>>0}
+function makeZip(files){
+  const enc=new TextEncoder(),parts=[],central=[];let off=0;
+  const d=new Date(),dt=((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1))&0xFFFF,dd=(((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate())&0xFFFF;
+  for(const f of files){
+    const name=enc.encode(f.name),data=f.data,crc=crc32(data);
+    const h=new DataView(new ArrayBuffer(30));
+    h.setUint32(0,0x04034b50,true);h.setUint16(4,20,true);h.setUint16(6,0x0800,true);h.setUint16(8,0,true);
+    h.setUint16(10,dt,true);h.setUint16(12,dd,true);h.setUint32(14,crc,true);h.setUint32(18,data.length,true);h.setUint32(22,data.length,true);
+    h.setUint16(26,name.length,true);h.setUint16(28,0,true);
+    parts.push(h,name,data);
+    const c=new DataView(new ArrayBuffer(46));
+    c.setUint32(0,0x02014b50,true);c.setUint16(4,20,true);c.setUint16(6,20,true);c.setUint16(8,0x0800,true);c.setUint16(10,0,true);
+    c.setUint16(12,dt,true);c.setUint16(14,dd,true);c.setUint32(16,crc,true);c.setUint32(20,data.length,true);c.setUint32(24,data.length,true);
+    c.setUint16(28,name.length,true);c.setUint16(30,0,true);c.setUint16(32,0,true);c.setUint16(34,0,true);c.setUint16(36,0,true);c.setUint32(38,0,true);c.setUint32(42,off,true);
+    central.push(c,name);
+    off+=30+name.length+data.length;
+  }
+  const cdSize=central.reduce((s,x)=>s+x.byteLength,0);
+  const end=new DataView(new ArrayBuffer(22));
+  end.setUint32(0,0x06054b50,true);end.setUint16(8,files.length,true);end.setUint16(10,files.length,true);end.setUint32(12,cdSize,true);end.setUint32(16,off,true);
+  return new Blob([...parts,...central,end],{type:"application/zip"});
+}
+/* items: [{name, svg, port, uri}]；缺二维码的会先向服务器取 */
+async function downloadAllZip(items,zipName){
+  if(!items.length)return toast("没有可下载的二维码");
+  toast(`正在打包 ${items.length} 张二维码…`,60000);
+  const files=[],used=new Set();
+  for(const x of items){
+    try{if(!x.svg&&x.uri){const q=await api("qr",{text:x.uri});x.svg=q.svg}}catch(e){}
+    const b=await qrPng(x.name,x.svg,x.port);if(!b)continue;
+    let n=safeName(x.name),k=2;while(used.has(n)){n=safeName(x.name)+"-"+k++}used.add(n);
+    files.push({name:n+".png",data:new Uint8Array(await b.arrayBuffer())});
+  }
+  const p=n=>String(n).padStart(2,"0"),d=new Date();
+  saveBlob(makeZip(files),safeName(zipName)+`_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.zip`);
+  toast(`已下载压缩包（${files.length} 张二维码）`);
 }
 
 /* ---------------- 线路管理 ---------------- */
@@ -279,9 +324,9 @@ async function exportLinks(tags){
   modal('<span class="spin"></span> 生成中…');
   try{const l=await api("links",{client_ids:ids});const txt=l.links.map(x=>x.uri).join("\n");
     modal(`<h2 style="margin-top:0">导出 ${l.links.length} 条链接</h2><textarea style="min-height:220px">${esc(txt)}</textarea>
-    <div class="row" style="margin-top:10px"><button class="pri" id="ecp">复制</button><button id="edq">下载全部二维码</button><button id="ecl">关闭</button></div>`);
+    <div class="row" style="margin-top:10px"><button class="pri" id="ecp">复制</button><button id="edq">下载全部二维码（压缩包）</button><button id="ecl">关闭</button></div>`);
     $("#ecp").onclick=()=>copy(txt);$("#ecl").onclick=closeModal;
-    $("#edq").onclick=async()=>{for(const x of l.links){const r=state.relays.find(r=>r.client_id===x.client_id);await downloadQR(r?r.tag:"qr",x.svg,r&&r.port);await new Promise(z=>setTimeout(z,350))}};
+    $("#edq").onclick=()=>downloadAllZip(l.links.map(x=>{const r=state.relays.find(r=>r.client_id===x.client_id);return {name:r?r.tag:"qr",svg:x.svg,port:r&&r.port,uri:x.uri}}),(state.q||"线路")+"_二维码");
   }catch(e){closeModal();toast(e.message)}
 }
 function replaceDlg(tag){
@@ -325,7 +370,8 @@ async function showNew(ok,bad){
   modal(`<h2 style="margin-top:0">新增节点（${ok.length}）</h2>${bad.map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
   <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
   <div class="qr" id="nq${i}"><span class="spin"></span></div><div class="acts" style="justify-content:center"><button class="sm" data-ncp="${i}">复制链接</button><button class="sm" data-ndl="${i}">下载二维码</button></div></div>`).join("")}</div>
-  <div class="row" style="margin-top:12px"><button class="pri" id="ncpall">复制全部链接</button><button id="ncl">关闭</button></div>`);
+  <div class="row" style="margin-top:12px"><button class="pri" id="ncpall">复制全部链接</button><button id="ndlall">下载全部二维码</button><button id="ncl">关闭</button></div>`);
+  $("#ndlall").onclick=()=>downloadAllZip(ok.map(x=>({name:x.name,svg:x.svg,port:x.port,uri:(x.links||[])[0]})),"新增节点_二维码");
   $("#ncl").onclick=closeModal;$("#ncpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
   document.querySelectorAll("[data-ncp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.ncp].links[0]));
   for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;H("#nq"+i,q.svg)}catch(e){}}
