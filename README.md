@@ -1,0 +1,61 @@
+# 中转助手（s-ui 一键中转）
+
+粘贴落地 → 自动在 s-ui 里建好中转节点 → 出客户链接和二维码。
+
+- 落地支持：`socks5://账号:密码@IP:端口`、`IP:端口:账号:密码`、`http://`、`vless://`、`vmess://`、`trojan://`、`hy2://`、`ss://`、`tuic://`、`anytls://`
+- 客户入站可选：VLESS-Reality（推荐）、Hysteria2、SOCKS5
+- 节点名自动生成：落地国家 + 客户名 + 落地 IP（可改）
+- 线路管理：搜索、检测落地连通、原位换落地（客户链接不变）、续期、停用/启用、批量导出链接和二维码、删除
+- 只通过 s-ui 自带接口操作，不改 s-ui 程序，s-ui 面板里照样能看到和修改这些节点
+
+## 安装
+
+在装有 s-ui 的中转服务器上（root）执行一行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/main/install.sh)
+```
+
+升级也是同一行命令（保留原配置）。
+
+安装时自动读取 s-ui 的端口、路径和管理员账号，只需要输入「中转机域名/IP」（客户链接里用的地址，例如 `yyus.liveshop.work`）。
+装完会显示访问地址和登录密码。
+
+**云服务器安全组**需要放行：
+- 工具页面端口（安装完显示，默认 2097/TCP）
+- 中转端口范围 10000-60000（TCP；用 Hysteria2 还要 UDP）
+
+服务器自带的 ufw / firewalld 会自动放行，不用手动加。
+
+## 使用
+
+1. 「一键中转」：填客户名、选入站协议和到期时间，粘贴落地（每行一条）→ 解析预览 → 检测落地 → 创建
+2. 创建完成后可以复制全部链接、下载全部二维码（文件名就是节点名）
+3. 「线路管理」：按客户名/IP 搜索，勾选后可批量检测、续期、停用、导出、删除
+
+## 需要知道的
+
+- **创建和删除会重启一次 s-ui**（约 3 秒断线）：s-ui 改路由规则必须重启内核，而 s-ui 1.3.10 在面板里直接重启内核时，有 Hysteria2 节点就可能出现 `address already in use`，导致所有节点掉线。工具改为直接重启 s-ui 服务，每次都能干净恢复。批量创建/删除只重启一次。
+- 换落地、续期、停用/启用 **不会**重启，不影响其他线路。
+- 落地国家通过 ip-api.com 查询（会把落地 IP 发给这个免费服务）。不想用可以在配置里设 `"geo_lookup": false`。
+- 默认是 HTTP 访问。如果 s-ui 面板配置了证书，工具会自动用同一张证书开 HTTPS。
+
+## 配置文件
+
+`/opt/relay-helper/config.json`，改完执行 `systemctl restart relay-helper`。
+
+| 项 | 说明 |
+|---|---|
+| `port` / `path` / `password` | 工具页面端口、访问路径、登录密码 |
+| `public_host` | 客户链接里的服务器地址 |
+| `sui_url` / `sui_user` / `sui_pass` | s-ui 地址和管理员账号 |
+| `port_min` / `port_max` | 新中转端口的随机范围 |
+| `check_url` | 检测落地时访问的网址 |
+| `geo_lookup` | 是否自动查落地国家 |
+| `auto_firewall` | 是否自动在 ufw/firewalld 放行新端口 |
+
+## 升级 / 卸载
+
+- 升级：重新执行上面的安装命令（保留原配置）
+- 卸载：`bash /opt/relay-helper/install.sh uninstall`（已建的线路不受影响）
+- 日志：`journalctl -u relay-helper -f`

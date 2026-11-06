@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中转助手</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--text:#1d2433;--muted:#6b7385;--line:#e4e8ef;--pri:#2563eb;--pri2:#1e4fc2;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--chip:#eef2ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,sans-serif}
+header{background:#111827;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}
+header h1{font-size:17px;margin:0;font-weight:600}
+header .host{color:#9ca3af;font-size:12px}
+header nav{margin-left:auto;display:flex;gap:6px}
+header nav button{background:transparent;color:#cbd5e1;border:1px solid #374151;border-radius:8px;padding:6px 14px;cursor:pointer}
+header nav button.on{background:#fff;color:#111827;border-color:#fff}
+main{max-width:1180px;margin:18px auto;padding:0 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.row label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+input,select,textarea{font:inherit;border:1px solid #cfd6e2;border-radius:8px;padding:7px 10px;background:#fff;color:var(--text)}
+textarea{width:100%;min-height:150px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+input:focus,select:focus,textarea:focus{outline:2px solid #bfd3ff;border-color:var(--pri)}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid #cfd6e2;background:#fff;padding:7px 14px;color:var(--text)}
+button.pri{background:var(--pri);border-color:var(--pri);color:#fff}
+button.pri:hover{background:var(--pri2)}
+button.danger{color:var(--bad);border-color:#f3c2c2}
+button.sm{padding:3px 9px;font-size:12px}
+button:disabled{opacity:.5;cursor:default}
+.hint{color:var(--muted);font-size:12px;margin:6px 0 0}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{font-size:12px;color:var(--muted);font-weight:500;background:#fafbfc}
+td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:var(--chip);color:#3730a3}
+.tag.ok{background:#dcfce7;color:#166534}.tag.bad{background:#fee2e2;color:#991b1b}.tag.warn{background:#fef3c7;color:#92400e}.tag.gray{background:#f1f5f9;color:#64748b}
+.acts{display:flex;gap:4px;flex-wrap:wrap}
+.results{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.res{border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center}
+.res .name{font-weight:600;word-break:break-all}
+.res .qr svg{width:180px;height:180px}
+.res .link{font-size:11px;word-break:break-all;color:var(--muted);max-height:48px;overflow:hidden;margin:6px 0}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.toolbar .grow{flex:1}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 18px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw;z-index:9}
+#toast.show{opacity:1}
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:8;padding:16px}
+.modal.show{display:flex}
+.modal .box{background:#fff;border-radius:12px;padding:18px;max-width:560px;width:100%;max-height:90vh;overflow:auto}
+.login{max-width:360px;margin:12vh auto}
+.muted{color:var(--muted)}
+.err{color:var(--bad)}
+.pager{display:flex;gap:6px;align-items:center;justify-content:flex-end;margin-top:10px}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #cbd5e1;border-top-color:var(--pri);border-radius:50%;animation:s .8s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+@media(max-width:720px){.hide-sm{display:none}header{flex-wrap:wrap}header nav{margin-left:0}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<div class="modal" id="modal"><div class="box" id="mbox"></div></div>
+<script>
+const BASE="__BASE__";
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let state={tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
+
+async function api(a,body){
+  const r=await fetch(BASE+"api/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
+  if(j.login){renderLogin();throw new Error("请先登录")}
+  if(!j.ok)throw new Error(j.error||"操作失败");
+  return j;
+}
+function toast(m,ms=2600){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),ms)}
+function modal(html){$("#mbox").innerHTML=html;$("#modal").classList.add("show")}
+function closeModal(){$("#modal").classList.remove("show")}
+$("#modal").addEventListener("click",e=>{if(e.target.id==="modal")closeModal()});
+function copy(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast("已复制")).catch(()=>{const a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove();toast("已复制")})}
+function coreMsg(c){if(c==="restarted")return "，已重启 s-ui 使路由生效（约 3 秒断线）";if(c==="down")return "。⚠ s-ui 内核未能启动，请登录服务器执行 systemctl restart s-ui";return ""}
+const fmtDate=ts=>{if(!ts)return "永久";const d=new Date(ts*1000);const p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`};
+function daysLeft(ts){if(!ts)return null;const d=(ts*1000-Date.now())/86400000;return d<0?-1:Math.ceil(d)}
+function expTag(r){if(r.enable===false)return '<span class="tag gray">已停用</span>';const d=daysLeft(r.expiry);if(d===null)return '<span class="tag ok">永久</span>';if(d<0)return '<span class="tag bad">已过期</span>';if(d<=7)return `<span class="tag warn">${d} 天</span>`;return `<span class="tag ok">${d} 天</span>`}
+const protoName={vless:"VLESS-Reality",hysteria2:"Hysteria2",socks:"SOCKS5",mixed:"Mixed",vmess:"VMess",trojan:"Trojan",shadowsocks:"SS",tuic:"TUIC",anytls:"AnyTLS",http:"HTTP"};
+
+function renderLogin(){
+  $("#app").innerHTML=`<div class="card login"><h2>中转助手 · 登录</h2>
+  <input id="pw" type="password" placeholder="登录密码" style="width:100%" autofocus>
+  <div style="margin-top:12px"><button class="pri" id="lg" style="width:100%">登录</button></div><p class="err" id="lerr"></p></div>`;
+  const go=async()=>{try{await api("login",{password:$("#pw").value});init()}catch(e){$("#lerr").textContent=e.message}};
+  $("#lg").onclick=go;$("#pw").onkeydown=e=>{if(e.key==="Enter")go()};
+}
+
+function shell(){
+  $("#app").innerHTML=`<header><h1>中转助手</h1><span class="host" id="hostinfo"></span>
+  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
+  document.querySelectorAll("header nav button[data-t]").forEach(b=>b.onclick=()=>{state.tab=b.dataset.t;render()});
+  $("#logout").onclick=async()=>{await fetch(BASE+"api/logout",{method:"POST"});renderLogin()};
+}
+function render(){
+  document.querySelectorAll("header nav button[data-t]").forEach(b=>b.classList.toggle("on",b.dataset.t===state.tab));
+  if(state.tab==="create")renderCreate();else renderManage();
+}
+
+/* ---------------- 一键中转 ---------------- */
+function renderCreate(){
+  const m=$("#main");
+  const saved=JSON.parse(localStorage.getItem("rh_form")||"{}");
+  m.innerHTML=`<div class="card"><h2>1. 粘贴落地</h2>
+  <div class="row">
+    <label>客户名 <input id="cust" placeholder="如：见山" value="${esc(saved.cust||"")}"></label>
+    <label>入站协议（客户连接用）<select id="proto">
+      <option value="vless">VLESS-Reality（推荐）</option><option value="hysteria2">Hysteria2（UDP）</option><option value="socks">SOCKS5</option></select></label>
+    <label>到期 <select id="days"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option><option value="0">永久</option><option value="custom">指定日期…</option></select></label>
+    <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
+  </div>
+  <div style="margin-top:12px"><textarea id="txt" placeholder="每行一条落地，支持：
+socks5://账号:密码@IP:端口
+IP:端口:账号:密码
+vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
+也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
+  <p class="hint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。</p>
+  <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button></div></div>
+  <div id="pvbox"></div><div id="resbox"></div>`;
+  $("#proto").value=saved.proto||"vless";$("#days").value=saved.days||"30";
+  const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
+  $("#pv").onclick=doPreview;
+  if(state.preview)renderPreview();if(state.results)renderResults();
+}
+function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"){const d=$("#cdate").value;if(!d)throw new Error("请选择到期日期");return Math.floor(new Date(d).getTime()/1000)}return Math.floor(Date.now()/1000)+parseInt(v)*86400}
+async function doPreview(){
+  const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
+  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,proto:$("#proto").value,days:$("#days").value}));
+  try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;$("#resbox").innerHTML="";renderPreview()}
+  catch(e){toast(e.message)}finally{b.disabled=false;b.textContent="解析预览"}
+}
+function renderPreview(){
+  const it=state.preview||[];const good=it.filter(x=>!x.error).length;
+  $("#pvbox").innerHTML=`<div class="card"><h2>2. 确认线路（${good} 条可建${it.length-good?`，${it.length-good} 条有误`:""}）</h2>
+  <div style="overflow:auto"><table><tr><th>#</th><th>节点名（可改）</th><th>落地</th><th class="hide-sm">类型</th><th>检测</th></tr>
+  ${it.map((x,i)=>x.error?`<tr><td>${i+1}</td><td colspan="4"><span class="err">✗ ${esc(x.error)}</span> <span class="mono muted">${esc(x.raw)}</span></td></tr>`:
+  `<tr><td>${i+1}</td><td><input data-i="${i}" class="nm" value="${esc(x.name)}" style="width:100%;min-width:180px"></td>
+   <td class="mono">${esc(x.outbound.server)}:${esc(x.outbound.server_port)}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
+   <td class="hide-sm">${esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
+  </table></div>
+  <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${good?"":"disabled"}>创建 ${good} 条中转</button>
+  <span class="hint">创建后会自动重启一次 s-ui 让路由生效，所有线路约断 3 秒。</span></div></div>`;
+  document.querySelectorAll(".nm").forEach(n=>n.oninput=()=>{state.preview[n.dataset.i].name=n.value.trim()});
+  $("#pchk").onclick=preCheck;$("#mk").onclick=doCreate;
+}
+function pcHtml(c){if(!c)return '<span class="muted">-</span>';if(c==="..")return '<span class="spin"></span>';return c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`}
+async function preCheck(){
+  const idx=[];const items=[];state.pvcheck={};
+  state.preview.forEach((x,i)=>{if(!x.error){idx.push(i);items.push(x);state.pvcheck[i]="..";$("#pc"+i).innerHTML=pcHtml("..")}});
+  try{const r=await api("check_raw",{items});r.results.forEach((c,k)=>{state.pvcheck[idx[k]]=c;$("#pc"+idx[k]).innerHTML=pcHtml(c)});
+    const bad=r.results.filter(c=>!c.ok).length;toast(bad?`${bad} 条落地不通，鼠标悬停看原因`:"全部落地连通")}
+  catch(e){toast(e.message)}
+}
+async function doCreate(){
+  let expiry;try{expiry=expiryTs()}catch(e){return toast(e.message)}
+  const items=state.preview.filter(x=>!x.error&&x.name);
+  const badN=Object.values(state.pvcheck||{}).filter(c=>c&&c!==".."&&!c.ok).length;
+  if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起创建。\n\n`:""}确定创建 ${items.length} 条中转？\n创建后会重启 s-ui 让路由生效，所有线路约断 3 秒。`))return;
+  const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
+  try{const r=await api("create",{items,protocol:$("#proto").value,expiry,customer:$("#cust").value.trim()});
+    state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
+    state.preview=null;$("#pvbox").innerHTML="";  // 防止同一批重复创建
+    toast(`成功 ${ok} 条${ok<r.results.length?`，失败 ${r.results.length-ok} 条`:""}${coreMsg(r.core)}`,5000);renderResults()}
+  catch(e){toast(e.message,5000);b.disabled=false;b.textContent="创建"}
+}
+async function renderResults(){
+  const rs=state.results||[];const ok=rs.filter(x=>x.ok);
+  $("#resbox").innerHTML=`<div class="card"><h2>3. 客户链接（${ok.length} 条）</h2>
+  <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码</button>
+  ${ok.some(x=>!x.firewall)?'<span class="hint">提醒：确认服务器防火墙 / 云安全组已放行这些端口</span>':""}</div>
+  ${rs.filter(x=>!x.ok).map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
+  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">端口 ${x.port}</div>
+  <div class="qr" id="rq${i}"><span class="spin"></span></div><div class="link mono">${esc((x.links||[])[0]||"")}</div>
+  <div class="acts" style="justify-content:center"><button class="sm" data-cp="${i}">复制链接</button><button class="sm" data-dl="${i}">下载二维码</button></div></div>`).join("")}</div></div>`;
+  $("#cpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
+  document.querySelectorAll("[data-cp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.cp].links[0]));
+  for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;$("#rq"+i).innerHTML=q.svg}catch(e){}}
+  document.querySelectorAll("[data-dl]").forEach(b=>b.onclick=()=>downloadQR(ok[b.dataset.dl].name,ok[b.dataset.dl].svg,ok[b.dataset.dl].port));
+  $("#dlall").onclick=async()=>{for(const x of ok){await downloadQR(x.name,x.svg,x.port);await new Promise(r=>setTimeout(r,350))}};
+}
+function downloadQR(name,svg,port){
+  return new Promise(res=>{
+    if(!svg)return res();
+    const img=new Image();img.onload=()=>{const W=600,H=700,c=document.createElement("canvas");c.width=W;c.height=H;const g=c.getContext("2d");
+      g.fillStyle="#fff";g.fillRect(0,0,W,H);g.imageSmoothingEnabled=false;g.drawImage(img,40,30,520,520);
+      g.fillStyle="#111";g.textAlign="center";g.font="bold 30px 'PingFang SC','Microsoft YaHei',sans-serif";g.fillText(name,W/2,600,W-30);
+      g.fillStyle="#666";g.font="20px sans-serif";g.fillText(state.host+(port?":"+port:""),W/2,645,W-30);
+      c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=name.replace(/[\\/:*?"<>|]/g,"_")+".png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);res()},"image/png")};
+    img.src="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);
+  });
+}
+
+/* ---------------- 线路管理 ---------------- */
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;$("#hostinfo").textContent=r.public_host}
+async function renderManage(){
+  const m=$("#main");
+  m.innerHTML=`<div class="card"><div class="toolbar"><input id="q" class="grow" placeholder="搜索：客户名 / 节点名 / 落地 IP / 端口" value="${esc(state.q)}">
+  <button id="rf">刷新</button></div>
+  <div class="toolbar" id="bulk"></div><div style="overflow:auto" id="tbl"><span class="spin"></span></div><div class="pager" id="pg"></div></div>`;
+  $("#q").oninput=()=>{state.q=$("#q").value.trim();state.page=1;drawTable()};
+  $("#rf").onclick=async()=>{await loadRelays();drawTable()};
+  try{await loadRelays();drawTable()}catch(e){toast(e.message)}
+}
+function filtered(){const q=state.q.toLowerCase();return state.relays.filter(r=>!q||[r.tag,r.landing,r.port,r.outbound_tag].join(" ").toLowerCase().includes(q))}
+function drawTable(){
+  const all=filtered();const per=20;const pages=Math.max(1,Math.ceil(all.length/per));if(state.page>pages)state.page=pages;
+  const rows=all.slice((state.page-1)*per,state.page*per);
+  const nsel=state.sel.size;
+  $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条${nsel?`，已选 ${nsel} 条`:""}</span>
+   <button class="sm" id="selall">全选当前搜索</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
+   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
+   <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
+  $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>检测</th><th>操作</th></tr>
+  ${rows.map(r=>`<tr><td><input type="checkbox" data-s="${esc(r.tag)}" ${state.sel.has(r.tag)?"checked":""}></td>
+  <td style="word-break:break-all;min-width:150px">${esc(r.tag)}</td>
+  <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
+  <td class="mono">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>
+  <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
+  <td>${pcHtml(state.checks[r.tag])}</td>
+  <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
+  <button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
+  <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
+  <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>续期</button>
+  <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</table>`;
+  $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
+  if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
+  document.querySelectorAll("[data-s]").forEach(c=>c.onchange=()=>{c.checked?state.sel.add(c.dataset.s):state.sel.delete(c.dataset.s);drawTable()});
+  $("#selall").onclick=()=>{all.forEach(r=>state.sel.add(r.tag));drawTable()};
+  if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
+    $("#bchk").onclick=()=>checkTags([...state.sel]);$("#bren").onclick=()=>renewDlg([...state.sel]);
+    $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
+    $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,ren:t=>renewDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+}
+const byTag=t=>state.relays.find(r=>r.tag===t);
+async function checkTags(tags){
+  const ts=tags.filter(t=>byTag(t)&&byTag(t).outbound_tag);
+  ts.forEach(t=>state.checks[t]="..");drawTable();
+  try{const r=await api("check",{tags:ts.map(t=>byTag(t).outbound_tag)});
+    r.results.forEach((c,i)=>state.checks[ts[i]]=c);const bad=r.results.filter(c=>!c.ok).length;toast(bad?`${bad} 条不通`:"全部连通")}
+  catch(e){ts.forEach(t=>delete state.checks[t]);toast(e.message)}drawTable();
+}
+async function showLinks(tag){
+  const r=byTag(tag);modal('<span class="spin"></span>');
+  try{const l=await api("links",{client_ids:[r.client_id]});
+    const x=l.links[0]||{};
+    modal(`<h2 style="margin-top:0">${esc(tag)}</h2><div style="text-align:center">${x.svg||"无链接"}</div>
+    <p class="mono" style="word-break:break-all;font-size:12px">${esc(x.uri||"")}</p>
+    <div class="row"><button class="pri" id="mcp">复制链接</button><button id="mdl">下载二维码</button><button id="mcl">关闭</button></div>`);
+    $("#mcp").onclick=()=>copy(x.uri);$("#mdl").onclick=()=>downloadQR(tag,x.svg,r.port);$("#mcl").onclick=closeModal;
+  }catch(e){closeModal();toast(e.message)}
+}
+async function exportLinks(tags){
+  const ids=[...new Set(tags.map(t=>byTag(t)).filter(r=>r&&r.client_id).map(r=>r.client_id))];
+  modal('<span class="spin"></span> 生成中…');
+  try{const l=await api("links",{client_ids:ids});const txt=l.links.map(x=>x.uri).join("\n");
+    modal(`<h2 style="margin-top:0">导出 ${l.links.length} 条链接</h2><textarea style="min-height:220px">${esc(txt)}</textarea>
+    <div class="row" style="margin-top:10px"><button class="pri" id="ecp">复制</button><button id="edq">下载全部二维码</button><button id="ecl">关闭</button></div>`);
+    $("#ecp").onclick=()=>copy(txt);$("#ecl").onclick=closeModal;
+    $("#edq").onclick=async()=>{for(const x of l.links){const r=state.relays.find(r=>r.client_id===x.client_id);await downloadQR(r?r.tag:"qr",x.svg,r&&r.port);await new Promise(z=>setTimeout(z,350))}};
+  }catch(e){closeModal();toast(e.message)}
+}
+function replaceDlg(tag){
+  const r=byTag(tag);
+  modal(`<h2 style="margin-top:0">更换落地：${esc(tag)}</h2><p class="muted">当前落地：<span class="mono">${esc(r.landing)}</span></p>
+  <p class="hint">客户的链接和二维码不变，只换出口。</p>
+  <input id="nl" style="width:100%" placeholder="socks5://账号:密码@IP:端口 或 IP:端口:账号:密码 或 vless://…">
+  <div class="row" style="margin-top:12px"><button class="pri" id="rok">替换并检测</button><button id="rcl">取消</button></div><p id="rmsg"></p>`);
+  $("#rcl").onclick=closeModal;
+  $("#rok").onclick=async()=>{const b=$("#rok");b.disabled=true;b.innerHTML='<span class="spin"></span> 替换中';
+    try{const x=await api("replace",{tag,landing:$("#nl").value.trim()});state.checks[tag]=x.check;
+      $("#rmsg").innerHTML=x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`;
+      await loadRelays();drawTable()}catch(e){$("#rmsg").innerHTML=`<span class="err">${esc(e.message)}</span>`}finally{b.disabled=false;b.textContent="替换并检测"}};
+}
+function renewDlg(tags){
+  const rs=tags.map(byTag).filter(r=>r&&r.client_id);if(!rs.length)return toast("所选线路没有用户");
+  modal(`<h2 style="margin-top:0">续期 ${rs.length} 条</h2>
+  <div class="row"><label>方式<select id="rm"><option value="add">在原到期时间上延长</option><option value="set">设为指定日期</option><option value="forever">改为永久</option></select></label>
+  <label id="ral">延长天数<input id="rd" type="number" value="30" min="1" style="width:100px"></label>
+  <label id="rsl" style="display:none">到期日期<input id="rdt" type="datetime-local"></label></div>
+  <p class="hint">已过期的从今天开始算；续期后自动重新启用。</p>
+  <div class="row" style="margin-top:12px"><button class="pri" id="rnok">确定</button><button id="rncl">取消</button></div>`);
+  const sync=()=>{const v=$("#rm").value;$("#ral").style.display=v==="add"?"flex":"none";$("#rsl").style.display=v==="set"?"flex":"none"};$("#rm").onchange=sync;
+  $("#rncl").onclick=closeModal;
+  $("#rnok").onclick=async()=>{const mode=$("#rm").value;const now=Math.floor(Date.now()/1000);
+    try{let groups={};
+      for(const r of rs){let e;if(mode==="forever")e=0;else if(mode==="set"){if(!$("#rdt").value)throw new Error("请选择日期");e=Math.floor(new Date($("#rdt").value).getTime()/1000)}
+        else{e=Math.max(r.expiry||now,now)+parseInt($("#rd").value||"0")*86400}(groups[e]=groups[e]||[]).push(r.client_id)}
+      let fail=0;for(const[e,ids]of Object.entries(groups)){const x=await api("update_clients",{client_ids:ids,expiry:parseInt(e)});fail+=x.results.filter(z=>!z.ok).length}
+      closeModal();toast(fail?`${fail} 条失败`:"已续期");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+}
+async function setEnable(tags,en){
+  const ids=[...new Set(tags.map(byTag).filter(r=>r&&r.client_id).map(r=>r.client_id))];
+  if(!en&&!confirm(`停用 ${ids.length} 个用户？停用后客户无法连接。`))return;
+  try{const x=await api("update_clients",{client_ids:ids,enable:en});toast(en?"已启用":"已停用");await loadRelays();drawTable()}catch(e){toast(e.message)}
+}
+async function delTags(tags){
+  if(!confirm(`确定删除 ${tags.length} 条线路？\n会删除入站、用户、路由和落地出站，并重启 s-ui（约 3 秒断线）。此操作不可恢复。`))return;
+  toast("删除中…",15000);
+  try{const x=await api("delete",{tags});const bad=x.results.filter(r=>!r.ok);
+    tags.forEach(t=>state.sel.delete(t));toast((bad.length?`${bad.length} 条失败：${bad.map(b=>b.error).join("；")}`:"已删除")+coreMsg(x.core),5000);
+    await loadRelays();drawTable()}catch(e){toast(e.message)}
+}
+
+async function init(){
+  shell();
+  try{const s=await api("status");state.host=s.public_host;$("#hostinfo").textContent=s.public_host;
+    if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000)}catch(e){return}
+  render();
+}
+init();
+</script>
+</body>
+</html>
