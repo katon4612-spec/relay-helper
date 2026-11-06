@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -416,7 +416,7 @@ def build_relays(data):
             "outbound_tag": ot,
             "outbound_id": ob.get("id") if ob else None,
             "landing_type": ob.get("type") if ob else None,
-            "landing": ("%s:%s" % (ob.get("server"), ob.get("server_port"))) if ob and ob.get("server") else (ot or ""),
+            "landing": "本机直连" if ob and ob.get("type") == "direct" else (("%s:%s" % (ob.get("server"), ob.get("server_port"))) if ob and ob.get("server") else (ot or "")),
             "landing_user": (ob or {}).get("username", ""),
             "landing_info": landing_info(ob) if ob else None,
             "client_id": main.get("id") if main else None,
@@ -590,11 +590,38 @@ def reserve_ports():
 
 
 # ----------------------------------------------------------- operations --
+def server_ip():
+    """中转机自己的公网 IP：先解析 public_host，解析不到再问外部服务。"""
+    ip = resolve(CFG["public_host"])
+    if ip and not ip.startswith(("127.", "10.", "192.168.")):
+        return ip
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                v = r.read().decode().strip()
+                if is_ip(v):
+                    return v
+        except Exception:
+            pass
+    return ip or CFG["public_host"]
+
+
 def op_preview(body):
     lines = [l for l in (body.get("text") or "").splitlines() if l.strip()]
     customer = (body.get("customer") or "").strip()
     data = SUI.load_all()
     taken = {i.get("tag") for i in data.get("inbounds") or []} | {o.get("tag") for o in data.get("outbounds") or []} | {c.get("name") for c in data.get("clients") or []}
+    if body.get("direct"):
+        # 直连：不用落地，客户从中转机自己的 IP 出网。每条线路单独一个 direct 出站，方便分组、限额、以后换成落地。
+        n = max(1, min(100, int(body.get("count") or 1)))
+        ip = server_ip()
+        country = geo_lookup([ip]).get(ip, "") if is_ip(ip) else ""
+        items = []
+        for _ in range(n):
+            items.append({"raw": "本机直连", "outbound": {"type": "direct"}, "host": ip, "ip": ip, "direct": True,
+                          "country": country, "error": "", "dup": [],
+                          "name": unique_name("%s%s直连%s" % (country, customer, ip), taken)})
+        return {"items": items}
     items = []
     for ln in lines:
         name_override = ""

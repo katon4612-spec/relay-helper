@@ -52,6 +52,7 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
 .ck input{margin:0}
+.modes{display:flex;gap:8px;flex-wrap:wrap}
 .tag{white-space:nowrap}.clk{cursor:pointer}.clk:hover{filter:brightness(.95);text-decoration:underline}th{white-space:nowrap}td.mono{white-space:nowrap}
 .bar{height:5px;background:#eef2f7;border-radius:3px;overflow:hidden;margin:3px 0;width:100px}.bar i{display:block;height:100%}
 .dupbox{margin-top:6px;font-size:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:6px 8px}.dupbox select{margin-top:4px;width:100%;font-size:12px;padding:4px 6px}
@@ -119,8 +120,10 @@ function render(){
 function renderCreate(){
   const m=$("#main");
   const saved=JSON.parse(localStorage.getItem("rh_form")||"{}");
-  m.innerHTML=`<div class="card"><h2>1. 粘贴落地</h2>
-  <div class="row">
+  m.innerHTML=`<div class="card"><h2>1. 选择类型</h2>
+  <div class="modes" id="modes"><label class="ck"><input type="radio" name="mode" value="relay">中转（粘贴落地，走落地 IP 出网）</label>
+  <label class="ck"><input type="radio" name="mode" value="direct">直连（不用落地，走本服务器 IP 出网）</label></div>
+  <div class="row" style="margin-top:12px">
     <label>客户名 <input id="cust" placeholder="如：见山" value="${esc(saved.cust||"")}"></label>
     <label>入站协议（客户连接用，可多选）<span class="protos" id="protos">
       <label class="ck"><input type="checkbox" value="vless">VLESS-Reality</label>
@@ -131,27 +134,33 @@ function renderCreate(){
     <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
     <label>设备数（0=不限）<input id="qdev" type="number" min="0" step="1" value="${esc(saved.qdev??0)}" style="width:110px"></label>
   </div>
-  <div style="margin-top:12px"><textarea id="txt" placeholder="每行一条落地，支持：
+  <div id="dcnt" class="row" style="margin-top:12px;display:none"><label>创建几条直连线路<input id="dn" type="number" min="1" max="100" value="1" style="width:110px"></label>
+    <span class="hint">每条线路单独计流量、设备和到期；出口 IP 都是本服务器（${esc(state.host||"")}）。</span></div>
+  <div style="margin-top:12px" id="txtbox"><textarea id="txt" placeholder="每行一条落地，支持：
 socks5://账号:密码@IP:端口
 IP:端口:账号:密码
 vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
 也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
-  <p class="hint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
+  <p class="hint" id="relayhint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
   <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button></div></div>
   <div id="pvbox"></div><div id="resbox"></div>`;
   const sp=saved.protos||[saved.proto||"vless"];document.querySelectorAll("#protos input").forEach(c=>c.checked=sp.includes(c.value));
   $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
   $("#pv").onclick=doPreview;
+  const md=state.mode||saved.mode||"relay";document.querySelector(`#modes input[value=${md}]`).checked=true;
+  const msync=()=>{const d=curMode()==="direct";state.mode=curMode();$("#txtbox").style.display=d?"none":"";$("#relayhint").style.display=d?"none":"";$("#dcnt").style.display=d?"flex":"none"};
+  document.querySelectorAll("#modes input").forEach(r=>r.onchange=()=>{msync();state.preview=null;H("#pvbox","")});msync();
   if(state.text)$("#txt").value=state.text;$("#txt").oninput=()=>{state.text=$("#txt").value};
   if(state.preview)renderPreview();if(state.results)renderResults();
 }
+const curMode=()=>(document.querySelector("#modes input:checked")||{}).value||"relay";
 function selProtos(sel="#protos"){return [...document.querySelectorAll(sel+" input:checked")].map(c=>c.value)}
 function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"){const d=$("#cdate").value;if(!d)throw new Error("请选择到期日期");return Math.floor(new Date(d).getTime()/1000)}return Math.floor(Date.now()/1000)+parseInt(v)*86400}
 async function doPreview(){
   const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
-  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value,qgb:$("#qgb").value,qdev:$("#qdev").value}));
-  try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;H("#resbox","");renderPreview()}
+  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value,qgb:$("#qgb").value,qdev:$("#qdev").value,mode:curMode()}));
+  try{const r=await api("preview",curMode()==="direct"?{direct:true,count:parseInt($("#dn").value||"1"),customer:$("#cust").value.trim()}:{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;H("#resbox","");renderPreview()}
   catch(e){toast(e.message)}finally{const bb=$("#pv");if(bb){bb.disabled=false;bb.textContent="解析预览"}}
 }
 function pvMode(x){if(x.mode)return x.mode;return (x.dup||[]).length?"attach:"+x.dup[0].tag:"new"}
@@ -173,8 +182,8 @@ function renderPreview(){
        <option value="new" ${x.mode==="new"?"selected":""}>新建独立线路（单独的出站和到期）</option>
        <option value="skip" ${x.mode==="skip"?"selected":""}>跳过这条</option>
      </select></div>`:""}</td>
-   <td class="mono">${esc(x.outbound.server)}:${esc(x.outbound.server_port)}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
-   <td class="hide-sm">${esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
+   <td class="mono">${x.direct?`本机直连 ${esc(x.ip)}`:`${esc(x.outbound.server)}:${esc(x.outbound.server_port)}`}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
+   <td class="hide-sm">${x.direct?"直连":esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
   </table></div>
   <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${nNew+nAtt?"":"disabled"}>${nNew?`新建 ${nNew} 条`:""}${nNew&&nAtt?" + ":""}${nAtt?`挂到原线路 ${nAtt} 条`:""}${!nNew&&!nAtt?"没有要处理的":""}</button>
   <span class="hint">完成后会自动重启 s-ui 让路由生效，所有线路约断 3 秒。</span></div></div>`;
@@ -366,7 +375,7 @@ function drawTable(){
   ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
   <td style="word-break:break-all;min-width:150px">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
   <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
-  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&r.landing_type!=="socks"?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
+  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
   ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
   ${i===0?`<td rowspan="${n}">${pcHtml(state.checks[r.tag])}</td>`:""}
