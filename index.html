@@ -52,7 +52,7 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
 .ck input{margin:0}
-.tag{white-space:nowrap}th{white-space:nowrap}td.mono{white-space:nowrap}
+.tag{white-space:nowrap}.clk{cursor:pointer}.clk:hover{filter:brightness(.95);text-decoration:underline}th{white-space:nowrap}td.mono{white-space:nowrap}
 .bar{height:5px;background:#eef2f7;border-radius:3px;overflow:hidden;margin:3px 0;width:100px}.bar i{display:block;height:100%}
 .dupbox{margin-top:6px;font-size:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:6px 8px}.dupbox select{margin-top:4px;width:100%;font-size:12px;padding:4px 6px}
 .warnbox{background:#fff7ed;border:1px solid #fdba74;color:#7c2d12;border-radius:12px;padding:14px 16px;margin-bottom:16px;line-height:1.7}
@@ -236,7 +236,27 @@ function trafficCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},used=g.
   return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}`}
 function deviceCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
   const tip=(O.active||[]).map(ip=>ip+((O.rejected||[]).includes(ip)?"（被拒）":"")).join("\n");
-  return `<span title="${esc(tip)}" class="tag ${lim&&O.full?"warn":n?"ok":"gray"}">${n}${lim?` / ${lim}`:""} 台</span>${(O.rejected||[]).length?`<div class="sib" style="color:var(--bad)">拒绝 ${O.rejected.length} 个新设备</div>`:""}`}
+  const nb=Object.keys(O.banned||{}).length;
+  return `<span title="${esc(tip)}" class="tag ${lim&&O.full?"warn":n?"ok":"gray"} clk" data-dev="${esc(g[0].tag)}">${n}${lim?` / ${lim}`:""} 台 ›</span>${(O.rejected||[]).length?`<div class="sib" style="color:var(--bad)">拒绝 ${O.rejected.length} 个新设备</div>`:""}${nb?`<div class="sib" style="color:var(--bad)">已踢出 ${nb} 个</div>`:""}`}
+function fmtLeft(s){if(!s)return "直到手动解除";if(s<60)return s+" 秒";return Math.ceil(s/60)+" 分钟"}
+function devDlg(tag){
+  const g=groupOf(tag);if(!g.length)return;const k=okeyOf(g[0]);
+  const draw=()=>{const O=(state.online||{})[k]||{},L=(state.limits||{})[k]||{},act=O.active||[],ban=O.banned||{};
+    const ips=[...new Set([...act,...Object.keys(ban)])];
+    modal(`<h2 style="margin-top:0">在线设备：${esc(g[0].tag)}</h2>
+    <p class="hint">按客户 IP 统计，上限 ${L.devices||"不限"}。踢出会立刻断开这个 IP 的连接并禁止一段时间，名额马上空出来。</p>
+    ${ips.length?`<table><tr><th>IP</th><th>状态</th><th></th></tr>${ips.map(ip=>{const b=ban[ip]!==undefined,rej=(O.rejected||[]).includes(ip);
+      return `<tr><td class="mono">${esc(ip)}</td><td>${b?`<span class="tag bad">已踢出，剩 ${fmtLeft(ban[ip])}</span>`:rej?'<span class="tag warn">被拒（名额已满）</span>':'<span class="tag ok">在用</span>'}</td>
+      <td>${b?`<button class="sm" data-unban="${esc(ip)}">解除禁止</button>`:`<button class="sm danger" data-kick="${esc(ip)}">踢出</button>`}</td></tr>`}).join("")}</table>`:'<p class="muted">当前没有在线设备</p>'}
+    <div class="row" style="margin-top:12px"><label>踢出后禁止<select id="kmin"><option value="5">5 分钟</option><option value="30">30 分钟</option><option value="60">1 小时</option><option value="1440">1 天</option><option value="0">一直禁止（手动解除）</option></select></label></div>
+    <div class="row" style="margin-top:12px"><button id="krel">全部释放名额（不禁止）</button><button id="kref">刷新</button><button id="kcl">关闭</button></div>`);
+    const run=async(body,msg)=>{try{const x=await api("kick",Object.assign({tag:g[0].tag},body));state.online=state.online||{};if(x.online)state.online[k]=x.online;else delete state.online[k];toast(msg);draw();drawTable()}catch(e){toast(e.message)}};
+    document.querySelectorAll("[data-kick]").forEach(b=>b.onclick=()=>run({action:"kick",ip:b.dataset.kick,minutes:parseFloat($("#kmin").value)},"已踢出 "+b.dataset.kick));
+    document.querySelectorAll("[data-unban]").forEach(b=>b.onclick=()=>run({action:"unban",ip:b.dataset.unban},"已解除禁止"));
+    $("#krel").onclick=()=>run({action:"release"},"已释放名额，在用的设备会在下次检查时重新登记");
+    $("#kref").onclick=async()=>{await loadRelays();drawTable();draw()};$("#kcl").onclick=closeModal;};
+  draw();
+}
 const safeName=n=>String(n||"qr").replace(/[\\/:*?"<>|\r\n]/g,"_").trim()||"qr";
 function qrPng(name,svg,port){
   return new Promise(res=>{
@@ -359,6 +379,7 @@ function drawTable(){
   <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</tbody>`}).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
   if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
+  document.querySelectorAll("[data-dev]").forEach(s=>s.onclick=()=>devDlg(s.dataset.dev));
   document.querySelectorAll("[data-g]").forEach(c=>c.onchange=()=>{groupOf(c.dataset.g).forEach(r=>c.checked?state.sel.add(r.tag):state.sel.delete(r.tag));drawTable()});
   $("#selall").onclick=()=>{all.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable()};
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};

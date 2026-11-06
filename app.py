@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -1116,7 +1116,9 @@ ONLINE = {}          # okey -> {"active": [ip...], "allowed": [ip...], "full": b
 DEVICE_IDLE = 180    # 设备断开多少秒后释放名额
 SEEN = {}            # okey -> {ip: [first_seen, last_seen]}
 ALLOWED = {}         # okey -> [ip...]（按先来后到）
+BANNED = {}          # okey -> {ip: 禁止到期时间戳（0=一直禁止，直到手动解除）}
 CHAIN = "RELAYHELPER"
+MON_LOCK = threading.RLock()
 _last_rules = {"4": None, "6": None}
 
 
@@ -1257,19 +1259,25 @@ def _ipt(v):
 
 
 def apply_firewall(blocks):
-    """blocks: [(proto, port, [允许的IP])]：这些端口只放行列出的 IP，其余拒绝。"""
+    """
+    blocks: [(proto, port, allowed, banned)]
+      banned 里的 IP 一律拒绝（被踢出的）；allowed 不为 None 时只放行这些 IP，其余拒绝（设备数满了）。
+    规则逐包生效，被踢 IP 的现有连接也会马上断开。
+    """
     for v in ("4", "6"):
         if not shutil.which(_ipt(v)) or not shutil.which(_ipt(v) + "-restore"):
             continue
         lines = ["*filter", ":%s - [0:0]" % CHAIN]
-        for proto, port, allowed in blocks:
-            for ip in allowed:
+        for proto, port, allowed, banned in blocks:
+            deny = "-j REJECT --reject-with tcp-reset" if proto == "tcp" else "-j DROP"
+            for ip in banned:
                 if (":" in ip) == (v == "6"):
-                    lines.append("-A %s -p %s --dport %d -s %s -j RETURN" % (CHAIN, proto, port, ip))
-            if proto == "tcp":
-                lines.append("-A %s -p tcp --dport %d -j REJECT --reject-with tcp-reset" % (CHAIN, port))
-            else:
-                lines.append("-A %s -p udp --dport %d -j DROP" % (CHAIN, port))
+                    lines.append("-A %s -p %s --dport %d -s %s %s" % (CHAIN, proto, port, ip, deny))
+            if allowed is not None:
+                for ip in allowed:
+                    if (":" in ip) == (v == "6"):
+                        lines.append("-A %s -p %s --dport %d -s %s -j RETURN" % (CHAIN, proto, port, ip))
+                lines.append("-A %s -p %s --dport %d %s" % (CHAIN, proto, port, deny))
         lines.append("COMMIT")
         rules = "\n".join(lines) + "\n"
         try:
@@ -1289,6 +1297,11 @@ def apply_firewall(blocks):
 
 
 def monitor_once():
+    with MON_LOCK:
+        _monitor_once()
+
+
+def _monitor_once():
     data = SUI.load_all()
     rows = build_relays(data)
     groups = group_rows(rows)
@@ -1331,10 +1344,16 @@ def monitor_once():
     for tag, ips in lp.items():
         seen_now.setdefault(udp_tags[tag], set()).update(i for i in ips if keep(i))
     blocks, online = [], {}
+    for k in list(BANNED):
+        BANNED[k] = {ip: u for ip, u in BANNED[k].items() if u == 0 or u > now}
+        if not BANNED[k] or k not in groups:
+            BANNED.pop(k, None)
     for k, rs in groups.items():
         S = SEEN.setdefault(k, {})
+        B = BANNED.get(k, {})
         for ip in seen_now.get(k, ()):
-            S.setdefault(ip, [now, now])[1] = now
+            if ip not in B:
+                S.setdefault(ip, [now, now])[1] = now
         for ip in [ip for ip, (f, l) in S.items() if now - l > int(CFG.get("device_idle", DEVICE_IDLE))]:
             del S[ip]
         active = sorted(S, key=lambda ip: S[ip][0])
@@ -1348,22 +1367,63 @@ def monitor_once():
                     A.append(ip)
             ALLOWED[k] = A
             full = len(A) >= n
-            if full:
-                for r in rs:
-                    if r.get("port"):
-                        blocks.append((ports[int(r["port"])][1], int(r["port"]), A))
         else:
             ALLOWED.pop(k, None)
             full = False
-        if active or n:
+        if full or B:
+            for r in rs:
+                if r.get("port"):
+                    blocks.append((ports[int(r["port"])][1], int(r["port"]), A if full else None, list(B)))
+        if active or n or B:
             online[k] = {"active": active, "allowed": A if n else active, "full": full,
-                         "rejected": [ip for ip in active if n and ip not in A]}
+                         "rejected": [ip for ip in active if n and ip not in A],
+                         "banned": {ip: (int(u - now) if u else 0) for ip, u in B.items()}}
     for k in list(SEEN):
         if k not in groups:
             SEEN.pop(k, None)
     ONLINE.clear()
     ONLINE.update(online)
     apply_firewall(blocks)
+
+
+def op_kick(body):
+    """
+    action: kick（踢出 ip，禁止 minutes 分钟，0=直到手动解除）| unban（解除禁止）| release（清空在线名单，不禁止）
+    """
+    tag, action = body.get("tag"), body.get("action") or "kick"
+    data = SUI.load_all()
+    rows = {r["tag"]: r for r in build_relays(data)}
+    if tag not in rows:
+        raise SuiError("找不到这条线路")
+    k = okey_of(rows[tag])
+    ips = body.get("ips") or ([body["ip"]] if body.get("ip") else [])
+    now = time.time()
+    with MON_LOCK:
+        S, A, B = SEEN.setdefault(k, {}), ALLOWED.get(k, []), BANNED.setdefault(k, {})
+        if action == "release":
+            S.clear()
+            ALLOWED.pop(k, None)
+        elif action == "unban":
+            for ip in ips:
+                B.pop(ip, None)
+        else:
+            mins = float(body.get("minutes", 5))
+            for ip in ips:
+                B[ip] = 0 if mins <= 0 else now + mins * 60
+                S.pop(ip, None)
+                if ip in A:
+                    A.remove(ip)
+        if not B:
+            BANNED.pop(k, None)
+    _monitor_now()
+    return {"online": ONLINE.get(k)}
+
+
+def _monitor_now():
+    try:
+        monitor_once()
+    except Exception as e:
+        sys.stderr.write("monitor: %s\n" % e)
 
 
 def monitor_loop():
@@ -1450,7 +1510,7 @@ def drop_group_limits(okeys):
             save_limits()
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick})
 
 
 # ------------------------------------------------------------- web server --
