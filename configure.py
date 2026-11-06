@@ -29,8 +29,17 @@ def port_free(p):
 def main():
     old = {}
     if os.path.exists(CFG):
-        old = json.load(open(CFG, encoding="utf-8"))
-        print("检测到已有配置，回车保留原值。")
+        try:
+            with open(CFG, encoding="utf-8-sig") as f:
+                old = json.load(f)
+            if not isinstance(old, dict):
+                raise ValueError("不是 JSON 对象")
+            print("检测到已有配置，回车保留原值。")
+        except Exception as e:
+            bak = "%s.broken-%d" % (CFG, int(__import__("time").time()))
+            os.replace(CFG, bak)
+            old = {}
+            print("⚠ 原配置文件损坏（%s），已备份为 %s，下面重新生成配置。" % (e, bak))
     db = next((d for d in DB_CANDIDATES if d and os.path.exists(d)), None)
     st, users = {}, []
     if db:
@@ -88,9 +97,13 @@ def main():
         "cert_file": old.get("cert_file", st.get("webCertFile", "") or ""),
         "key_file": old.get("key_file", st.get("webKeyFile", "") or ""),
     })
-    with open(CFG, "w", encoding="utf-8") as f:
+    tmp = CFG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.chmod(CFG, 0o600)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CFG)  # 先写临时文件再整体替换，不会留下写了一半的空文件
 
     # 验证能登录 s-ui
     sys.path.insert(0, HERE)
