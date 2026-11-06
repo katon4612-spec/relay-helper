@@ -42,6 +42,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/
 - 落地国家通过 ip-api.com 查询（会把落地 IP 发给这个免费服务）。不想用可以在配置里设 `"geo_lookup": false`。
 - 默认是 HTTP 访问。如果 s-ui 面板配置了证书，工具会自动用同一张证书开 HTTPS。
 
+## 安全：停用/过期节点不会变成公开代理
+
+s-ui 在用户停用或过期后会清空入站用户，SOCKS5 入站此时会变成免密码，连接匹配不上落地规则就会从中转机直接出网。
+中转助手给每个节点都加了一条兜底规则：没匹配上落地的连接一律拒绝。老版本建的节点或在 s-ui 面板里手动建的中转节点，
+打开「线路管理」时页面顶部会提示，点「一键修复」即可补上（只补「所有用户都走落地」的中转入站，不动其他入站）。
+
 ## 配置文件
 
 `/opt/relay-helper/config.json`，改完执行 `systemctl restart relay-helper`。

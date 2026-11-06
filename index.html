@@ -52,6 +52,7 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
 .ck input{margin:0}
+.warnbox{background:#fff7ed;border:1px solid #fdba74;color:#7c2d12;border-radius:12px;padding:14px 16px;margin-bottom:16px;line-height:1.7}
 tbody.grp{border-bottom:2px solid #dbe2ec}tbody.grp tr.sub td{border-bottom:1px dashed var(--line)}tbody.grp tr.sub{background:#fbfcfe}.branch{color:#94a3b8;margin-right:6px}.sib{font-size:11px;color:var(--muted);margin-top:2px}
 .kv{display:grid;grid-template-columns:70px 1fr auto;gap:6px 8px;align-items:center;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
 .kv b{font-weight:500;color:var(--muted);font-size:12px}.kv span{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
@@ -259,10 +260,20 @@ async function downloadAllZip(items,zipName){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;$("#hostinfo").textContent=r.public_host}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];$("#hostinfo").textContent=r.public_host;drawSecure()}
+function drawSecure(){
+  const n=(state.unprot||[]).length;
+  H("#secbox",n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
+  <div>节点停用或过期后，SOCKS5 入站会变成免密码，任何人都能连上并从<b>中转机自己的 IP</b> 直接出网。补上规则后，停用/过期的节点会直接连不上。</div>
+  <div class="hint" style="margin:6px 0">${(state.unprot||[]).slice(0,8).map(esc).join("、")}${n>8?` 等 ${n} 个`:""}</div>
+  <button class="pri sm" id="secfix">一键修复（会重启 s-ui，约 3 秒断线）</button></div>`:"");
+  if(n)$("#secfix").onclick=async()=>{if(!confirm(`给 ${n} 个节点补上兜底拒绝规则？会重启一次 s-ui（约 3 秒断线）。`))return;
+    const b=$("#secfix");b.disabled=true;b.innerHTML='<span class="spin"></span> 修复中…';
+    try{const x=await api("secure",{});toast(`已修复 ${x.fixed} 个节点${coreMsg(x.core)}`,5000);await loadRelays();drawTable()}catch(e){toast(e.message,5000);if(b.isConnected){b.disabled=false;b.textContent="一键修复"}}};
+}
 async function renderManage(){
   const m=$("#main");
-  m.innerHTML=`<div class="card"><div class="toolbar"><input id="q" class="grow" placeholder="搜索：客户名 / 节点名 / 落地 IP / 端口" value="${esc(state.q)}">
+  m.innerHTML=`<div id="secbox"></div><div class="card"><div class="toolbar"><input id="q" class="grow" placeholder="搜索：客户名 / 节点名 / 落地 IP / 端口" value="${esc(state.q)}">
   <button id="rf">刷新</button></div>
   <div class="toolbar" id="bulk"></div><div style="overflow:auto" id="tbl"><span class="spin"></span></div><div class="pager" id="pg"></div></div>`;
   $("#q").oninput=()=>{state.q=$("#q").value.trim();state.page=1;drawTable()};
@@ -436,7 +447,8 @@ async function delTags(tags){
 async function init(){
   shell();
   try{const s=await api("status");state.host=s.public_host;$("#hostinfo").textContent=s.public_host;
-    if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000)}catch(e){return}
+    if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000);
+    if((s.unprotected||[]).length){state.tab="manage";setTimeout(()=>toast(`⚠ ${s.unprotected.length} 个节点有安全风险，见页面顶部提醒`,6000),300)}}catch(e){return}
   render();
 }
 init();

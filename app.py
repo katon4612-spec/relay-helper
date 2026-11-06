@@ -39,7 +39,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -673,7 +673,10 @@ def _make_inbound(name, proto, tls_id, expiry, group, taken_ports, outbound_tag)
         fw = open_firewall(port, proto == "hysteria2")
         return {"name": name, "protocol": proto, "port": port, "client_id": cid, "ok": True, "firewall": fw,
                 "outbound": outbound_tag,
-                "rule": {"inbound": [name], "auth_user": [name], "action": "route", "outbound": outbound_tag}}
+                # 第二条是兜底：用户停用/过期后 SOCKS5 入站会变成免认证，没匹配上落地规则的连接一律拒绝，
+                # 否则会从中转机直接出网（变成公开代理）
+                "rules": [{"inbound": [name], "auth_user": [name], "action": "route", "outbound": outbound_tag},
+                          {"inbound": [name], "action": "reject"}]}
     except Exception:
         _rollback({"client_id": created.get("client"), "name": name if created.get("inbound") else None})
         raise
@@ -690,7 +693,7 @@ def _rollback(r, outbound=None):
 
 def _apply_rules(results, new_outbounds):
     """一次性写入这批路由规则并重启 s-ui；失败则整批回滚。返回 core 状态。"""
-    new_rules = [r.pop("rule") for r in results if r.get("ok") and "rule" in r]
+    new_rules = [x for r in results if r.get("ok") and "rules" in r for x in r.pop("rules")]
     if not new_rules:
         return "ok"
     cfg = SUI.get("config")
@@ -811,7 +814,8 @@ def client_links(cid):
 
 def op_list(body):
     data = SUI.load_all()
-    return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"]}
+    return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
+            "unprotected": [t for t, _ in unprotected_inbounds(data)]}
 
 
 def op_links(body):
@@ -995,19 +999,63 @@ def op_delete(body):
     return {"results": out, "core": core}
 
 
+def unprotected_inbounds(data):
+    """
+    找出缺少兜底拒绝规则的中转入站：有路由规则把它送到非 direct 的落地、且它的所有用户都被这些规则覆盖，
+    但后面没有 reject 规则。返回 [(tag, 插入位置之前的最后一条规则下标)]。
+    """
+    cfg = data.get("config") or {}
+    rules = ((cfg.get("route") or {}).get("rules")) or []
+    out = []
+    for inb in data.get("inbounds") or []:
+        tag = inb.get("tag")
+        idx = [i for i, r in enumerate(rules) if tag in (r.get("inbound") or [])]
+        routes = [rules[i] for i in idx if rules[i].get("action", "route") == "route" and rules[i].get("outbound") not in (None, "direct")]
+        if not routes:
+            continue
+        if any(rules[i].get("action") == "reject" and rules[i].get("inbound") == [tag] and len(rules[i]) == 2 for i in idx):
+            continue
+        if any(not r.get("auth_user") for r in routes):
+            continue  # 规则不区分用户，已有的行为不动
+        authed = {u for r in routes for u in r.get("auth_user") or []}
+        users = set(inb.get("users") or [])
+        if users and not users <= authed:
+            continue  # 这个入站还有别的用户走默认出口，不能加拒绝
+        last = max(i for i in idx if rules[i] in routes)
+        out.append((tag, last))
+    return out
+
+
+def op_secure(body):
+    with LOCK:
+        data = SUI.load_all()
+        todo = unprotected_inbounds(data)
+        if not todo:
+            return {"fixed": 0, "core": "ok"}
+        cfg = SUI.get("config")
+        cfg = cfg.get("config", cfg) if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict) else cfg
+        rules = cfg["route"]["rules"]
+        for tag, last in sorted(todo, key=lambda x: -x[1]):  # 从后往前插，下标不乱
+            rules.insert(last + 1, {"inbound": [tag], "action": "reject"})
+        SUI.save("config", "edit", cfg)
+        core = ensure_core()
+    return {"fixed": len(todo), "tags": [t for t, _ in todo], "core": core}
+
+
 def op_status(body):
     data = SUI.load_all()
     return {
         "ok": True, "version": VERSION, "public_host": CFG["public_host"],
         "reality_tls": find_tls(data, "reality"), "cert_tls": find_tls(data, "cert"),
         "inbounds": len(data.get("inbounds") or []), "clients": len(data.get("clients") or []),
+        "unprotected": [t for t, _ in unprotected_inbounds(data)],
     }
 
 
 OPS = {
     "status": op_status, "list": op_list, "preview": op_preview, "create": op_create,
     "check": op_check, "check_raw": op_check_raw, "replace": op_replace, "add_protocol": op_add_protocol,
-    "update_clients": op_update_clients, "delete": op_delete, "links": op_links, "qr": op_qr,
+    "update_clients": op_update_clients, "secure": op_secure, "delete": op_delete, "links": op_links, "qr": op_qr,
 }
 
 # ------------------------------------------------------------- web server --
