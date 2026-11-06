@@ -69,6 +69,7 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 <script>
 const BASE="__BASE__";
 const $=s=>document.querySelector(s);
+const H=(sel,html)=>{const e=document.querySelector(sel);if(e)e.innerHTML=html;return e};
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let state={tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
 
@@ -135,6 +136,7 @@ vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
   $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
   $("#pv").onclick=doPreview;
+  if(state.text)$("#txt").value=state.text;$("#txt").oninput=()=>{state.text=$("#txt").value};
   if(state.preview)renderPreview();if(state.results)renderResults();
 }
 function selProtos(sel="#protos"){return [...document.querySelectorAll(sel+" input:checked")].map(c=>c.value)}
@@ -142,11 +144,12 @@ function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"
 async function doPreview(){
   const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
   localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value}));
-  try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;$("#resbox").innerHTML="";renderPreview()}
-  catch(e){toast(e.message)}finally{b.disabled=false;b.textContent="解析预览"}
+  try{const r=await api("preview",{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;H("#resbox","");renderPreview()}
+  catch(e){toast(e.message)}finally{const bb=$("#pv");if(bb){bb.disabled=false;bb.textContent="解析预览"}}
 }
 function renderPreview(){
   const it=state.preview||[];const good=it.filter(x=>!x.error).length;
+  if(!$("#pvbox"))return;
   $("#pvbox").innerHTML=`<div class="card"><h2>2. 确认线路（${good} 条可建${it.length-good?`，${it.length-good} 条有误`:""}）</h2>
   <div style="overflow:auto"><table><tr><th>#</th><th>节点名（可改）</th><th>落地</th><th class="hide-sm">类型</th><th>检测</th></tr>
   ${it.map((x,i)=>x.error?`<tr><td>${i+1}</td><td colspan="4"><span class="err">✗ ${esc(x.error)}</span> <span class="mono muted">${esc(x.raw)}</span></td></tr>`:
@@ -162,8 +165,8 @@ function renderPreview(){
 function pcHtml(c){if(!c)return '<span class="muted">-</span>';if(c==="..")return '<span class="spin"></span>';return c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`}
 async function preCheck(){
   const idx=[];const items=[];state.pvcheck={};
-  state.preview.forEach((x,i)=>{if(!x.error){idx.push(i);items.push(x);state.pvcheck[i]="..";$("#pc"+i).innerHTML=pcHtml("..")}});
-  try{const r=await api("check_raw",{items});r.results.forEach((c,k)=>{state.pvcheck[idx[k]]=c;$("#pc"+idx[k]).innerHTML=pcHtml(c)});
+  state.preview.forEach((x,i)=>{if(!x.error){idx.push(i);items.push(x);state.pvcheck[i]="..";H("#pc"+i,pcHtml(".."))}});
+  try{const r=await api("check_raw",{items});r.results.forEach((c,k)=>{state.pvcheck[idx[k]]=c;H("#pc"+idx[k],pcHtml(c))});
     const bad=r.results.filter(c=>!c.ok).length;toast(bad?`${bad} 条落地不通，鼠标悬停看原因`:"全部落地连通")}
   catch(e){toast(e.message)}
 }
@@ -176,12 +179,14 @@ async function doCreate(){
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
   try{const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim()});
     state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
-    state.preview=null;$("#pvbox").innerHTML="";  // 防止同一批重复创建
-    toast(`成功 ${ok} 条${ok<r.results.length?`，失败 ${r.results.length-ok} 条`:""}${coreMsg(r.core)}`,5000);renderResults()}
-  catch(e){toast(e.message,5000);b.disabled=false;b.textContent="创建"}
+    state.preview=null;H("#pvbox","");state.text="";const tx=$("#txt");if(tx)tx.value="";  // 防止同一批重复创建
+    toast(`成功 ${ok} 个节点${ok<r.results.length?`，失败 ${r.results.length-ok} 个`:""}${coreMsg(r.core)}`,5000);
+    if(state.tab==="create")renderResults();else toast(`成功 ${ok} 个节点${coreMsg(r.core)}，回到「一键中转」查看链接`,6000)}
+  catch(e){toast(e.message,5000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="创建"}}
 }
 async function renderResults(){
   const rs=state.results||[];const ok=rs.filter(x=>x.ok);
+  if(!$("#resbox"))return;
   $("#resbox").innerHTML=`<div class="card"><h2>3. 客户链接（${ok.length} 条）</h2>
   <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码</button>
   ${ok.some(x=>!x.firewall)?'<span class="hint">提醒：确认服务器防火墙 / 云安全组已放行这些端口</span>':""}</div>
@@ -191,7 +196,7 @@ async function renderResults(){
   <div class="acts" style="justify-content:center"><button class="sm" data-cp="${i}">复制链接</button><button class="sm" data-dl="${i}">下载二维码</button></div></div>`).join("")}</div></div>`;
   $("#cpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
   document.querySelectorAll("[data-cp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.cp].links[0]));
-  for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;$("#rq"+i).innerHTML=q.svg}catch(e){}}
+  for(let i=0;i<ok.length;i++){try{if(!ok[i].svg){const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg}H("#rq"+i,ok[i].svg)}catch(e){}}
   document.querySelectorAll("[data-dl]").forEach(b=>b.onclick=()=>downloadQR(ok[b.dataset.dl].name,ok[b.dataset.dl].svg,ok[b.dataset.dl].port));
   $("#dlall").onclick=async()=>{for(const x of ok){await downloadQR(x.name,x.svg,x.port);await new Promise(r=>setTimeout(r,350))}};
 }
@@ -220,6 +225,7 @@ async function renderManage(){
 }
 function filtered(){const q=state.q.toLowerCase();return state.relays.filter(r=>!q||[r.tag,r.landing,r.port,r.outbound_tag].join(" ").toLowerCase().includes(q))}
 function drawTable(){
+  if(!$("#tbl"))return;
   const all=filtered();const per=20;const pages=Math.max(1,Math.ceil(all.length/per));if(state.page>pages)state.page=pages;
   const rows=all.slice((state.page-1)*per,state.page*per);
   const nsel=state.sel.size;
@@ -293,8 +299,8 @@ function replaceDlg(tag){
   $("#rcl").onclick=closeModal;document.querySelectorAll("#mbox [data-cp]").forEach(b=>b.onclick=()=>copy(b.dataset.cp));
   $("#rok").onclick=async()=>{const b=$("#rok");b.disabled=true;b.innerHTML='<span class="spin"></span> 替换中';
     try{const x=await api("replace",{tag,landing:$("#nl").value.trim()});state.checks[tag]=x.check;
-      $("#rmsg").innerHTML=x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`;
-      await loadRelays();drawTable()}catch(e){$("#rmsg").innerHTML=`<span class="err">${esc(e.message)}</span>`}finally{b.disabled=false;b.textContent="替换并检测"}};
+      H("#rmsg",x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`);
+      await loadRelays();drawTable()}catch(e){H("#rmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="替换并检测"}}};
 }
 function addProtoDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&r.outbound_tag);if(!rs.length)return toast("所选线路没有落地");
@@ -312,7 +318,7 @@ function addProtoDlg(tags){
     try{const x=await api("add_protocol",{tags:rs.map(r=>r.tag),protocols:protos});
       const ok=x.results.filter(z=>z.ok),skip=x.results.filter(z=>z.skipped),bad=x.results.filter(z=>!z.ok&&!z.skipped);
       toast(`新增 ${ok.length} 个节点${skip.length?`，跳过 ${skip.length} 个`:""}${bad.length?`，失败 ${bad.length} 个`:""}${coreMsg(x.core)}`,5000);
-      await loadRelays();drawTable();showNew(ok,bad)}catch(e){toast(e.message,5000);b.disabled=false;b.textContent="添加"}};
+      await loadRelays();drawTable();showNew(ok,bad)}catch(e){toast(e.message,5000);if(b.isConnected){b.disabled=false;b.textContent="添加"}}};
 }
 async function showNew(ok,bad){
   if(!ok.length&&!bad.length)return closeModal();
@@ -322,7 +328,7 @@ async function showNew(ok,bad){
   <div class="row" style="margin-top:12px"><button class="pri" id="ncpall">复制全部链接</button><button id="ncl">关闭</button></div>`);
   $("#ncl").onclick=closeModal;$("#ncpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
   document.querySelectorAll("[data-ncp]").forEach(b=>b.onclick=()=>copy(ok[b.dataset.ncp].links[0]));
-  for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;$("#nq"+i).innerHTML=q.svg}catch(e){}}
+  for(let i=0;i<ok.length;i++){try{const q=await api("qr",{text:ok[i].links[0]});ok[i].svg=q.svg;H("#nq"+i,q.svg)}catch(e){}}
   document.querySelectorAll("[data-ndl]").forEach(b=>b.onclick=()=>{const x=ok[b.dataset.ndl];downloadQR(x.name,x.svg,x.port)});
 }
 function renewDlg(tags){
