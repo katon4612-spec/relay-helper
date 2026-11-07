@@ -34,6 +34,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "安装 python3 ..."
   (apt-get update -y && apt-get install -y python3) || yum install -y python3 || dnf install -y python3
 fi
+if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-restore >/dev/null 2>&1; then
+  echo "安装 iptables（踢出设备、设备数限制要用）..."
+  (apt-get update -y && apt-get install -y iptables) || yum install -y iptables || dnf install -y iptables || apk add iptables ip6tables || echo "⚠ iptables 安装失败，踢出设备和设备数限制将不生效"
+fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' || { echo "需要 Python 3.7 以上"; exit 1; }
 python3 -c 'import sqlite3' || { echo "python3 缺少 sqlite3 模块"; exit 1; }
 systemctl list-unit-files 2>/dev/null | grep -q '^s-ui\.service' || echo "⚠ 没找到 s-ui 服务，确认这台机器装了 s-ui"

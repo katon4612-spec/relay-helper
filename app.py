@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.10.1"
+VERSION = "1.10.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -964,7 +964,8 @@ def op_list(body):
         lim = json.loads(json.dumps(LIMITS))
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
-            "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary()}
+            "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary(),
+            "fw_error": FW_STATE["error"]}
 
 
 def op_links(body):
@@ -1329,6 +1330,7 @@ BANNED = {}          # okey -> {ip: 禁止到期时间戳（0=一直禁止，直
 CHAIN = "RELAYHELPER"
 MON_LOCK = threading.RLock()
 _last_rules = {"4": None, "6": None}
+FW_STATE = {"error": ""}  # 防火墙规则下发失败的原因，页面上会提示
 
 
 def load_limits():
@@ -1473,6 +1475,11 @@ def apply_firewall(blocks):
       banned 里的 IP 一律拒绝（被踢出的）；allowed 不为 None 时只放行这些 IP，其余拒绝（设备数满了）。
     规则逐包生效，被踢 IP 的现有连接也会马上断开。
     """
+    if not shutil.which("iptables") or not shutil.which("iptables-restore"):
+        # 没有 iptables：独立端口节点的踢出/设备限制都没法生效（443 共用节点还能靠断连接）
+        FW_STATE["error"] = "服务器没有安装 iptables，踢出设备和设备数限制对独立端口的节点不生效。请在服务器执行：apt-get install -y iptables（CentOS 用 yum install -y iptables），然后 systemctl restart relay-helper"
+        return
+    errs = []
     for v in ("4", "6"):
         if not shutil.which(_ipt(v)) or not shutil.which(_ipt(v) + "-restore"):
             continue
@@ -1501,8 +1508,15 @@ def apply_firewall(blocks):
                     _last_rules[v] = rules
                 else:
                     sys.stderr.write("%s-restore: %s\n" % (_ipt(v), r.stderr.strip()))
+                    if v == "4":
+                        errs.append("%s 规则下发失败：%s" % (_ipt(v), r.stderr.strip()[:200]))
+            elif v == "4" and subprocess.run([_ipt(v), "-C", "INPUT", "-j", CHAIN], capture_output=True).returncode != 0:
+                errs.append("iptables 规则没能挂到 INPUT 链上")
         except Exception as e:
             sys.stderr.write("apply_firewall: %s\n" % e)
+            if v == "4":
+                errs.append("iptables 出错：%s" % e)
+    FW_STATE["error"] = ("踢出设备和设备数限制对独立端口的节点可能不生效：" + "；".join(errs)) if errs else ""
 
 
 # ------------------------------------------------- Clash API（共用端口按客户统计设备）--

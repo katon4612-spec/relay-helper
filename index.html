@@ -384,13 +384,14 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
-  H("#secbox",n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
+  const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
+  H("#secbox",fw+(n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
   <div>节点停用或过期后，SOCKS5 入站会变成免密码，任何人都能连上并从<b>中转机自己的 IP</b> 直接出网。补上规则后，停用/过期的节点会直接连不上。</div>
   <div class="hint" style="margin:6px 0">${(state.unprot||[]).slice(0,8).map(esc).join("、")}${n>8?` 等 ${n} 个`:""}</div>
-  <button class="pri sm" id="secfix">一键修复（会重启 s-ui，约 3 秒断线）</button></div>`:"");
+  <button class="pri sm" id="secfix">一键修复（会重启 s-ui，约 3 秒断线）</button></div>`:""));
   if(n)$("#secfix").onclick=async()=>{if(!confirm(`给 ${n} 个节点补上兜底拒绝规则？会重启一次 s-ui（约 3 秒断线）。`))return;
     const b=$("#secfix");b.disabled=true;b.innerHTML='<span class="spin"></span> 修复中…';
     try{const x=await api("secure",{});toast(`已修复 ${x.fixed} 个节点${coreMsg(x.core)}`,5000);await loadRelays();drawTable()}catch(e){toast(e.message,5000);if(b.isConnected){b.disabled=false;b.textContent="一键修复"}}};
