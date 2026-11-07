@@ -95,7 +95,7 @@ function copy(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.r
 function coreMsg(c){if(c==="restarted")return "，已重启 s-ui 使路由生效（约 3 秒断线）";if(c==="down")return "。⚠ s-ui 内核未能启动，请登录服务器执行 systemctl restart s-ui";return ""}
 const fmtDate=ts=>{if(!ts)return "永久";const d=new Date(ts*1000);const p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`};
 function daysLeft(ts){if(!ts)return null;const d=(ts*1000-Date.now())/86400000;return d<0?-1:Math.ceil(d)}
-function expTag(r){if(r.enable===false)return '<span class="tag gray">已停用</span>';const d=daysLeft(r.expiry);if(d===null)return '<span class="tag ok">永久</span>';if(d<0)return '<span class="tag bad">已过期</span>';if(d<=7)return `<span class="tag warn">${d} 天</span>`;return `<span class="tag ok">${d} 天</span>`}
+function expTag(r){const d=daysLeft(r.expiry);if(d!==null&&d<0)return '<span class="tag bad">已过期</span>';if(r.enable===false)return '<span class="tag gray">已停用</span>';if(d===null)return '<span class="tag ok">永久</span>';if(d<0)return '<span class="tag bad">已过期</span>';if(d<=7)return `<span class="tag warn">${d} 天</span>`;return `<span class="tag ok">${d} 天</span>`}
 const protoName={vless:"VLESS-Reality",hysteria2:"Hysteria2",socks:"SOCKS5",mixed:"Mixed",vmess:"VMess",trojan:"Trojan",shadowsocks:"SS",tuic:"TUIC",anytls:"AnyTLS",http:"HTTP"};
 
 function renderLogin(){
@@ -423,8 +423,14 @@ function drawTable(){
   const gs=all.slice((state.page-1)*per,state.page*per);
   const nodes=all.reduce((s,g)=>s+g.length,0);
   const nsel=state.sel.size;const selG=all.filter(g=>g.some(r=>state.sel.has(r.tag))).length;
+  const withC=g=>g.filter(r=>r.client_id);
+  const isOff=g=>withC(g).length>0&&withC(g).every(r=>r.enable===false);
+  const isExp=g=>withC(g).length>0&&withC(g).every(r=>{const d=daysLeft(r.expiry);return d!==null&&d<0});
+  const expG=all.filter(isExp),offG=all.filter(g=>isOff(g)&&!isExp(g));
   $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条线路（${nodes} 个节点）${nsel?`，已选 ${selG} 条`:""}</span>
-   <button class="sm" id="selall">全选当前搜索</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
+   <button class="sm" id="selall">全选当前搜索</button>
+   <button class="sm" id="seloff" ${offG.length?"":"disabled"} title="整条线路的客户端都已停用、但没过期（手动停用或流量用完）">选中已停用（${offG.length}）</button>
+   <button class="sm" id="selexp" ${expG.length?"":"disabled"} title="整条线路的客户端都已过期">选中已过期（${expG.length}）</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
    <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
    <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
@@ -451,6 +457,9 @@ function drawTable(){
   document.querySelectorAll("[data-dev]").forEach(s=>s.onclick=()=>devDlg(s.dataset.dev));
   document.querySelectorAll("[data-g]").forEach(c=>c.onchange=()=>{groupOf(c.dataset.g).forEach(r=>c.checked?state.sel.add(r.tag):state.sel.delete(r.tag));drawTable()});
   $("#selall").onclick=()=>{all.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable()};
+  const pick=(gs,what)=>{state.sel.clear();gs.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable();
+    toast(`已选中 ${gs.length} 条${what}线路（${gs.reduce((n,g)=>n+g.length,0)} 个节点），确认无误后点「批量删除」即可一次删掉、释放端口`,6000)};
+  $("#seloff").onclick=()=>pick(offG,"已停用");$("#selexp").onclick=()=>pick(expG,"已过期");
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
     const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
     $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
