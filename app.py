@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -1586,6 +1586,12 @@ def _monitor_once():
     now = time.time()
     with LIM_LOCK:
         lim = json.loads(json.dumps(LIMITS))
+    # ---- 到期：s-ui 自己要过几分钟才处理，这里到期就马上停用（续期时会重新启用）
+    expired = [r for r in rows if r.get("client_id") and r.get("enable") and (r.get("expiry") or 0) > 0 and r["expiry"] < now]
+    if expired:
+        with LOCK:
+            set_group_enable(expired, False)
+        sys.stderr.write("已到期停用：%s\n" % "、".join(r["tag"] for r in expired[:20]))
     # ---- 流量：整条线路合计，超了整组停用
     changed = False
     for k, L in lim.items():
