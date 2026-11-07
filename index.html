@@ -524,7 +524,8 @@ function searched(){const q=state.q.toLowerCase();
 const withC=g=>g.filter(r=>r.client_id);
 const isExp=g=>withC(g).length>0&&withC(g).every(r=>{const d=daysLeft(r.expiry);return d!==null&&d<0});
 const isOff=g=>withC(g).length>0&&withC(g).every(r=>r.enable===false)&&!isExp(g);
-const ONLY={off:["已停用",isOff],exp:["已过期",isExp]};
+const isBad=g=>{const c=(state.checks||{})[g[0].tag];if(c)return c.ok===false;const h=(state.health||{})[okeyOf(g[0])];return !!(h&&h.ok===false)};
+const ONLY={off:["已停用",isOff],exp:["已过期",isExp],bad:["落地不通",isBad]};
 function filtered(){const gs=searched();return state.only&&ONLY[state.only]?gs.filter(ONLY[state.only][1]):gs}
 function drawTable(){
   if(!$("#tbl"))return;
@@ -532,12 +533,13 @@ function drawTable(){
   const gs=all.slice((state.page-1)*per,state.page*per);
   const nodes=all.reduce((s,g)=>s+g.length,0);
   const nsel=state.sel.size;const selG=all.filter(g=>g.some(r=>state.sel.has(r.tag))).length;
-  const base=searched(),expG=base.filter(isExp),offG=base.filter(isOff);
+  const base=searched(),expG=base.filter(isExp),offG=base.filter(isOff),badG=base.filter(isBad);
   $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条线路（${nodes} 个节点）${nsel?`，已选 ${selG} 条`:""}</span>
    <button class="sm" id="selall">全选当前搜索</button>
    ${state.only?`<span class="tag warn" style="padding:4px 10px">只显示${ONLY[state.only][0]}的线路</span><button class="sm" id="showall">显示全部</button>`:""}
    <button class="sm" id="seloff" ${offG.length?"":"disabled"} title="整条线路的客户端都已停用、但没过期（手动停用或流量用完）">选中已停用（${offG.length}）</button>
-   <button class="sm" id="selexp" ${expG.length?"":"disabled"} title="整条线路的客户端都已过期">选中已过期（${expG.length}）</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
+   <button class="sm" id="selexp" ${expG.length?"":"disabled"} title="整条线路的客户端都已过期">选中已过期（${expG.length}）</button>
+   <button class="sm" id="selbad" ${badG.length?"":"disabled"} title="最近一次检测落地不通的线路（自动巡检或手动检测的结果）">选中落地不通（${badG.length}）</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
    <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
    <button class="sm" id="bport">批量换端口</button><button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
@@ -567,8 +569,8 @@ function drawTable(){
   document.querySelectorAll("[data-g]").forEach(c=>c.onchange=()=>{groupOf(c.dataset.g).forEach(r=>c.checked?state.sel.add(r.tag):state.sel.delete(r.tag));drawTable()});
   $("#selall").onclick=()=>{all.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable()};
   const pick=(k,gs)=>{state.only=k;state.page=1;state.sel.clear();gs.forEach(g=>g.forEach(r=>state.sel.add(r.tag)));drawTable();
-    toast(`已筛出并选中 ${gs.length} 条${ONLY[k][0]}线路（${gs.reduce((n,g)=>n+g.length,0)} 个节点），确认无误后点「批量删除」`,6000)};
-  $("#seloff").onclick=()=>pick("off",offG);$("#selexp").onclick=()=>pick("exp",expG);
+    toast(`已筛出并选中 ${gs.length} 条${ONLY[k][0]}线路（${gs.reduce((n,g)=>n+g.length,0)} 个节点）${k==="bad"?"，可以先「批量检测」再确认一次，然后换落地或删除":"，确认无误后点「批量删除」"}`,6000)};
+  $("#seloff").onclick=()=>pick("off",offG);$("#selexp").onclick=()=>pick("exp",expG);$("#selbad").onclick=()=>pick("bad",badG);
   if($("#showall"))$("#showall").onclick=()=>{state.only=null;state.page=1;state.sel.clear();drawTable()};
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
     const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
