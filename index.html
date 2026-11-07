@@ -335,7 +335,7 @@ async function renderSettings(){
   let s;try{s=(await api("get_settings")).settings}catch(e){return toast(e.message)}
   if(!$("#main"))return;
   m.innerHTML=`<div class="card"><h2>Telegram 通知</h2>
-  <p class="hint">用于落地不通告警、恢复通知、每日备份文件。获取方法：在 Telegram 里找 <b>@BotFather</b> 发 /newbot 创建机器人，拿到 Token；然后给你的机器人发一条消息，再找 <b>@userinfobot</b> 获取你的 Chat ID（数字）。</p>
+  <p class="hint">用于落地不通告警和恢复通知。获取方法：在 Telegram 里找 <b>@BotFather</b> 发 /newbot 创建机器人，拿到 Token；然后给你的机器人发一条消息，再找 <b>@userinfobot</b> 获取你的 Chat ID（数字）。</p>
   <div class="row"><label>Bot Token<input id="tgt" style="width:360px" placeholder="123456:ABC-DEF…" value="${esc(s.tg_token)}"></label>
   <label>Chat ID<input id="tgc" style="width:180px" placeholder="如 123456789" value="${esc(s.tg_chat)}"></label>
   <button id="tgtest">保存并发送测试消息</button></div></div>
@@ -343,35 +343,43 @@ async function renderSettings(){
   <div class="row"><label>每隔几分钟检测（0=关闭）<input id="hi" type="number" min="0" value="${esc(s.health_interval_min)}" style="width:120px"></label>
   <label>连续失败几次才告警<input id="hf" type="number" min="1" value="${esc(s.health_fail_times)}" style="width:120px"></label></div>
   <p class="hint">只检测有在用用户的线路（已停用、已过期的不检测）。落地不通和恢复都会通过 Telegram 通知；「线路管理」的检测列会显示最新结果。</p></div>
-  <div class="card"><h2>自动备份</h2>
-  <div class="row"><label>每天几点备份（服务器时间，-1=关闭）<input id="bh" type="number" min="-1" max="23" value="${esc(s.backup_hour)}" style="width:120px"></label>
-  <label>保留几份<input id="bk" type="number" min="1" max="365" value="${esc(s.backup_keep)}" style="width:120px"></label>
-  <label class="ck" style="margin-top:18px"><input type="checkbox" id="btg" ${s.backup_to_tg?"checked":""}>每日备份同时发到 Telegram（异地保存）</label>
-  <label class="ck" style="margin-top:18px"><input type="checkbox" id="bfull" ${s.backup_full?"checked":""}>包含流量统计历史（文件会大很多）</label></div>
-  <p class="hint">备份内容：s-ui 数据库（所有节点、用户、路由、每个用户的累计流量）、限额记录、中转助手配置。默认不含 s-ui 面板的流量曲线历史，备份通常只有几百 KB；勾选后可能有上百 MB，超过 50MB 发不了 Telegram。</p></div>
   <div class="row"><button class="pri" id="ssave">保存设置</button></div>`;
-  const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2"),backup_hour:parseInt($("#bh").value),backup_keep:parseInt($("#bk").value||"14"),backup_to_tg:$("#btg").checked,backup_full:$("#bfull").checked});
+  const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2")});
   $("#ssave").onclick=async()=>{try{await api("save_settings",collect());toast("已保存")}catch(e){toast(e.message)}};
   $("#tgtest").onclick=async()=>{const b=$("#tgtest");b.disabled=true;try{await api("save_settings",collect());await api("tg_test");toast("测试消息已发送，请查看 Telegram")}catch(e){toast(e.message,6000)}finally{b.disabled=false}};
 }
 
 /* ---------------- 备份 ---------------- */
-async function renderBackup(){
-  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
-  let r;try{r=await api("backups")}catch(e){return toast(e.message)}
-  if(!$("#main"))return;
-  m.innerHTML=`<div class="card"><h2>备份</h2>
-  <p class="hint">${r.hour>=0?`每天 ${r.hour} 点自动备份`:"自动备份已关闭"}，保留最近 ${r.keep} 份（存放在服务器 ${esc(r.dir)}）。恢复前会自动先备份当前状态。</p>
-  <div class="row"><button class="pri" id="bnow">立即备份</button><button id="bnowtg">立即备份并发到 Telegram</button></div></div>
-  <div class="card"><table><tr><th>备份</th><th>时间</th><th>大小</th><th></th></tr>
-  ${r.backups.map(b=>`<tr><td class="mono">${esc(b.name)}</td><td>${esc(fmtDate(b.time))}</td><td>${fmtB(b.size)}</td>
-  <td><div class="acts"><a class="sm btnlink" href="${BASE}api/backup_download?name=${encodeURIComponent(b.name)}">下载</a><button class="sm danger" data-rs="${esc(b.name)}">恢复到这个备份</button></div></td></tr>`).join("")||'<tr><td colspan="4" class="muted">还没有备份</td></tr>'}</table></div>`;
-  const go=async(tg)=>{try{const x=await api("backup_now",{to_tg:tg});toast(`已备份 ${x.name}${tg?"，已发到 Telegram":""}`);renderBackup()}catch(e){toast(e.message,6000);renderBackup()}};
-  $("#bnow").onclick=()=>go(false);$("#bnowtg").onclick=()=>go(true);
-  document.querySelectorAll("[data-rs]").forEach(b=>b.onclick=async()=>{
-    const n=b.dataset.rs;if(prompt(`恢复到备份 ${n}？\n\n所有节点、用户、路由、限额都会回到那时的状态，之后新建/修改的会丢失（恢复前会先自动备份当前状态）。s-ui 会重启，所有线路断开几秒。\n\n确认请输入：恢复`)!=="恢复")return;
-    toast("正在恢复…",30000);
-    try{const x=await api("restore",{name:n});toast(`已恢复到 ${n}${x.core==="ok"?"，s-ui 已正常运行":"，⚠ s-ui 内核未启动，请检查"}（恢复前的状态已备份为 ${x.before}）`,8000);renderBackup()}catch(e){toast(e.message,8000)}});
+function renderBackup(){
+  const m=$("#main");
+  m.innerHTML=`<div class="card"><h2>备份与恢复</h2>
+  <div class="row"><label class="ck"><input type="checkbox" id="bfull">包含流量统计历史（s-ui 面板里的流量曲线，文件会大很多）</label></div>
+  <div class="row" style="margin-top:10px"><button class="pri" id="bdl">下载备份</button><button class="danger" id="brs">恢复备份</button><input type="file" id="bfile" accept=".gz,.tar.gz,.db" style="display:none"></div>
+  <p class="hint">备份包含：s-ui 全部节点、用户、到期时间、已用流量、路由规则、证书文件，以及中转助手的流量/设备限额和 Telegram、巡检设置。不包含中转助手自己的登录密码和端口。<br>
+  恢复也支持 s-ui 面板自己「下载备份」得到的 .db 文件。</p></div>
+  <div class="card"><h2>换中转服务器</h2>
+  <ol class="hint" style="line-height:1.9;padding-left:20px;margin:0">
+  <li>在<b>旧服务器</b>的这个页面点「下载备份」。</li>
+  <li>把域名解析改到<b>新服务器</b>的 IP。</li>
+  <li>新服务器装好 s-ui，再执行中转助手的安装命令。</li>
+  <li>打开新服务器的中转助手，点「恢复备份」，选刚才下载的文件。</li>
+  <li>到云服务商安全组放行节点端口（和旧服务器一样）。</li></ol>
+  <p class="hint">恢复后 s-ui 的面板端口、路径、登录账号会变成旧服务器的。恢复前的状态会自动存一份在服务器 <span class="mono">/opt/relay-helper/before-restore.tar.gz</span>，恢复错了可以用它再恢复回去。</p></div>`;
+  $("#bdl").onclick=()=>{location.href=`${BASE}api/backup_download?full=${$("#bfull").checked?1:0}&t=${Date.now()}`;toast("正在生成备份…",3000)};
+  $("#brs").onclick=()=>{$("#bfile").value="";$("#bfile").click()};
+  $("#bfile").onchange=async()=>{
+    const f=$("#bfile").files[0];if(!f)return;
+    if(prompt(`用 ${f.name} 恢复？\n\n当前这台服务器上的所有节点、用户、路由、限额都会被备份里的内容替换，s-ui 会重启，所有线路断开几秒。\n\n确认请输入：恢复`)!=="恢复")return;
+    const b=$("#brs");b.disabled=true;b.innerHTML='<span class="spin"></span> 正在恢复…';
+    try{
+      const r=await fetch(`${BASE}api/restore_upload`,{method:"POST",body:f,credentials:"same-origin",headers:{"Content-Type":"application/octet-stream"}});
+      let x;try{x=await r.json()}catch(e){throw new Error("恢复失败（HTTP "+r.status+"）")}
+      if(!x.ok){if(x.login)location.reload();throw new Error(x.error)}
+      let msg=`已恢复：${x.inbounds} 个节点、${x.clients} 个用户${x.from_host?`（来自 ${x.from_host}${x.backup_time?" "+x.backup_time:""}）`:""}，`+(x.core==="ok"?"s-ui 已正常运行。":"⚠ s-ui 内核未启动，请到 s-ui 面板查看。");
+      if(x.warnings&&x.warnings.length)msg+="\n\n注意：\n"+x.warnings.join("\n");
+      alert(msg);
+    }catch(e){toast(e.message,8000)}finally{if($("#brs")){b.disabled=false;b.textContent="恢复备份"}}
+  };
 }
 
 /* ---------------- 线路管理 ---------------- */

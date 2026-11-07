@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -65,10 +65,6 @@ DEFAULTS = {
     "tg_chat": "",
     "health_interval_min": 5,
     "health_fail_times": 2,
-    "backup_hour": 4,
-    "backup_keep": 14,
-    "backup_to_tg": True,
-    "backup_full": False,
     "reserve_ports": True,
     "cert_file": "",
     "key_file": "",
@@ -1552,7 +1548,7 @@ def drop_group_limits(okeys):
 
 
 # ------------------------------------------------------- 设置 / Telegram --
-SETTING_KEYS = ("tg_token", "tg_chat", "health_interval_min", "health_fail_times", "backup_hour", "backup_keep", "backup_to_tg", "backup_full")
+SETTING_KEYS = ("tg_token", "tg_chat", "health_interval_min", "health_fail_times")
 
 
 def save_config(updates):
@@ -1593,51 +1589,12 @@ def tg_send(text):
         return False, str(e)
 
 
-def tg_send_file(path, caption=""):
-    if not tg_ready():
-        return False, "未配置 Telegram"
-    try:
-        boundary = "----rh%s" % secrets.token_hex(8)
-        parts = []
-        for k, v in (("chat_id", str(CFG["tg_chat"])), ("caption", caption[:1000])):
-            parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode())
-        size = os.path.getsize(path)
-        if size > 49 * 1024 * 1024:
-            return False, "文件 %.1f MB 超过 Telegram 机器人 50MB 上限" % (size / 1048576)
-        head = b"".join(parts) + ("--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-                                    % (boundary, os.path.basename(path))).encode()
-        tail = ("\r\n--%s--\r\n" % boundary).encode()
-
-        def body():  # 分块读，不把整个文件读进内存
-            yield head
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(256 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            yield tail
-        req = urllib.request.Request("%s/bot%s/sendDocument" % (CFG.get("tg_api") or "https://api.telegram.org", CFG["tg_token"]), data=body(),
-                                     headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary,
-                                              "Content-Length": str(len(head) + size + len(tail))})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            res = json.loads(r.read().decode())
-        return bool(res.get("ok")), res.get("description", "")
-    except urllib.error.HTTPError as e:
-        try:
-            return False, json.loads(e.read().decode()).get("description", str(e))
-        except Exception:
-            return False, str(e)
-    except Exception as e:
-        return False, str(e)
-
-
 def op_get_settings(body):
     s = {k: CFG.get(k) for k in SETTING_KEYS}
     tok = s.get("tg_token") or ""
     s["tg_token"] = ("••••" + tok[-4:]) if tok else ""
     s["tg_token_set"] = bool(tok)
-    return {"settings": s, "health_last": HEALTH_META.get("last", 0), "backup_last": BACKUP_META.get("last", 0)}
+    return {"settings": s, "health_last": HEALTH_META.get("last", 0)}
 
 
 def op_save_settings(body):
@@ -1652,17 +1609,10 @@ def op_save_settings(body):
                 continue  # 没改
         elif k == "tg_chat":
             v = str(v or "").strip()
-        elif k in ("backup_to_tg", "backup_full"):
-            v = bool(v)
         elif k == "health_interval_min":
             v = max(0, int(v or 0))
         elif k == "health_fail_times":
             v = max(1, int(v or 1))
-        elif k == "backup_hour":
-            v = int(v) if str(v).strip() != "" and int(v) >= 0 else -1
-            v = min(23, v)
-        elif k == "backup_keep":
-            v = max(1, min(365, int(v or 14)))
         up[k] = v
     save_config(up)
     return {"saved": list(up)}
@@ -1746,34 +1696,62 @@ def health_loop():
 
 
 # ---------------------------------------------------------------- 备份/恢复 --
-BACKUP_META = {}
-BACKUP_RE = re.compile(r"^backup-[0-9A-Za-z_.-]+\.tar\.gz$")
+# 和 s-ui 自带的「下载备份 / 恢复备份」一样：下载时现做一份发给浏览器（服务器上不留），恢复时上传文件。
+# 换服务器：旧机下载备份 → 域名解析到新机 → 新机装好 s-ui + 中转助手 → 上传恢复，节点/用户/到期/限额/证书全部带过去。
+RESTORE_MAX = 2 * 1024 * 1024 * 1024
+SUI_FILE_SETTINGS = ("webCertFile", "webKeyFile", "subCertFile", "subKeyFile")
 
 
-def backup_dir():
-    d = CFG.get("backup_dir") or os.path.join(os.path.dirname(CONFIG_PATH), "backups")
-    os.makedirs(d, exist_ok=True)
-    return d
+def _ref_files(dbpath):
+    """数据库里引用到的证书文件（TLS 设置里的 certificate_path/key_path、面板/订阅证书）。"""
+    out = set()
+    c = sqlite3.connect(dbpath)
+    try:
+        try:
+            for (srv,) in c.execute("select server from tls"):
+                try:
+                    j = json.loads(srv.decode() if isinstance(srv, bytes) else (srv or "{}"))
+                except ValueError:
+                    continue
+                for k in ("certificate_path", "key_path"):
+                    if isinstance(j.get(k), str) and j[k].startswith("/"):
+                        out.add(j[k])
+        except sqlite3.Error:
+            pass
+        try:
+            for k, v in c.execute("select key, value from settings"):
+                v = v.decode() if isinstance(v, bytes) else v
+                if k in SUI_FILE_SETTINGS and isinstance(v, str) and v.startswith("/"):
+                    out.add(v)
+        except sqlite3.Error:
+            pass
+    finally:
+        c.close()
+    return sorted(out)
 
 
-def make_backup(reason="manual"):
+def make_backup(full=False, out=None):
+    """生成备份文件，返回 (路径, 下载文件名)。"""
     import tarfile, tempfile
     db = CFG.get("sui_db")
     if not db or not os.path.exists(db):
         raise SuiError("找不到 s-ui 数据库：%s（配置项 sui_db）" % db)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    name = "backup-%s-%s.tar.gz" % (stamp, reason)
-    out = os.path.join(backup_dir(), name)
-    with tempfile.TemporaryDirectory() as td:
+    host = re.sub(r"[^0-9A-Za-z.-]", "_", CFG.get("public_host") or "server")
+    name = "relay-backup-%s-%s.tar.gz" % (host, stamp)
+    if not out:
+        fd, out = tempfile.mkstemp(prefix="rh-backup-", suffix=".tar.gz", dir=os.path.dirname(CONFIG_PATH))
+        os.close(fd)
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(CONFIG_PATH)) as td:
         snap = os.path.join(td, "s-ui.db")
         src = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=30)
         dst = sqlite3.connect(snap)
         with dst:
             src.backup(dst)  # 在线一致性快照，s-ui 运行中也安全
         src.close()
-        if not CFG.get("backup_full"):
-            # 默认不带流量统计历史（stats，每 10 秒每个节点一条，几百 MB）和操作记录（changes）：
-            # 只用于 s-ui 面板画曲线，恢复节点用不上；每个用户的累计流量在 clients 表里，照常备份
+        if not full:
+            # 默认不带流量统计历史（stats，每 10 秒每个节点一条，可达上百 MB）和操作记录（changes）：
+            # 只用于 s-ui 面板画曲线；每个用户的累计流量在 clients 表里，照常备份
             for tb in ("stats", "changes"):
                 try:
                     dst.execute('DELETE FROM "%s"' % tb)
@@ -1782,101 +1760,119 @@ def make_backup(reason="manual"):
             dst.commit()
             dst.execute("VACUUM")
         dst.close()
+        files = [f for f in _ref_files(snap) if os.path.isfile(f) and os.path.getsize(f) < 1024 * 1024]
         meta = os.path.join(td, "backup-info.json")
         with open(meta, "w", encoding="utf-8") as f:
-            json.dump({"time": stamp, "reason": reason, "host": CFG["public_host"], "version": VERSION, "sui_db": db,
-                       "full": bool(CFG.get("backup_full"))}, f, ensure_ascii=False)
-        with tarfile.open(out + ".tmp", "w:gz") as tar:
+            json.dump({"time": stamp, "host": CFG.get("public_host"), "version": VERSION, "full": bool(full), "files": files},
+                      f, ensure_ascii=False)
+        st = os.path.join(td, "relay-helper-settings.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({k: CFG.get(k) for k in SETTING_KEYS}, f, ensure_ascii=False)
+        with tarfile.open(out, "w:gz") as tar:
             tar.add(snap, "s-ui.db")
             tar.add(meta, "backup-info.json")
-            for fn in (LIMITS_PATH, CONFIG_PATH):
-                if os.path.exists(fn):
-                    tar.add(fn, os.path.basename(fn))
-    os.replace(out + ".tmp", out)
+            tar.add(st, "relay-helper-settings.json")
+            if os.path.exists(LIMITS_PATH):
+                tar.add(LIMITS_PATH, "limits.json")
+            for fp in files:
+                tar.add(fp, "files" + fp)
     os.chmod(out, 0o600)
-    prune_backups()
-    BACKUP_META["last"] = int(time.time())
-    return out
+    return out, name
 
 
-def list_backups():
-    d = backup_dir()
-    out = []
-    for fn in os.listdir(d):
-        if BACKUP_RE.match(fn):
-            st = os.stat(os.path.join(d, fn))
-            out.append({"name": fn, "size": st.st_size, "time": int(st.st_mtime)})
-    out.sort(key=lambda x: x["time"], reverse=True)
-    return out
+def _sui_conn_from_db(dbpath):
+    """从（恢复后的）s-ui 数据库读面板端口/路径/管理员账号，算出中转助手连接 s-ui 要用的配置。"""
+    c = sqlite3.connect("file:%s?mode=ro" % dbpath, uri=True)
+    try:
+        st = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in c.execute("select key, value from settings")}
+        users = list(c.execute("select username, password from users order by id"))
+    finally:
+        c.close()
+    up = {}
+    if users and users[0][0] and users[0][1]:
+        up["sui_user"], up["sui_pass"] = users[0][0], users[0][1]
+    web_path = st.get("webPath") or "/app/"
+    web_path = ("/" + web_path.strip("/") + "/") if web_path.strip("/") else "/"
+    listen = st.get("webListen") or "127.0.0.1"
+    if listen in ("0.0.0.0", "::", ""):
+        listen = "127.0.0.1"
+    scheme = "https" if st.get("webCertFile") and st.get("webKeyFile") else "http"
+    up["sui_url"] = "%s://%s:%s%s" % (scheme, listen, st.get("webPort") or "2095", web_path)
+    up["sui_host"] = st.get("webDomain") or ""
+    return up
 
 
-def prune_backups():
-    keep = int(CFG.get("backup_keep") or 14)
-    for b in list_backups()[keep:]:
-        try:
-            os.remove(os.path.join(backup_dir(), b["name"]))
-        except OSError:
-            pass
-
-
-def backup_loop():
-    last_day = None
-    while True:
-        try:
-            h = int(CFG.get("backup_hour", 4))
-            now = time.localtime()
-            if h >= 0 and now.tm_hour == h and last_day != now.tm_yday:
-                last_day = now.tm_yday
-                path = make_backup("daily")
-                if CFG.get("backup_to_tg") and tg_ready():
-                    ok, err = tg_send_file(path, "中转助手每日备份（%s）%s" % (CFG["public_host"], os.path.basename(path)))
-                    if not ok:
-                        sys.stderr.write("tg backup: %s\n" % err)
-                        tg_send("⚠️ 中转助手（%s）今日备份已保存在服务器，但没能发到 Telegram：%s" % (CFG["public_host"], err))
-        except Exception as e:
-            sys.stderr.write("backup: %s\n" % e)
-            tg_send("❌ 中转助手（%s）自动备份失败：%s" % (CFG["public_host"], e))
-        time.sleep(60)
-
-
-def op_backups(body):
-    return {"backups": list_backups(), "dir": backup_dir(), "keep": CFG.get("backup_keep"), "hour": CFG.get("backup_hour")}
-
-
-def op_backup_now(body):
-    path = make_backup("manual")
-    sent = None
-    if body.get("to_tg"):
-        sent, err = tg_send_file(path, "中转助手手动备份（%s）" % CFG["public_host"])
-        if not sent:
-            raise SuiError("已备份，但发送到 Telegram 失败：%s" % err)
-    return {"name": os.path.basename(path), "sent": sent}
-
-
-def op_restore(body):
+def restore_file(path):
     import tarfile, tempfile
-    name = body.get("name") or ""
-    if not BACKUP_RE.match(name):
-        raise SuiError("备份文件名不对")
-    path = os.path.join(backup_dir(), name)
-    if not os.path.exists(path):
-        raise SuiError("备份不存在")
+    with open(path, "rb") as f:
+        head = f.read(16)
     db = CFG.get("sui_db")
-    with LOCK:
-        before = make_backup("before-restore")  # 恢复前先把现在的状态备份一份
-        with tempfile.TemporaryDirectory() as td:
-            with tarfile.open(path, "r:gz") as tar:
-                for m in tar.getmembers():
-                    if m.name in ("s-ui.db", os.path.basename(LIMITS_PATH)) and m.isfile():
-                        tar.extract(m, td)
-            snap = os.path.join(td, "s-ui.db")
-            if not os.path.exists(snap):
-                raise SuiError("备份里没有 s-ui.db")
+    warnings = []
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(CONFIG_PATH)) as td:
+        snap = os.path.join(td, "s-ui.db")
+        files, limits, settings, info = [], None, None, {}
+        if head.startswith(b"SQLite format 3"):
+            shutil.copyfile(path, snap)  # s-ui 面板自己「下载备份」得到的 .db 文件也能直接恢复
+            info = {"source": "s-ui"}
+        elif head[:2] == b"\x1f\x8b":
+            try:
+                with tarfile.open(path, "r:gz") as tar:
+                    for m in tar.getmembers():
+                        nm = m.name
+                        if not m.isfile() or ".." in nm.split("/") or nm.startswith("/"):
+                            continue
+                        if nm in ("s-ui.db", "limits.json", "relay-helper-settings.json", "backup-info.json") or \
+                                (nm.startswith("files/") and m.size < 1024 * 1024):
+                            dest = os.path.join(td, "x", nm)
+                            os.makedirs(os.path.dirname(dest), exist_ok=True)
+                            with tar.extractfile(m) as fi, open(dest, "wb") as fo:
+                                shutil.copyfileobj(fi, fo)
+                            if nm == "s-ui.db":
+                                os.replace(dest, snap)
+                            elif nm.startswith("files/"):
+                                files.append((nm[len("files"):], dest))
+            except (tarfile.TarError, OSError, EOFError) as e:
+                raise SuiError("备份文件损坏：%s" % e)
+            x = os.path.join(td, "x")
+            for nm, var in (("limits.json", "limits"), ("relay-helper-settings.json", "settings"), ("backup-info.json", "info")):
+                fp = os.path.join(x, nm)
+                if os.path.exists(fp):
+                    try:
+                        with open(fp, encoding="utf-8") as f:
+                            val = json.load(f)
+                    except ValueError:
+                        continue
+                    if var == "limits":
+                        limits = fp
+                    elif var == "settings":
+                        settings = val
+                    else:
+                        info = val
+        else:
+            raise SuiError("不是备份文件（请上传中转助手下载的 .tar.gz，或 s-ui 面板下载的 .db）")
+        if not os.path.exists(snap):
+            raise SuiError("备份里没有 s-ui 数据库")
+        try:
             c = sqlite3.connect(snap)
             ok = c.execute("pragma integrity_check").fetchone()[0]
+            tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+            n_in = c.execute("select count(*) from inbounds").fetchone()[0] if "inbounds" in tables else 0
+            n_cl = c.execute("select count(*) from clients").fetchone()[0] if "clients" in tables else 0
             c.close()
-            if ok != "ok":
-                raise SuiError("备份里的数据库校验失败：%s" % ok)
+        except sqlite3.Error as e:
+            raise SuiError("备份里的数据库打不开：%s" % e)
+        if ok != "ok":
+            raise SuiError("备份里的数据库校验失败：%s" % ok)
+        if not {"inbounds", "settings", "users"} <= tables:
+            raise SuiError("这不是 s-ui 的数据库")
+
+        with LOCK:
+            before = os.path.join(os.path.dirname(CONFIG_PATH), "before-restore.tar.gz")
+            try:
+                make_backup(False, out=before)  # 恢复前把当前状态留一份，恢复错了还能救回来
+            except Exception as e:
+                warnings.append("恢复前没能保存当前状态：%s" % e)
+                before = ""
             subprocess.run(CFG.get("sui_stop_cmd") or "systemctl stop s-ui", shell=True, timeout=60, capture_output=True)
             time.sleep(1)
             for ext in ("-wal", "-shm"):
@@ -1886,24 +1882,57 @@ def op_restore(body):
                     pass
             shutil.copyfile(snap, db + ".restore")
             os.replace(db + ".restore", db)
-            lim = os.path.join(td, os.path.basename(LIMITS_PATH))
-            if os.path.exists(lim):
-                shutil.copyfile(lim, LIMITS_PATH)
-                with LIM_LOCK:
-                    load_limits()
+            # 证书文件：新服务器上没有的才写入，已有的不覆盖
+            for dst, src in files:
+                if not os.path.exists(dst):
+                    try:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copyfile(src, dst)
+                        os.chmod(dst, 0o600)
+                    except OSError as e:
+                        warnings.append("证书文件 %s 写入失败：%s" % (dst, e))
+            for fp in _ref_files(db):
+                if not os.path.exists(fp):
+                    warnings.append("s-ui 用到的证书文件 %s 在这台服务器上不存在，相关节点/面板可能起不来" % fp)
+            if limits:
+                shutil.copyfile(limits, LIMITS_PATH)
+            up = _sui_conn_from_db(db)
+            if isinstance(settings, dict):
+                for k in SETTING_KEYS:
+                    if k in settings and settings[k] not in (None, ""):
+                        up[k] = settings[k]
+            save_config(up)
+            with LIM_LOCK:
+                load_limits()
+            HEALTH.clear()
             subprocess.run(CFG.get("sui_start_cmd") or "systemctl start s-ui", shell=True, timeout=60, capture_output=True)
-        deadline = time.time() + 40
-        time.sleep(2)
-        core = "down"
-        while time.time() < deadline:
-            if core_running():
-                core = "ok"
-                break
-            time.sleep(1)
-    return {"restored": name, "before": os.path.basename(before), "core": core}
+            global SUI
+            SUI = Sui(CFG)
+            deadline = time.time() + 40
+            time.sleep(2)
+            core = "down"
+            while time.time() < deadline:
+                try:
+                    if core_running():
+                        core = "ok"
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            ports = 0
+            try:
+                reserve_ports()
+                for ib in SUI.load_all().get("inbounds") or []:
+                    if str(ib.get("listen_port") or "").isdigit():
+                        open_firewall(int(ib["listen_port"]), ib.get("type") in ("hysteria2", "hysteria", "tuic"))
+                        ports += 1
+            except Exception as e:
+                warnings.append("恢复后连接 s-ui 失败：%s" % e)
+    return {"core": core, "inbounds": n_in, "clients": n_cl, "from_host": info.get("host") or info.get("source") or "",
+            "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "backups": op_backups, "backup_now": op_backup_now, "restore": op_restore})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test})
 
 
 # ------------------------------------------------------------- web server --
@@ -1965,18 +1994,25 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send(401, "请先登录", "text/plain; charset=utf-8")
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            name = (q.get("name") or [""])[0]
-            fp = os.path.join(backup_dir(), name)
-            if not BACKUP_RE.match(name) or not os.path.isfile(fp):
-                return self._send(404, "not found", "text/plain")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/gzip")
-            self.send_header("Content-Length", str(os.path.getsize(fp)))
-            self.send_header("Content-Disposition", "attachment; filename=\"%s\"" % name)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            with open(fp, "rb") as f:  # 分块发送，不把整个文件读进内存
-                shutil.copyfileobj(f, self.wfile, 256 * 1024)
+            full = (q.get("full") or ["0"])[0] == "1"
+            try:
+                fp, name = make_backup(full)
+            except Exception as e:
+                return self._send(500, "备份失败：%s" % e, "text/plain; charset=utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(os.path.getsize(fp)))
+                self.send_header("Content-Disposition", "attachment; filename=\"%s\"" % name)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                with open(fp, "rb") as f:  # 分块发送，不把整个文件读进内存
+                    shutil.copyfileobj(f, self.wfile, 256 * 1024)
+            finally:
+                try:
+                    os.remove(fp)  # 只是临时文件，下载完就删，服务器上不留
+                except OSError:
+                    pass
             return
         if path == p.rstrip("/"):
             return self._send(302, "", headers={"Location": p})
@@ -1986,12 +2022,53 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, html, "text/html; charset=utf-8")
         return self._send(404, "not found", "text/plain")
 
+    def _restore_upload(self):
+        import tempfile
+        if not self._authed():
+            return self._send(401, {"ok": False, "error": "请先登录", "login": True})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return self._send(400, {"ok": False, "error": "没有收到文件"})
+        if n > RESTORE_MAX:
+            return self._send(413, {"ok": False, "error": "文件太大（%.0f MB）" % (n / 1048576)})
+        fd, tmp = tempfile.mkstemp(prefix="rh-upload-", dir=os.path.dirname(CONFIG_PATH))
+        try:
+            with os.fdopen(fd, "wb") as f:  # 边收边写硬盘，不占内存
+                left = n
+                while left > 0:
+                    chunk = self.rfile.read(min(256 * 1024, left))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    left -= len(chunk)
+            if left:
+                return self._send(400, {"ok": False, "error": "上传中断，请重试"})
+            try:
+                res = restore_file(tmp)
+                res["ok"] = True
+                return self._send(200, res)
+            except (SuiError, ValueError) as e:
+                return self._send(200, {"ok": False, "error": str(e)})
+            except Exception as e:
+                traceback.print_exc()
+                return self._send(200, {"ok": False, "error": "内部错误：%s" % e})
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     def do_POST(self):
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
         if not path.startswith(p + "api/"):
             return self._send(404, {"ok": False, "error": "not found"})
         action = path[len(p + "api/"):]
+        if action == "restore_upload":
+            return self._restore_upload()
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
@@ -2047,7 +2124,6 @@ def main():
     load_limits()
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
-    threading.Thread(target=backup_loop, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)
     scheme = "http"
     if CFG.get("cert_file") and CFG.get("key_file"):
