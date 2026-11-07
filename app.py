@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -889,7 +889,7 @@ def op_list(body):
         lim = json.loads(json.dumps(LIMITS))
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
-            "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0)}
+            "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary()}
 
 
 def op_links(body):
@@ -968,6 +968,12 @@ def op_replace(body):
         ob["tag"] = row["outbound_tag"]
         ob["id"] = row["outbound_id"]
         SUI.save("outbounds", "edit", ob)
+        with FO_LOCK:
+            f = FO.get(row["outbound_tag"])
+            if f:  # 有备用落地：换的是当前在用的那个
+                f[f.get("active", "primary")] = _ob_clean(ob)
+                FO_STATE.pop(row["outbound_tag"], None)
+                save_fo()
     chk = op_check({"tags": [row["outbound_tag"]]})["results"][0]
     return {"ok": True, "landing": "%s:%s" % (ob.get("server"), ob.get("server_port")), "check": chk}
 
@@ -1080,6 +1086,12 @@ def op_delete(body):
                     try:
                         SUI.save("outbounds", "del", ot)
                         drop_group_limits([ot])
+                        with FO_LOCK:
+                            f = FO.pop(ot, None)
+                            FO_STATE.pop(ot, None)
+                            if f:
+                                save_fo()
+                                SUI.save("outbounds", "del", f["standby"])
                     except Exception:
                         pass
     return {"results": out, "core": core}
@@ -1638,6 +1650,8 @@ def health_once():
     targets = []
     for k, rs in groups.items():
         m = rs[0]
+        if k in FO:
+            continue  # 有备用落地的线路由自动切换检测负责
         if not m.get("outbound_tag") or not any(r.get("enable") and (not r.get("expiry") or r["expiry"] > now) for r in rs):
             HEALTH.pop(k, None)  # 没有在用的用户：不检测，避免对过期/停用线路误报
             continue
@@ -1693,6 +1707,244 @@ def health_loop():
             time.sleep(secs)
         else:
             time.sleep(60)
+
+
+# ------------------------------------------------------ 备用落地 / 自动切换 --
+# 每条线路可以配一个备用落地。线路的出站 tag（= 分组、限额、路由规则用的 key）始终不变，
+# 切换时只是把出站的内容换成另一个落地，所以客户链接、流量统计、设备限制都不受影响。
+# 另建一个「<tag>-备用落地」出站（不挂任何路由规则）专门放当前没在用的那个落地，用来随时检测它通不通。
+FO_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "failover.json")
+FO = {}          # okey -> {"primary": ob, "backup": ob, "active": "primary"|"backup", "standby": tag, "auto_back": bool, "switched": ts, "log": [...]}
+FO_STATE = {}    # okey -> {"active": 检测结果, "standby": 检测结果, "afails", "sok", "both", "ts"}
+FO_LOCK = threading.RLock()
+FO_META = {}
+
+
+def load_fo():
+    global FO
+    try:
+        with open(FO_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        FO = d if isinstance(d, dict) else {}
+    except Exception:
+        FO = {}
+
+
+def save_fo():
+    tmp = FO_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(FO, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, FO_PATH)
+
+
+def _ob_clean(ob):
+    return {k: v for k, v in (ob or {}).items() if k not in ("id", "tag")}
+
+
+def _ob_addr(ob):
+    return "%s:%s" % (ob.get("server", ""), ob.get("server_port", "")) if ob else ""
+
+
+def _write_ob(obs, tag, conf):
+    ob = dict(conf)
+    ob["tag"] = tag
+    cur = obs.get(tag)
+    if cur:
+        ob["id"] = cur["id"]
+        SUI.save("outbounds", "edit", ob)
+    else:
+        SUI.save("outbounds", "new", ob)
+
+
+def _fo_swap(okey, to, reason):
+    """把线路切到 to（primary / backup）。返回 True 表示切了。"""
+    with LOCK, FO_LOCK:
+        f = FO.get(okey)
+        if not f or f.get("active") == to:
+            return False
+        obs = {o.get("tag"): o for o in SUI.load_all().get("outbounds") or []}
+        if okey not in obs:
+            raise SuiError("线路的落地出站不存在")
+        other = "primary" if to == "backup" else "backup"
+        _write_ob(obs, okey, f[to])              # 在用的出站换成目标落地
+        _write_ob(obs, f["standby"], f[other])  # 另一个放进待命出站，继续检测
+        f["active"] = to
+        f["switched"] = int(time.time())
+        f.setdefault("log", []).insert(0, {"ts": f["switched"], "to": to, "reason": reason})
+        del f["log"][20:]
+        save_fo()
+        FO_STATE.pop(okey, None)
+        HEALTH.pop(okey, None)
+        if not wait_core(6):
+            ensure_core()
+    return True
+
+
+def _fo_row(data, tag):
+    rows = {r["tag"]: r for r in build_relays(data)}
+    row = rows.get(tag)
+    if not row or not row.get("outbound_tag"):
+        raise SuiError("找不到这条线路的落地出站")
+    if row.get("landing_type") == "direct":
+        raise SuiError("直连线路没有落地，不能设备用落地")
+    return row
+
+
+def op_failover_set(body):
+    """设置 / 修改 / 取消备用落地。landing 为空 = 取消。"""
+    data = SUI.load_all()
+    row = _fo_row(data, body.get("tag"))
+    okey = row["outbound_tag"]
+    obs = {o.get("tag"): o for o in data.get("outbounds") or []}
+    if body.get("only_flag"):
+        with FO_LOCK:
+            if okey not in FO:
+                raise SuiError("这条线路还没有备用落地")
+            FO[okey]["auto_back"] = bool(body.get("auto_back"))
+            save_fo()
+        return {}
+    raw = (body.get("landing") or "").strip()
+    if not raw:
+        with FO_LOCK:
+            if okey not in FO:
+                return {"removed": False}
+        if FO[okey].get("active") == "backup":
+            _fo_swap(okey, "primary", "取消备用落地，切回主落地")
+        with LOCK, FO_LOCK:
+            try:
+                SUI.save("outbounds", "del", FO[okey]["standby"])
+            except Exception:
+                pass
+            FO.pop(okey, None)
+            FO_STATE.pop(okey, None)
+            save_fo()
+        return {"removed": True}
+    ob, host, remark = parse_landing(raw)
+    ob = _ob_clean(ob)
+    with LOCK, FO_LOCK:
+        f = FO.get(okey)
+        if not f:
+            stb = okey + "-备用落地"
+            while stb in obs:
+                stb += "_"
+            f = {"primary": _ob_clean(obs[okey]), "active": "primary", "standby": stb, "log": []}
+        if landing_key(ob) == landing_key(f["primary"]):
+            raise SuiError("备用落地和主落地是同一个")
+        f["backup"] = ob
+        f["auto_back"] = bool(body.get("auto_back", True))
+        if f["active"] == "backup":
+            _write_ob(obs, okey, ob)      # 正在用备用：直接换掉在用的出站
+        else:
+            _write_ob(obs, f["standby"], ob)
+        FO[okey] = f
+        FO_STATE.pop(okey, None)
+        save_fo()
+        chk_tag = okey if f["active"] == "backup" else f["standby"]
+    chk = op_check({"tags": [chk_tag]})["results"][0]
+    return {"check": chk, "backup": _ob_addr(ob)}
+
+
+def op_failover_switch(body):
+    data = SUI.load_all()
+    row = _fo_row(data, body.get("tag"))
+    to = body.get("to")
+    if to not in ("primary", "backup"):
+        raise SuiError("参数错误")
+    if row["outbound_tag"] not in FO:
+        raise SuiError("这条线路还没有备用落地")
+    did = _fo_swap(row["outbound_tag"], to, "手动切换")
+    return {"switched": did}
+
+
+def fo_summary():
+    with FO_LOCK:
+        out = {}
+        for k, f in FO.items():
+            st = FO_STATE.get(k) or {}
+            out[k] = {"active": f.get("active"), "auto_back": f.get("auto_back", True), "switched": f.get("switched", 0),
+                      "primary": landing_info(f.get("primary") or {}), "backup": landing_info(f.get("backup") or {}),
+                      "log": (f.get("log") or [])[:5],
+                      "state": {"active": st.get("active"), "standby": st.get("standby"), "ts": st.get("ts", 0)}}
+        return out
+
+
+def failover_once():
+    with FO_LOCK:
+        items = [(k, json.loads(json.dumps(v))) for k, v in FO.items()]
+    if not items:
+        return
+    data = SUI.load_all()
+    obs = {o.get("tag") for o in data.get("outbounds") or []}
+    groups = group_rows(build_relays(data))
+    url = CFG.get("check_url")
+
+    def chk(tag):
+        if tag not in obs:
+            return {"ok": False, "error": "出站不存在"}
+        try:
+            r = SUI.check_outbound(tag, url) or {}
+            return {"ok": bool(r.get("OK")), "delay": r.get("Delay"), "error": r.get("Error") or ""}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    jobs = [(k, f) for k, f in items if k in groups]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(lambda kf: (kf[0], kf[1], chk(kf[0]), chk(kf[1]["standby"])), jobs))
+    need = int(CFG.get("failover_fail_times") or 2)
+    back_need = int(CFG.get("failover_back_times") or 3)
+    host = CFG["public_host"]
+    now = int(time.time())
+    for k, f, a, s in res:
+        st = FO_STATE.setdefault(k, {"afails": 0, "sok": 0})
+        st.update(active=dict(a, ts=now), standby=dict(s, ts=now), ts=now)
+        st["afails"] = 0 if a["ok"] else st.get("afails", 0) + 1
+        st["sok"] = st.get("sok", 0) + 1 if s["ok"] else 0
+        # 检测列显示在用落地的状态
+        HEALTH[k] = {"ok": a["ok"], "delay": a.get("delay"), "error": a.get("error"), "fails": st["afails"], "ts": now,
+                     "landing": _ob_addr(f.get(f["active"])), "name": groups[k][0]["tag"]}
+        name = groups[k][0]["tag"]
+        pa, ba = _ob_addr(f.get("primary")), _ob_addr(f.get("backup"))
+        try:
+            if a["ok"] and st.get("both"):
+                st["both"] = False
+                tg_send("✅ %s 落地已恢复（%s）" % (name, host))
+            if f["active"] == "primary":
+                if st["afails"] >= need and s["ok"]:
+                    if _fo_swap(k, "backup", "主落地连续 %d 次不通：%s" % (st["afails"], (a.get("error") or "超时")[:60])):
+                        tg_send("🔁 %s 主落地 %s 不通，已自动切到备用落地 %s（%s，客户无需操作）" % (name, pa, ba, host))
+                elif st["afails"] >= need and not st.get("both"):
+                    st["both"] = True
+                    tg_send("⚠️ %s 主落地 %s 和备用落地 %s 都不通（%s）" % (name, pa, ba, host))
+            else:
+                if f.get("auto_back", True) and st["sok"] >= back_need:
+                    if _fo_swap(k, "primary", "主落地已恢复（连续 %d 次检测正常），自动切回" % st["sok"]):
+                        tg_send("↩️ %s 主落地 %s 已恢复，已自动切回（%s）" % (name, pa, host))
+                elif st["afails"] >= need and s["ok"]:
+                    if _fo_swap(k, "primary", "备用落地不通，主落地正常，切回主落地"):
+                        tg_send("🔁 %s 备用落地 %s 不通，已切回主落地 %s（%s）" % (name, ba, pa, host))
+                elif st["afails"] >= need and not st.get("both"):
+                    st["both"] = True
+                    tg_send("⚠️ %s 主落地 %s 和备用落地 %s 都不通（%s）" % (name, pa, ba, host))
+        except Exception as e:
+            sys.stderr.write("failover %s: %s\n" % (k, e))
+        with FO_LOCK:
+            nf = FO.get(k)
+        if nf and nf.get("active") != f["active"]:
+            # 刚切换：在用/待命对调，直接用这次的检测结果，不必等下一轮
+            FO_STATE[k] = {"active": dict(s, ts=now), "standby": dict(a, ts=now), "afails": 0, "sok": 0, "ts": now, "both": False}
+            HEALTH[k] = {"ok": s["ok"], "delay": s.get("delay"), "error": s.get("error"), "fails": 0, "ts": now,
+                         "landing": _ob_addr(nf.get(nf["active"])), "name": name}
+    FO_META["last"] = now
+
+
+def failover_loop():
+    time.sleep(int(CFG.get("failover_first_delay", 20)))
+    while True:
+        try:
+            failover_once()
+        except Exception as e:
+            sys.stderr.write("failover: %s\n" % e)
+        time.sleep(max(10, int(CFG.get("failover_interval_sec") or 30)))
 
 
 # ---------------------------------------------------------------- 备份/恢复 --
@@ -1774,6 +2026,8 @@ def make_backup(full=False, out=None):
             tar.add(st, "relay-helper-settings.json")
             if os.path.exists(LIMITS_PATH):
                 tar.add(LIMITS_PATH, "limits.json")
+            if os.path.exists(FO_PATH):
+                tar.add(FO_PATH, "failover.json")
             for fp in files:
                 tar.add(fp, "files" + fp)
     os.chmod(out, 0o600)
@@ -1821,7 +2075,7 @@ def restore_file(path):
                         nm = m.name
                         if not m.isfile() or ".." in nm.split("/") or nm.startswith("/"):
                             continue
-                        if nm in ("s-ui.db", "limits.json", "relay-helper-settings.json", "backup-info.json") or \
+                        if nm in ("s-ui.db", "limits.json", "failover.json", "relay-helper-settings.json", "backup-info.json") or \
                                 (nm.startswith("files/") and m.size < 1024 * 1024):
                             dest = os.path.join(td, "x", nm)
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1896,6 +2150,16 @@ def restore_file(path):
                     warnings.append("s-ui 用到的证书文件 %s 在这台服务器上不存在，相关节点/面板可能起不来" % fp)
             if limits:
                 shutil.copyfile(limits, LIMITS_PATH)
+            fo = os.path.join(td, "x", "failover.json")
+            if os.path.exists(fo):
+                shutil.copyfile(fo, FO_PATH)
+            else:  # 备份里没有备用落地记录（s-ui 的 .db 或旧版本备份）：清空，免得和恢复后的出站对不上
+                with FO_LOCK:
+                    FO.clear()
+                    save_fo()
+            with FO_LOCK:
+                load_fo()
+                FO_STATE.clear()
             up = _sui_conn_from_db(db)
             if isinstance(settings, dict):
                 for k in SETTING_KEYS:
@@ -1932,7 +2196,7 @@ def restore_file(path):
             "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch})
 
 
 # ------------------------------------------------------------- web server --
@@ -2122,7 +2386,9 @@ def main():
     except Exception as e:
         print("警告：暂时无法登录 s-ui：", e)
     load_limits()
+    load_fo()
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=failover_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)
     scheme = "http"

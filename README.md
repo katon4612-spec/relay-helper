@@ -43,6 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/
 - **HTTPS**：安装/升级时会询问是否启用。中转机地址是域名、且 80 端口空闲时，自动用 acme.sh 申请 Let's Encrypt 证书并自动续签（需要云安全组放行 TCP 80）；否则使用自签名证书（同样加密，浏览器首次打开点「继续访问」）。之后单独重新配置：`bash /opt/relay-helper/https.sh /opt/relay-helper force`
 - **Telegram 通知**：在「设置」页填 Bot Token 和 Chat ID，可发送测试消息。
 - **落地自动巡检**：默认每 5 分钟检测所有在用线路的落地，连续 2 次不通发 Telegram 告警，恢复后通知；「线路管理」检测列显示最新结果。
+- **备用落地 / 自动切换**：「线路管理」每条线路点「备用落地」填一个备用落地。每 30 秒检测一次，主落地连续 2 次不通就自动切到备用（约 1 分钟内），主落地连续 3 次正常再自动切回（可关）；主备都不通时发告警。切换只换出站内容、出站 tag 不变，所以客户链接、二维码、流量统计、设备限额都不变，Telegram 会通知每次切换。也可手动切换。参数（config.json）：`failover_interval_sec`（默认 30）、`failover_fail_times`（2）、`failover_back_times`（3）。
 - **备份与恢复**（和 s-ui 自带的一样）：「备份」页点「下载备份」现做一份发给浏览器（服务器上不留文件），包含 s-ui 全部节点/用户/到期/已用流量/路由、用到的证书文件、中转助手的限额和 Telegram/巡检设置，一般几十 KB（可勾选包含流量统计历史）；「恢复备份」上传文件即可，也支持 s-ui 面板自己下载的 .db。恢复后自动接上 s-ui 新的端口/账号、放行防火墙端口；恢复前的状态自动存为 `/opt/relay-helper/before-restore.tar.gz`。
 - **换中转服务器**：旧机「下载备份」→ 域名解析到新机 IP → 新机装 s-ui + 中转助手 → 新机「恢复备份」→ 安全组放行节点端口。
 

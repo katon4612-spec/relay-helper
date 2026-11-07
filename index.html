@@ -383,7 +383,7 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   H("#secbox",n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
@@ -434,13 +434,14 @@ function drawTable(){
   ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
   <td style="word-break:break-all;min-width:150px">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
   <td><span class="tag">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
-  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
+  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
   ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
   ${i===0?`<td rowspan="${n}">${healthCell(g)}</td>`:""}
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
+  <button class="sm" data-a="fo" data-t="${esc(r.tag)}" ${r.outbound_tag&&r.landing_type!=="direct"?"":"disabled"}>备用落地</button>
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
   <button class="sm" data-a="lim" data-t="${esc(r.tag)}">限额</button>`:""}
@@ -455,7 +456,7 @@ function drawTable(){
     $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -502,6 +503,43 @@ function replaceDlg(tag){
     try{const x=await api("replace",{tag,landing:$("#nl").value.trim()});state.checks[tag]=x.check;
       H("#rmsg",x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`);
       await loadRelays();drawTable()}catch(e){H("#rmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="替换并检测"}}};
+}
+/* ---------------- 备用落地 ---------------- */
+const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
+const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
+function foCell(r){const f=foOf(r);if(!f)return "";
+  return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}</div>`
+    :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}</div>`}
+function foDlg(tag){
+  const r=byTag(tag);const f=foOf(r);const st=(f&&f.state)||{};
+  const chk=c=>!c?'<span class="muted">待检测</span>':c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`;
+  const pri=f?f.primary:(r.landing_info||{}),bak=f?f.backup:null;
+  const act=f?f.active:"primary";
+  const line=(lab,L,isAct,c)=>`<tr><td><b>${lab}</b>${isAct?' <span class="tag ok">在用</span>':""}</td><td class="mono">${esc(addr(L))}${L&&L.username?` <span class="muted">${esc(L.username)}</span>`:""}</td><td>${L&&L.server?chk(c):""}</td></tr>`;
+  const cPri=act==="primary"?st.active:st.standby,cBak=act==="backup"?st.active:st.standby;
+  modal(`<h2 style="margin-top:0">备用落地：${esc(tag)}</h2>
+  <p class="hint">主落地连续两次检测不通（约 1 分钟）就自动切到备用落地，<b>客户链接、二维码、流量和设备限额都不变</b>，Telegram 会通知你。检测每 30 秒一次。</p>
+  <table style="margin:8px 0"><tr><th>落地</th><th>地址</th><th>状态</th></tr>${line("主落地",pri,act==="primary",cPri)}${bak?line("备用落地",bak,act==="backup",cBak):""}</table>
+  <input id="fol" style="width:100%" placeholder="${f?"填新的备用落地可替换现有备用":"备用落地：socks5://账号:密码@IP:端口 或 IP:端口:账号:密码 或 vless://…"}" value="${f&&bak&&bak.plain?esc(bak.plain):""}">
+  <label class="ck" style="margin-top:8px"><input type="checkbox" id="foab" ${!f||f.auto_back?"checked":""}>主落地恢复后自动切回（连续 3 次检测正常）</label>
+  <div class="row" style="margin-top:12px"><button class="pri" id="fook">${f?"保存":"设为备用落地"}并检测</button>
+  ${f?`<button id="fosw">手动切到${act==="primary"?"备用":"主"}落地</button><button class="danger" id="fodel">取消备用落地</button>`:""}<button id="focl">关闭</button></div>
+  <p id="fomsg"></p>
+  ${f&&f.log&&f.log.length?`<div class="hint" style="margin-top:8px"><b>切换记录</b><br>${f.log.map(x=>`${esc(fmtDate(x.ts))} → ${x.to==="backup"?"备用":"主"}落地：${esc(x.reason)}`).join("<br>")}</div>`:""}`);
+  $("#focl").onclick=closeModal;
+  const busy=(b,t)=>{b.disabled=true;b.innerHTML=`<span class="spin"></span> ${t}`};
+  const refresh=async()=>{await loadRelays();drawTable()};
+  $("#fook").onclick=async()=>{const b=$("#fook");const v=$("#fol").value.trim();if(!v)return H("#fomsg",'<span class="err">请填写备用落地</span>');busy(b,"检测中");
+    try{const x=await api("failover_set",{tag,landing:v,auto_back:$("#foab").checked});
+      H("#fomsg",x.check.ok?`<span class="tag ok">备用落地 ${esc(x.backup)} 已设置，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已设置，但备用落地 ${esc(x.backup)} 检测不通：${esc(x.check.error)}</span>`);
+      await refresh();setTimeout(()=>{if($("#fomsg"))foDlg(tag)},1500)}catch(e){H("#fomsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="保存并检测"}};
+  if(f){
+    $("#foab").onchange=async()=>{try{await api("failover_set",{tag,only_flag:true,auto_back:$("#foab").checked});await refresh();toast("已保存")}catch(e){toast(e.message)}};
+    $("#fosw").onclick=async()=>{const to=act==="primary"?"backup":"primary";if(!confirm(`切到${to==="backup"?"备用":"主"}落地？正在使用的连接会断开重连（几秒）。`))return;busy($("#fosw"),"切换中");
+      try{await api("failover_switch",{tag,to});await refresh();toast("已切换");foDlg(tag)}catch(e){toast(e.message,6000);foDlg(tag)}};
+    $("#fodel").onclick=async()=>{if(!confirm("取消这条线路的备用落地？如果正在走备用，会先切回主落地。"))return;busy($("#fodel"),"处理中");
+      try{await api("failover_set",{tag,landing:""});await refresh();toast("已取消备用落地");closeModal()}catch(e){toast(e.message,6000)}};
+  }
 }
 function addProtoDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&r.outbound_tag);if(!rs.length)return toast("所选线路没有落地");
