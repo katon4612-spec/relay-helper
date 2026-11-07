@@ -105,6 +105,8 @@ td.nm.p-vless{--c:var(--p-vless)}td.nm.p-vless443{--c:var(--p-vless443)}td.nm.p-
 .modal.show{display:flex}
 .modal .box{background:var(--card);border-radius:14px;padding:22px 24px;max-width:580px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 20px 50px rgba(43,38,32,.25)}
 .modal .box h2{font-size:17px}
+.modal .box:has(#poolbox){max-width:720px}
+#poolbox td,#poolbox button,#ppl td{white-space:nowrap}
 .modal .box table th{background:transparent}
 
 .login{max-width:380px;margin:14vh auto;padding:28px}
@@ -177,13 +179,13 @@ function renderLogin(){
 
 function shell(){
   $("#app").innerHTML=`<header><h1>中转助手</h1><span class="host" id="hostinfo"></span><select id="srvsel" class="srvsel" title="选择要管理的服务器" style="display:none"></select>
-  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button data-t="backup">备份</button><button data-t="settings">设置</button><button data-t="servers">服务器</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
+  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button data-t="pool">落地库</button><button data-t="backup">备份</button><button data-t="settings">设置</button><button data-t="servers">服务器</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.onclick=()=>{state.tab=b.dataset.t;render()});
   $("#logout").onclick=async()=>{await fetch(BASE+"api/logout",{method:"POST"});renderLogin()};
 }
 function render(){
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.classList.toggle("on",b.dataset.t===state.tab));
-  if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else if(state.tab==="servers")renderServers();else renderManage();
+  if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else if(state.tab==="servers")renderServers();else if(state.tab==="pool")renderPool();else renderManage();
 }
 async function loadServers(){
   try{const x=await api("servers_list",{},{local:true});state.servers=x.servers;state.local=x.local}catch(e){state.servers=[]}
@@ -229,8 +231,9 @@ IP:端口:账号:密码
 vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
 也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
   <p class="hint" id="relayhint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
-  <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button></div></div>
+  <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button><button id="frompool">从落地库选</button></div></div>
   <div id="pvbox"></div><div id="resbox"></div>`;
+  $("#frompool").onclick=()=>poolPicker(raws=>{const t=$("#txt");t.value=(t.value.trim()?t.value.trim()+"\n":"")+raws.join("\n");toast(`已加入 ${raws.length} 条落地`)});
   const sp=saved.protos||[saved.proto||"vless"];document.querySelectorAll("#protos input").forEach(c=>c.checked=sp.includes(c.value));
   $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
@@ -484,7 +487,7 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
@@ -618,13 +621,132 @@ function replaceDlg(tag){
   ${sib.length?`<p class="hint" style="color:var(--warn)">⚠ 这个落地还被 ${sib.length} 个节点共用（${sib.map(s=>esc(s.tag)).join("、")}），会一起换。</p>`:""}
   <p class="hint">客户的链接和二维码不变，只换出口。</p>
   <input id="nl" style="width:100%" placeholder="socks5://账号:密码@IP:端口 或 IP:端口:账号:密码 或 vless://…">
-  <div class="row" style="margin-top:12px"><button class="pri" id="rok">替换并检测</button><button id="rcl">取消</button></div><p id="rmsg"></p>`);
-  $("#rcl").onclick=closeModal;document.querySelectorAll("#mbox [data-cp]").forEach(b=>b.onclick=()=>copy(b.dataset.cp));
+  <div class="row" style="margin-top:12px"><button class="pri" id="rok">替换并检测</button><button id="rcl">取消</button></div><p id="rmsg"></p>
+  <div id="poolbox" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><span class="spin"></span> 读取落地库…</div>`);
+  $("#rcl").onclick=closeModal;poolSection(tag);document.querySelectorAll("#mbox [data-cp]").forEach(b=>b.onclick=()=>copy(b.dataset.cp));
   $("#rok").onclick=async()=>{const b=$("#rok");b.disabled=true;b.innerHTML='<span class="spin"></span> 替换中';
     try{const x=await api("replace",{tag,landing:$("#nl").value.trim()});state.checks[tag]=x.check;
       H("#rmsg",x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`);
       await loadRelays();drawTable()}catch(e){H("#rmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="替换并检测"}}};
 }
+/* ---------------- 落地库 ---------------- */
+const fmtD=ts=>{if(!ts)return "";const d=new Date(ts*1000);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`};
+const chkTag=c=>!c?'<span class="muted">未检测</span>':(c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`)+`<div class="sib">${agoText(c.ts)}</div>`;
+function poolStatus(it){if(it.disabled)return '<span class="tag gray">已停用</span>';if(it.expired)return '<span class="tag bad">已到期</span>';
+  return it.used_by.length?`<span class="tag warn">使用中</span><div class="sib">${it.used_by.map(esc).join("、")}</div>`:'<span class="tag ok">空闲</span>'}
+async function poolSection(tag){
+  let x;try{x=await api("pool_candidates",{tag})}catch(e){return H("#poolbox",`<span class="err">${esc(e.message)}</span>`)}
+  const box=$("#poolbox");if(!box)return;
+  const c=x.current;
+  box.innerHTML=`<b>从落地库换</b> <span class="hint">当前：${esc(c.addr)}　${esc(c.country||"国家未知")}　网段 ${esc(c.net||"-")}${c.in_pool?"":"（不在落地库里）"}</span>
+  <div class="row" style="margin-top:8px;align-items:center"><button class="pri sm" id="pauto1">自动挑一个能通的换上</button>
+  <label class="ck"><input type="checkbox" id="pautochk" ${x.auto?"checked":""} ${x.has_failover?"disabled":""}>落地不通时自动从库里换${x.has_failover?"（已设备用落地，由备用落地负责）":""}</label></div>
+  <p class="hint">优先挑同国家、<b>不同网段</b>、最近检测能通的空闲落地；换之前会先检测。客户链接不变。</p>
+  ${x.candidates.length?`<table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>到期</th><th></th></tr>${x.candidates.slice(0,8).map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
+    <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag warn">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
+    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有${esc(c.country||"")}的空闲落地，可以到「落地库」页导入。</p>`}
+  <p id="pmsg"></p>`;
+  const done=async(p)=>{const r=await p;state.checks[tag]=r.check;H("#pmsg",`<span class="tag ${r.check&&r.check.ok?"ok":"bad"}">已换成 ${esc(r.to)}（${esc(r.country||"")} ${esc(r.net||"")}）${r.check&&r.check.ok?"，连通 "+r.check.delay+"ms":"，但检测不通"}</span>${r.same_net?' <span class="tag warn">注意：和原来是同一网段</span>':""}`);await loadRelays();drawTable();setTimeout(()=>{if($("#poolbox"))replaceDlg(tag)},1800)};
+  $("#pauto1").onclick=async()=>{const b=$("#pauto1");b.disabled=true;b.innerHTML='<span class="spin"></span> 检测并更换中…';try{await done(api("pool_switch",{tag}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="自动挑一个能通的换上"}};
+  document.querySelectorAll("#poolbox [data-use]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';try{await done(api("pool_switch",{tag,id:b.dataset.use}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`)}});
+  $("#pautochk").onchange=async()=>{try{await api("pool_auto",{tags:[tag],on:$("#pautochk").checked});toast($("#pautochk").checked?"已开启：落地不通时自动从落地库换":"已关闭自动换");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+}
+async function poolPicker(cb){
+  let x;try{x=await api("pool_list")}catch(e){return toast(e.message)}
+  const rank=it=>it.check?(it.check.ok?0:2):1;
+  const idle=x.items.filter(it=>!it.used_by.length&&!it.disabled&&!it.expired).sort((a,b)=>rank(a)-rank(b)||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9));
+  const cs=[...new Set(idle.map(it=>it.country||"未知"))];
+  let cur=cs[0]||"";
+  const draw=()=>{const list=idle.filter(it=>(it.country||"未知")===cur);
+    H("#ppl",list.length?`<table><tr><th><input type="checkbox" id="ppall"></th><th>落地</th><th>网段</th><th>检测</th><th>到期</th></tr>${list.map(it=>`<tr><td><input type="checkbox" data-pp="${esc(it.id)}"></td><td class="mono">${esc(it.host)}:${esc(it.port)}</td><td class="mono">${esc(it.net||"-")}</td><td>${chkTag(it.check)}</td><td>${it.expire?esc(fmtD(it.expire)):"-"}</td></tr>`).join("")}</table>`:'<p class="hint">没有空闲落地</p>');
+    if($("#ppall"))$("#ppall").onchange=()=>document.querySelectorAll("[data-pp]").forEach(c=>c.checked=$("#ppall").checked);
+    document.querySelectorAll("#ppc button").forEach(b=>b.classList.toggle("pri",b.dataset.c===cur))};
+  modal(`<h2 style="margin-top:0">从落地库选（空闲 ${idle.length} 个）</h2>
+  <div class="row" id="ppc" style="gap:6px">${cs.map(c=>`<button class="sm" data-c="${esc(c)}">${esc(c)}（${idle.filter(it=>(it.country||"未知")===c).length}）</button>`).join("")||'<span class="hint">落地库里没有空闲落地，先到「落地库」页导入。</span>'}</div>
+  <div id="ppl" style="max-height:52vh;overflow:auto;margin-top:10px"></div>
+  <div class="row" style="margin-top:12px"><button class="pri" id="ppok">加入到落地输入框</button><button id="ppcl">取消</button></div>`);
+  document.querySelectorAll("#ppc button").forEach(b=>b.onclick=()=>{cur=b.dataset.c;draw()});draw();
+  $("#ppcl").onclick=closeModal;
+  $("#ppok").onclick=()=>{const ids=new Set([...document.querySelectorAll("[data-pp]:checked")].map(c=>c.dataset.pp));if(!ids.size)return toast("先勾选落地");
+    cb(idle.filter(it=>ids.has(it.id)).map(it=>it.raw));closeModal()};
+}
+async function renderPool(){
+  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
+  let x;try{x=await api("pool_list")}catch(e){return H("#main",`<div class="card err">${esc(e.message)}</div>`)}
+  if(state.tab!=="pool")return;
+  state.pool=x.items;state.pf=state.pf||{c:"",s:"",q:""};state.psel=state.psel||new Set();
+  const items=x.items,now=x.now;
+  const by={};items.forEach(it=>{const c=it.country||"未知";(by[c]=by[c]||{n:0,idle:0,bad:0}).n++;if(!it.used_by.length&&!it.disabled&&!it.expired)by[c].idle++;if(it.check&&!it.check.ok)by[c].bad++});
+  const soon=items.filter(it=>it.expire&&it.expire>now&&it.expire<now+7*86400).length;
+  m.innerHTML=`<div class="card"><h2>落地库</h2>
+  <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（优先同国家、不同网段），也可以给线路开「自动换」。是否在用、被哪条线路用，按线路实时算。</p>
+  <div class="row" style="gap:6px;margin:10px 0"><button class="sm" data-pc="">全部（${items.length}）</button>${Object.entries(by).map(([c,v])=>`<button class="sm" data-pc="${esc(c)}">${esc(c)} ${v.n}<span class="muted">（空闲 ${v.idle}${v.bad?`，<span class="err">不通 ${v.bad}</span>`:""}）</span></button>`).join("")}</div>
+  <div class="toolbar"><input id="pq" class="grow" placeholder="搜 IP / 网段 / 供应商 / 备注 / 使用的线路" value="${esc(state.pf.q)}">
+   <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">使用中</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
+   <button class="pri" id="pimp">导入落地</button></div>
+  <div class="toolbar" id="pbulk"></div><div id="ptable"></div></div>
+  ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;
+  document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;renderPool()}});
+  $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
+  $("#pq").oninput=()=>{state.pf.q=$("#pq").value;drawPool()};
+  $("#pimp").onclick=poolImportDlg;
+  drawPool();
+}
+function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now()/1000;
+  return state.pool.filter(it=>(!f.c||(it.country||"未知")===f.c)&&
+    (!f.s||(f.s==="idle"&&!it.used_by.length&&!it.disabled&&!it.expired)||(f.s==="used"&&it.used_by.length)||(f.s==="bad"&&it.check&&!it.check.ok)||(f.s==="exp"&&it.expire&&it.expire<now+7*86400)||(f.s==="off"&&it.disabled))&&
+    (!q||[it.host,it.net,it.supplier,it.note,it.used_by.join(" "),it.raw].join(" ").toLowerCase().includes(q)))}
+function drawPool(){
+  const list=poolFiltered(),sel=state.psel;[...sel].forEach(id=>{if(!state.pool.some(it=>it.id===id))sel.delete(id)});
+  H("#pbulk",`<span class="muted">${list.length} 个${sel.size?`，已选 ${sel.size}`:""}</span><button class="sm" id="psall">全选当前</button>${sel.size?`<button class="sm" id="psnone">取消选择</button>
+   <button class="sm" id="pchk">检测</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
+  H("#ptable",list.length?`<table><tr><th></th><th>国家</th><th>落地</th><th>网段</th><th>状态</th><th>检测</th><th>供应商 / 进价</th><th>落地到期</th><th>备注</th></tr>
+  ${list.slice(0,500).map(it=>`<tr><td><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td>${esc(it.country||"未知")}</td>
+   <td class="mono">${esc(it.host)}:${esc(it.port)} <span class="tag gray">${esc(protoName[it.type]||it.type)}</span></td><td class="mono">${esc(it.net||"-")}</td>
+   <td>${poolStatus(it)}</td><td>${chkTag(it.check)}</td><td>${esc(it.supplier||"")}${it.cost?` <span class="muted">¥${esc(it.cost)}</span>`:""}</td>
+   <td>${it.expire?`<span class="${it.expired?"err":""}">${esc(fmtD(it.expire))}</span>`:'<span class="muted">-</span>'}</td><td class="muted">${esc(it.note||"")}</td></tr>`).join("")}</table>`:
+   `<p class="hint">${state.pool.length?"没有符合条件的落地":"落地库还是空的，点右上角「导入落地」把买来的落地粘贴进来。"}</p>`);
+  document.querySelectorAll("[data-ps]").forEach(c=>c.onchange=()=>{c.checked?sel.add(c.dataset.ps):sel.delete(c.dataset.ps);drawPool()});
+  $("#psall").onclick=()=>{list.forEach(it=>sel.add(it.id));drawPool()};
+  if(!sel.size)return;
+  const ids=[...sel];
+  $("#psnone").onclick=()=>{sel.clear();drawPool()};
+  $("#pcopy").onclick=()=>copy(state.pool.filter(it=>sel.has(it.id)).map(it=>it.raw).join("\n"));
+  $("#pchk").onclick=async()=>{const b=$("#pchk");b.disabled=true;let done=0;
+    for(let i=0;i<ids.length;i+=30){b.innerHTML=`<span class="spin"></span> ${done}/${ids.length}`;try{await api("pool_check",{ids:ids.slice(i,i+30)})}catch(e){toast(e.message)}done=Math.min(ids.length,i+30)}
+    toast("检测完成");renderPool()};
+  const upd=async f=>{try{await api("pool_update",Object.assign({ids},f));renderPool()}catch(e){toast(e.message)}};
+  $("#pdis").onclick=()=>upd({disabled:true});$("#pen").onclick=()=>upd({disabled:false});
+  $("#pdel").onclick=async()=>{const used=state.pool.filter(it=>sel.has(it.id)&&it.used_by.length).length;
+    if(!confirm(`从落地库删除 ${ids.length} 个落地？${used?`\n其中 ${used} 个正在被线路使用——只是从库里删掉记录，线路不受影响。`:""}`))return;
+    await api("pool_delete",{ids});sel.clear();renderPool()};
+  $("#pedit").onclick=()=>{modal(`<h2 style="margin-top:0">编辑 ${ids.length} 个落地</h2><p class="hint">留空的项不修改。</p>
+    <div class="row"><label>国家<input id="ec" style="width:120px"></label><label>供应商<input id="es" style="width:140px"></label><label>进价<input id="ecost" style="width:90px"></label>
+    <label>落地到期<input id="ee" type="date"></label></div><div class="row" style="margin-top:10px"><label style="flex:1">备注<input id="en" style="width:100%"></label></div>
+    <div class="row" style="margin-top:12px"><button class="pri" id="eok">保存</button><button id="ecl">取消</button></div>`);
+    $("#ecl").onclick=closeModal;
+    $("#eok").onclick=async()=>{const f={};if($("#ec").value.trim())f.country=$("#ec").value.trim();if($("#es").value.trim())f.supplier=$("#es").value.trim();
+      if($("#ecost").value.trim())f.cost=$("#ecost").value.trim();if($("#ee").value)f.expire=Math.floor(new Date($("#ee").value+"T23:59:59").getTime()/1000);if($("#en").value.trim())f.note=$("#en").value.trim();
+      closeModal();await upd(f)}};
+}
+function poolImportDlg(){
+  modal(`<h2 style="margin-top:0">导入落地</h2>
+  <p class="hint">每行一条，格式和一键中转一样（IP:端口:账号:密码、socks5://…、vless://… 等）。国家和网段会自动识别；同一批可以统一填供应商、进价、到期。重复的会跳过。</p>
+  <textarea id="it" style="min-height:180px" placeholder="1.2.3.4:1080:user:pass"></textarea>
+  <div class="row" style="margin-top:10px"><label>供应商<input id="isup" style="width:140px"></label><label>进价（每个）<input id="icost" style="width:100px"></label>
+  <label>落地到期<input id="iexp" type="date"></label><label>国家（留空自动）<input id="icty" style="width:110px"></label></div>
+  <div class="row" style="margin-top:10px"><label style="flex:1">备注<input id="inote" style="width:100%"></label></div>
+  <div class="row" style="margin-top:12px"><button class="pri" id="iok">导入并检测</button><button id="icl">取消</button></div><p id="imsg"></p>`);
+  $("#icl").onclick=closeModal;
+  $("#iok").onclick=async()=>{const b=$("#iok");b.disabled=true;b.innerHTML='<span class="spin"></span> 导入中';
+    try{const x=await api("pool_import",{text:$("#it").value,supplier:$("#isup").value,cost:$("#icost").value,country:$("#icty").value,note:$("#inote").value,
+        expire:$("#iexp").value?Math.floor(new Date($("#iexp").value+"T23:59:59").getTime()/1000):0});
+      H("#imsg",`已导入 ${x.added} 个${x.dup?`，跳过重复 ${x.dup} 个`:""}${x.errors.length?`<div class="err">${x.errors.length} 行无法识别：${x.errors.slice(0,5).map(e=>esc(e.line)).join("；")}</div>`:""}`);
+      if(x.added){b.innerHTML='<span class="spin"></span> 检测中';const l=await api("pool_list");const fresh=l.items.filter(it=>!it.check).map(it=>it.id);
+        for(let i=0;i<fresh.length;i+=30)await api("pool_check",{ids:fresh.slice(i,i+30)});}
+      closeModal();toast(`已导入 ${x.added} 个落地`);renderPool()}catch(e){H("#imsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="导入并检测"}};
+}
+
 /* ---------------- 服务器 ---------------- */
 async function renderServers(){
   const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span> 正在读取各服务器…</div>';
@@ -728,7 +850,7 @@ function portDlg(tags){
 /* ---------------- 备用落地 ---------------- */
 const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
 const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
-function foCell(r){const f=foOf(r);if(!f)return "";
+function foCell(r){const f=foOf(r);const pa=state.pauto&&r.outbound_tag&&state.pauto.has(r.outbound_tag)?`<div class="sib"><span class="tag p-vless443" title="落地连续不通时，自动从落地库换一个同国家的">自动换</span></div>`:"";if(!f)return pa;
   return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}${f.primary.country?` ${esc(f.primary.country)}`:""}</div>`
     :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}${f.backup.country?` ${esc(f.backup.country)}`:""}</div>`}
 function foDlg(tag){

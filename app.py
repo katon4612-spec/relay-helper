@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.13.1"
+VERSION = "1.14.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -965,7 +965,7 @@ def op_list(body):
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
             "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary(),
-            "fw_error": FW_STATE["error"], "version": VERSION}
+            "fw_error": FW_STATE["error"], "version": VERSION, "pool_auto": [k for k, v in (POOL.get("auto") or {}).items() if v]}
 
 
 def op_links(body):
@@ -1040,7 +1040,10 @@ def op_replace(body):
         row = rows.get(tag)
         if not row or not row.get("outbound_id"):
             raise SuiError("找不到这条线路的落地出站")
-        ob, host, remark = parse_landing(raw)
+        if isinstance(body.get("outbound"), dict):
+            ob = dict(body["outbound"])  # 落地库里已解析好的
+        else:
+            ob, host, remark = parse_landing(raw)
         ob["tag"] = row["outbound_tag"]
         ob["id"] = row["outbound_id"]
         SUI.save("outbounds", "edit", ob)
@@ -1927,8 +1930,8 @@ def health_once():
     targets = []
     for k, rs in groups.items():
         m = rs[0]
-        if k in FO:
-            continue  # 有备用落地的线路由自动切换检测负责
+        if k in FO or (POOL.get("auto") or {}).get(k):
+            continue  # 有备用落地 / 开了自动换的线路由它们自己的检测负责
         if not m.get("outbound_tag") or not any(r.get("enable") and (not r.get("expiry") or r["expiry"] > now) for r in rs):
             HEALTH.pop(k, None)  # 没有在用的用户：不检测，避免对过期/停用线路误报
             continue
@@ -2690,6 +2693,351 @@ def op_servers_overview(body):
     return {"servers": out}
 
 
+# ------------------------------------------------------------- 落地库 --
+# 把买来的落地统一存起来：国家、网段、供应商、进价、落地到期、检测结果；是否在用、被哪条线路用，按出站实时算。
+# 线路可以一键从库里换一个（同国家、优先不同网段——同网段的 IP 常常一起出问题），也可以开「自动换」：
+# 落地连续不通就自动换成库里能用的，线路的出站名不变，所以客户链接、订阅、限额都不变。
+POOL_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "landings.json")
+POOL = {"items": [], "auto": {}}
+POOL_LOCK = threading.RLock()
+POOL_STATE = {}  # 线路 key -> {"fails", "last_switch", "noalert"}
+
+
+def load_pool():
+    global POOL
+    try:
+        with open(POOL_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        POOL = d if isinstance(d, dict) else {}
+    except Exception:
+        POOL = {}
+    POOL.setdefault("items", [])
+    POOL.setdefault("auto", {})
+
+
+def save_pool():
+    tmp = POOL_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(POOL, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, POOL_PATH)
+
+
+def ip_net(ip):
+    """网段：IPv4 取 /24，IPv6 取 /48。"""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ""
+    return str(ipaddress.ip_network("%s/%d" % (ip, 24 if a.version == 4 else 48), strict=False))
+
+
+def _pool_usage(data=None):
+    """落地 key -> [使用它的线路名（备用的标「备用」）]"""
+    data = data or SUI.load_all()
+    obs = {o.get("tag"): o for o in data.get("outbounds") or []}
+    use = {}
+    for k, rs in group_rows(build_relays(data)).items():
+        ob = obs.get(k)
+        if not ob or ob.get("type") == "direct":
+            continue
+        name = min((r["tag"] for r in rs), key=len)
+        use.setdefault(landing_key(ob), []).append(name)
+    with FO_LOCK:
+        for k, f in FO.items():
+            other = "backup" if f.get("active") == "primary" else "primary"
+            if f.get(other):
+                use.setdefault(landing_key(f[other]), []).append("%s（备用）" % k)
+    return use
+
+
+def _rec_public(it, use, now):
+    r = {k: it.get(k) for k in ("id", "raw", "host", "ip", "port", "type", "country", "net", "supplier", "cost", "expire", "note", "disabled", "added", "check")}
+    r["used_by"] = use.get(landing_key(it["ob"]), [])
+    r["expired"] = bool(it.get("expire") and it["expire"] < now)
+    r["info"] = landing_info(it["ob"])
+    return r
+
+
+def op_pool_list(body):
+    data = SUI.load_all()
+    use = _pool_usage(data)
+    now = time.time()
+    with POOL_LOCK:
+        items = [_rec_public(it, use, now) for it in POOL["items"]]
+        auto = dict(POOL["auto"])
+    groups = group_rows(build_relays(data))
+    return {"items": items, "auto": [k for k, v in auto.items() if v and k in groups], "now": now}
+
+
+def op_pool_import(body):
+    lines = [l.strip() for l in (body.get("text") or "").splitlines() if l.strip()]
+    if not lines:
+        raise SuiError("没有内容")
+    parsed, errors = [], []
+    for ln in lines:
+        try:
+            ob, host, remark = parse_landing(ln)
+            if ob.get("type") == "direct":
+                raise ValueError("直连不能放进落地库")
+            parsed.append((ln, ob, host))
+        except Exception as e:
+            errors.append({"line": ln, "error": str(e)})
+    ips = {h: resolve(h) for _, _, h in parsed}
+    geo = geo_lookup([ip for ip in ips.values() if ip])
+    exp = int(body.get("expire") or 0)
+    added, dup = 0, 0
+    with POOL_LOCK:
+        have = {landing_key(it["ob"]) for it in POOL["items"]}
+        for ln, ob, host in parsed:
+            k = landing_key(ob)
+            if k in have:
+                dup += 1
+                continue
+            have.add(k)
+            ip = ips.get(host) or ""
+            POOL["items"].append({"id": secrets.token_hex(5), "raw": ln, "ob": ob, "host": host, "ip": ip,
+                                  "port": ob.get("server_port"), "type": ob.get("type"),
+                                  "country": (body.get("country") or "").strip() or geo.get(ip, ""), "net": ip_net(ip),
+                                  "supplier": (body.get("supplier") or "").strip(), "cost": (body.get("cost") or "").strip(),
+                                  "expire": exp, "note": (body.get("note") or "").strip(), "disabled": False,
+                                  "added": int(time.time()), "check": None})
+            added += 1
+        save_pool()
+    return {"added": added, "dup": dup, "errors": errors}
+
+
+def op_pool_update(body):
+    ids = set(body.get("ids") or [])
+    fields = {k: body[k] for k in ("supplier", "cost", "expire", "note", "country", "disabled") if k in body}
+    if "expire" in fields:
+        fields["expire"] = int(fields["expire"] or 0)
+    if "disabled" in fields:
+        fields["disabled"] = bool(fields["disabled"])
+    with POOL_LOCK:
+        n = 0
+        for it in POOL["items"]:
+            if it["id"] in ids:
+                it.update(fields)
+                n += 1
+        save_pool()
+    return {"updated": n}
+
+
+def op_pool_delete(body):
+    ids = set(body.get("ids") or [])
+    with POOL_LOCK:
+        before = len(POOL["items"])
+        POOL["items"] = [it for it in POOL["items"] if it["id"] not in ids]
+        save_pool()
+        return {"deleted": before - len(POOL["items"])}
+
+
+def _pool_check_items(items):
+    """检测落地库里的落地（临时出站），结果写回记录。"""
+    res = op_check_raw({"items": [{"raw": it["id"], "outbound": it["ob"]} for it in items]})["results"]
+    now = int(time.time())
+    by = {r["raw"]: r for r in res}
+    with POOL_LOCK:
+        for it in POOL["items"]:
+            r = by.get(it["id"])
+            if r:
+                it["check"] = {"ok": r["ok"], "delay": r.get("delay"), "error": (r.get("error") or "")[:160], "ts": now}
+        save_pool()
+    return by
+
+
+def op_pool_check(body):
+    ids = set(body.get("ids") or [])
+    with POOL_LOCK:
+        items = [dict(it) for it in POOL["items"] if it["id"] in ids][:60]
+    by = _pool_check_items(items)
+    return {"results": [{"id": i, "ok": r["ok"], "delay": r.get("delay"), "error": r.get("error", "")} for i, r in by.items()]}
+
+
+def _line(tag, data):
+    rows = {r["tag"]: r for r in build_relays(data)}
+    row = rows.get(tag)
+    if not row or not row.get("outbound_tag"):
+        raise SuiError("找不到这条线路的落地出站")
+    if row.get("landing_type") == "direct":
+        raise SuiError("直连线路没有落地")
+    return row
+
+
+def _current(okey, data):
+    obs = {o.get("tag"): o for o in data.get("outbounds") or []}
+    ob = obs.get(okey) or {}
+    ip = resolve(ob.get("server", "")) if ob else ""
+    k = landing_key(ob) if ob else ""
+    with POOL_LOCK:
+        rec = next((it for it in POOL["items"] if landing_key(it["ob"]) == k), None)
+    country = (rec or {}).get("country") or (geo_lookup([ip]).get(ip, "") if ip else "")
+    return {"ob": ob, "ip": ip, "net": ip_net(ip), "country": country, "rec_id": (rec or {}).get("id"),
+            "addr": "%s:%s" % (ob.get("server", ""), ob.get("server_port", ""))}
+
+
+def _candidates(cur, use, country=None):
+    """同国家、空闲、没停用、没到期的落地，排序：不同网段优先 → 最近检测能通 → 未检测 → 延迟低。"""
+    country = cur["country"] if country is None else country
+    now = time.time()
+    bad_nets = set()
+    with POOL_LOCK:
+        items = [dict(it) for it in POOL["items"]]
+    for it in items:  # 最近 10 分钟有落地检测失败的网段，往后排
+        c = it.get("check") or {}
+        if c and not c.get("ok") and now - (c.get("ts") or 0) < 600:
+            bad_nets.add(it.get("net"))
+    out = []
+    for it in items:
+        if it.get("disabled") or (it.get("expire") and it["expire"] < now) or use.get(landing_key(it["ob"])):
+            continue
+        if country and it.get("country") != country:
+            continue
+        if it.get("id") == cur.get("rec_id"):
+            continue
+        c = it.get("check") or {}
+        recent_fail = c and not c.get("ok") and now - (c.get("ts") or 0) < 600
+        same_net = bool(cur.get("net")) and it.get("net") == cur["net"]
+        score = (same_net, recent_fail, it.get("net") in bad_nets, not (c and c.get("ok")), c.get("delay") or 99999)
+        out.append((score, it))
+    out.sort(key=lambda x: x[0])
+    return [it for _, it in out]
+
+
+def op_pool_candidates(body):
+    data = SUI.load_all()
+    row = _line(body.get("tag"), data)
+    k = row["outbound_tag"]
+    cur = _current(k, data)
+    use = _pool_usage(data)
+    cands = _candidates(cur, use, body.get("country"))
+    now = time.time()
+    with POOL_LOCK:
+        countries = sorted({it.get("country") or "" for it in POOL["items"]} - {""})
+        auto = bool(POOL["auto"].get(k))
+    return {"current": {"addr": cur["addr"], "country": cur["country"], "net": cur["net"], "in_pool": bool(cur["rec_id"])},
+            "auto": auto, "has_failover": k in FO, "countries": countries,
+            "candidates": [_rec_public(it, use, now) for it in cands[:30]]}
+
+
+def _switch_to(row, it, reason):
+    """把线路的落地原位换成落地库里的 it（出站名不变）。"""
+    ob = dict(it["ob"])
+    res = op_replace({"tag": row["tag"], "outbound": ob})
+    return res
+
+
+def op_pool_switch(body):
+    """手动：指定 id 换；不指定就自动挑（会先检测，挑第一个能通的）。"""
+    data = SUI.load_all()
+    row = _line(body.get("tag"), data)
+    if body.get("id"):
+        with POOL_LOCK:
+            it = next((dict(x) for x in POOL["items"] if x["id"] == body["id"]), None)
+        if not it:
+            raise SuiError("落地库里没有这个落地")
+        cur = _current(row["outbound_tag"], data)
+    else:
+        cur = _current(row["outbound_tag"], data)
+        it = _pick_working(cur, _pool_usage(data), body.get("country"))
+        if not it:
+            raise SuiError("落地库里没有能用的%s落地（空闲、没停用、没到期、检测能通）" % (cur["country"] or "同国家"))
+    res = _switch_to(row, it, "手动")
+    return {"from": cur["addr"], "to": "%s:%s" % (it["host"], it["port"]), "country": it.get("country"), "net": it.get("net"),
+            "same_net": bool(cur["net"]) and cur["net"] == it.get("net"), "check": res.get("check")}
+
+
+def _pick_working(cur, use, country=None):
+    cands = _candidates(cur, use, country)
+    for i in range(0, min(len(cands), 9), 3):  # 每次检测 3 个，最多 9 个
+        batch = cands[i:i + 3]
+        by = _pool_check_items(batch)
+        for it in batch:
+            if (by.get(it["id"]) or {}).get("ok"):
+                return it
+    return None
+
+
+def op_pool_auto(body):
+    data = SUI.load_all()
+    on = bool(body.get("on"))
+    rows = {r["tag"]: r for r in build_relays(data)}
+    n = 0
+    with POOL_LOCK:
+        for t in body.get("tags") or []:
+            r = rows.get(t)
+            if r and r.get("outbound_tag") and r.get("landing_type") != "direct":
+                if on:
+                    POOL["auto"][r["outbound_tag"]] = True
+                else:
+                    POOL["auto"].pop(r["outbound_tag"], None)
+                n += 1
+        save_pool()
+    return {"updated": n}
+
+
+def pool_once():
+    with POOL_LOCK:
+        auto = [k for k, v in POOL["auto"].items() if v]
+    if not auto:
+        return
+    data = SUI.load_all()
+    groups = group_rows(build_relays(data))
+    keys = [k for k in auto if k in groups and k not in FO and any(r.get("enable") and r.get("client_id") for r in groups[k])]
+    if not keys:
+        return
+    res = op_check({"tags": keys})["results"]
+    need = int(CFG.get("pool_fail_times") or 2)
+    now = time.time()
+    use = None
+    for r in res:
+        k = r["tag"]
+        st = POOL_STATE.setdefault(k, {"fails": 0, "last_switch": 0, "noalert": False})
+        HEALTH[k] = {"ok": r["ok"], "delay": r.get("delay"), "error": r.get("error"), "fails": 0 if r["ok"] else st["fails"] + 1,
+                     "ts": int(now), "landing": "", "name": groups[k][0]["tag"]}
+        if r["ok"]:
+            st["fails"], st["noalert"] = 0, False
+            continue
+        st["fails"] += 1
+        if st["fails"] < need or now - st["last_switch"] < 90:  # 刚换过的给 90 秒稳定时间，避免来回切
+            continue
+        name = min((x["tag"] for x in groups[k]), key=len)
+        try:
+            use = use or _pool_usage(data)
+            cur = _current(k, data)
+            # 当前落地记为失败
+            if cur["rec_id"]:
+                with POOL_LOCK:
+                    for it in POOL["items"]:
+                        if it["id"] == cur["rec_id"]:
+                            it["check"] = {"ok": False, "delay": None, "error": (r.get("error") or "")[:160], "ts": int(now)}
+                    save_pool()
+            it = _pick_working(cur, use)
+            if not it:
+                if not st["noalert"]:
+                    tg_send("⚠️ %s 落地 %s（%s）不通，落地库里没有能用的同国家落地可换（%s）" % (name, cur["addr"], cur["country"] or "?", CFG["public_host"]))
+                    st["noalert"] = True
+                continue
+            _switch_to(groups[k][0], it, "自动")
+            use = None
+            st.update(fails=0, last_switch=now, noalert=False)
+            tg_send("🔁 %s 落地 %s（%s %s）不通，已自动换成落地库里的 %s:%s（%s）。客户链接不变（%s）" % (
+                name, cur["addr"], cur["country"], cur["net"], it["host"], it["port"], it.get("net") or "", CFG["public_host"]))
+        except Exception as e:
+            sys.stderr.write("pool switch %s: %s\n" % (k, e))
+
+
+def pool_loop():
+    time.sleep(25)
+    while True:
+        try:
+            pool_once()
+        except Exception as e:
+            sys.stderr.write("pool: %s\n" % e)
+        time.sleep(max(20, int(CFG.get("pool_interval_sec") or 60)))
+
+
 # ---------------------------------------------------------------- 备份/恢复 --
 # 和 s-ui 自带的「下载备份 / 恢复备份」一样：下载时现做一份发给浏览器（服务器上不留），恢复时上传文件。
 # 换服务器：旧机下载备份 → 域名解析到新机 → 新机装好 s-ui + 中转助手 → 上传恢复，节点/用户/到期/限额/证书全部带过去。
@@ -2775,6 +3123,8 @@ def make_backup(full=False, out=None):
                 tar.add(SUBS_PATH, "subs.json")
             if os.path.exists(SERVERS_PATH):
                 tar.add(SERVERS_PATH, "servers.json")
+            if os.path.exists(POOL_PATH):
+                tar.add(POOL_PATH, "landings.json")
             for fp in files:
                 tar.add(fp, "files" + fp)
     os.chmod(out, 0o600)
@@ -2822,7 +3172,7 @@ def restore_file(path):
                         nm = m.name
                         if not m.isfile() or ".." in nm.split("/") or nm.startswith("/"):
                             continue
-                        if nm in ("s-ui.db", "limits.json", "failover.json", "subs.json", "servers.json", "relay-helper-settings.json", "backup-info.json") or \
+                        if nm in ("s-ui.db", "limits.json", "failover.json", "subs.json", "servers.json", "landings.json", "relay-helper-settings.json", "backup-info.json") or \
                                 (nm.startswith("files/") and m.size < 1024 * 1024):
                             dest = os.path.join(td, "x", nm)
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -2912,6 +3262,11 @@ def restore_file(path):
                 shutil.copyfile(sb, SUBS_PATH)
             with SUBS_LOCK:
                 load_subs()
+            lp = os.path.join(td, "x", "landings.json")
+            if os.path.exists(lp):
+                shutil.copyfile(lp, POOL_PATH)
+                with POOL_LOCK:
+                    load_pool()
             sv = os.path.join(td, "x", "servers.json")
             if os.path.exists(sv):
                 shutil.copyfile(sv, SERVERS_PATH)
@@ -2955,7 +3310,9 @@ def restore_file(path):
 
 OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port, "change_domain": op_change_domain, "sub_get": op_sub_get, "ping": op_ping, "servers_list": op_servers_list,
             "server_save": op_server_save, "server_del": op_server_del, "servers_overview": op_servers_overview,
-            "local_token_reset": op_local_token_reset})
+            "local_token_reset": op_local_token_reset, "pool_list": op_pool_list, "pool_import": op_pool_import,
+            "pool_update": op_pool_update, "pool_delete": op_pool_delete, "pool_check": op_pool_check,
+            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto})
 
 
 # ------------------------------------------------------------- web server --
@@ -3241,6 +3598,8 @@ def main():
     load_fo()
     load_subs()
     load_servers()
+    load_pool()
+    threading.Thread(target=pool_loop, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()
