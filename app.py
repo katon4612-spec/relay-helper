@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -726,6 +726,10 @@ def _ensure_shared(data, tls_id, taken_ports):
         raise SuiError("共用入站创建后未找到 id")
     taken_ports.add(port)
     data.setdefault("inbounds", []).append({"id": iid, "tag": tag, "listen_port": port, "type": "vless"})
+    try:
+        ensure_clash_api()  # 共用端口按客户统计设备要用（随后保存路由时会重启 s-ui 生效）
+    except Exception as e:
+        sys.stderr.write("clash api: %s\n" % e)
     open_firewall(port, False)
     # 兜底：共用入站上没匹配到任何用户规则的连接一律拒绝
     return tag, iid, [{"inbound": [tag], "action": "reject"}]
@@ -1501,6 +1505,61 @@ def apply_firewall(blocks):
             sys.stderr.write("apply_firewall: %s\n" % e)
 
 
+# ------------------------------------------------- Clash API（共用端口按客户统计设备）--
+# 443 共用入站上所有客户是同一个端口，系统连接表分不出谁是谁；sing-box 的 Clash API 能列出每条连接的
+# 来源 IP 和走的落地出站（= 线路），就能按客户统计/限制设备。只监听 127.0.0.1，带随机密钥。
+CLASH = {"url": None, "secret": None}
+
+
+def _unwrap_cfg(cfg):
+    return cfg.get("config", cfg) if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict) else cfg
+
+
+def ensure_clash_api():
+    """没开就在 s-ui 配置里开 Clash API。返回 True 表示改了配置（需要重启 s-ui 生效）。"""
+    cfg = _unwrap_cfg(SUI.get("config"))
+    ca = (cfg.get("experimental") or {}).get("clash_api") or {}
+    if ca.get("external_controller"):
+        host, _, port = ca["external_controller"].rpartition(":")
+        host = host.strip("[]")
+        if host in ("", "0.0.0.0", "::"):
+            host = "127.0.0.1"
+        CLASH.update(url="http://%s:%s" % ("[%s]" % host if ":" in host else host, port), secret=ca.get("secret") or "")
+        return False
+    port = next((p for p in range(39090, 39190) if port_free(p, False)), None)
+    if not port:
+        return False
+    sec = secrets.token_hex(16)
+    cfg.setdefault("experimental", {})["clash_api"] = {"external_controller": "127.0.0.1:%d" % port, "secret": sec}
+    SUI.save("config", "edit", cfg)
+    CLASH.update(url="http://127.0.0.1:%d" % port, secret=sec)
+    return True
+
+
+def _clash(method, path):
+    if not CLASH["url"]:
+        return None
+    req = urllib.request.Request(CLASH["url"] + path, method=method,
+                                 headers={"Authorization": "Bearer %s" % CLASH["secret"]} if CLASH["secret"] else {})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = r.read()
+    return json.loads(body) if body else None
+
+
+def clash_conns():
+    try:
+        return (_clash("GET", "/connections") or {}).get("connections") or []
+    except Exception:
+        return []
+
+
+def clash_close(cid):
+    try:
+        _clash("DELETE", "/connections/" + urllib.parse.quote(cid))
+    except Exception:
+        pass
+
+
 def monitor_once():
     with MON_LOCK:
         _monitor_once()
@@ -1538,6 +1597,26 @@ def _monitor_once():
         for r in rs:
             if r.get("port") and not r.get("shared"):  # 共用端口上分不出是哪个客户，不按端口统计
                 ports[int(r["port"])] = (k, "udp" if r["type"] in ("hysteria2", "hysteria", "tuic") else "tcp")
+    shared_in = {r["inbound_tag"]: int(r["port"]) for r in rows if r.get("shared") and r.get("port")}
+    sconns = []  # (线路, ip, 连接 id)
+    if shared_in:
+        if not CLASH["url"]:
+            try:
+                with LOCK:
+                    if ensure_clash_api():
+                        ensure_core()
+            except Exception as e:
+                sys.stderr.write("clash api: %s\n" % e)
+        for c in clash_conns():
+            md = c.get("metadata") or {}
+            if (md.get("type") or "").split("/", 1)[-1] not in shared_in:
+                continue
+            k = (c.get("chains") or [None])[0]
+            ip = md.get("sourceIP") or ""
+            if ip.startswith("::ffff:"):
+                ip = ip[7:]
+            if k in groups and ip:
+                sconns.append((k, ip, c.get("id")))
     tp = tcp_peers({p for p, (k, pr) in ports.items() if pr == "tcp"})
     up = udp_peers({p for p, (k, pr) in ports.items() if pr == "udp"})
     udp_tags = {r["tag"]: okey_of(r) for r in rows if r.get("port") and not r.get("shared") and ports.get(int(r["port"]), ("", ""))[1] == "udp"}
@@ -1548,7 +1627,11 @@ def _monitor_once():
         seen_now.setdefault(ports[p][0], set()).update(i for i in ips if keep(i))
     for tag, ips in lp.items():
         seen_now.setdefault(udp_tags[tag], set()).update(i for i in ips if keep(i))
+    for k, ip, _ in sconns:
+        if keep(ip):
+            seen_now.setdefault(k, set()).add(ip)
     blocks, online = [], {}
+    sh_bad, sh_ok = {}, set()  # 共用端口：要拒绝的 (线路 -> ip)、各线路正常在用的 ip
     for k in list(BANNED):
         BANNED[k] = {ip: u for ip, u in BANNED[k].items() if u == 0 or u > now}
         if not BANNED[k] or k not in groups:
@@ -1575,6 +1658,11 @@ def _monitor_once():
         else:
             ALLOWED.pop(k, None)
             full = False
+        if any(r.get("shared") for r in rs):
+            bad = set(B) | ({ip for ip in active if ip not in A} if full else set())
+            if bad:
+                sh_bad[k] = bad
+            sh_ok.update(ip for ip in active if ip not in bad)
         if full or B:
             for r in rs:
                 if r.get("port") and not r.get("shared"):
@@ -1588,6 +1676,16 @@ def _monitor_once():
             SEEN.pop(k, None)
     ONLINE.clear()
     ONLINE.update(online)
+    # 共用端口不能用白名单（会挡住别的客户），改为只拒绝超额/被踢的 IP；
+    # 同一个 IP 若也是别的客户正常在用的（比如同一个出口 NAT），不封端口，只断这条线路的连接
+    if sh_bad:
+        deny = set().union(*sh_bad.values()) - sh_ok
+        for port in sorted(set(shared_in.values())):
+            if deny:
+                blocks.append(("tcp", port, None, sorted(deny)))
+        for k, ip, cid in sconns:
+            if ip in sh_bad.get(k, ()):
+                clash_close(cid)
     apply_firewall(blocks)
 
 

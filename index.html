@@ -130,7 +130,7 @@ function renderCreate(){
       <label class="ck"><input type="checkbox" value="vless">VLESS-Reality</label>
       <label class="ck"><input type="checkbox" value="hysteria2">Hysteria2</label>
       <label class="ck"><input type="checkbox" value="socks">SOCKS5</label>
-      <label class="ck" title="所有客户共用一个 443 端口（像普通 HTTPS），按用户分流到各自落地；不占新端口。设备数只能统计独立端口的节点"><input type="checkbox" value="vless443">VLESS-443 共用</label></span></label>
+      <label class="ck" title="所有客户共用一个 443 端口（像普通 HTTPS），按用户分流到各自落地；不占新端口"><input type="checkbox" value="vless443">VLESS-443 共用</label></span></label>
     <label>到期 <select id="days"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option><option value="0">永久</option><option value="custom">指定日期…</option></select></label>
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
     <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
@@ -245,7 +245,7 @@ const okeyOf=r=>r.outbound_tag||("#"+r.tag);
 function trafficCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},used=g.reduce((s,r)=>s+(r.up||0)+(r.down||0),0),q=(L.quota_gb||0)*1073741824;
   const pct=q?Math.min(100,used/q*100):0,col=L.over||pct>=100?"var(--bad)":pct>=80?"var(--warn)":"var(--ok)";
   return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}`}
-function deviceCell(g){if(g.every(r=>r.shared))return '<span class="tag gray" title="443 共用端口上分不出是哪个客户的设备，只能统计/限制独立端口的节点">共用不统计</span>';const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
+function deviceCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
   const tip=(O.active||[]).map(ip=>ip+((O.rejected||[]).includes(ip)?"（被拒）":"")).join("\n");
   const nb=Object.keys(O.banned||{}).length;
   return `<span title="${esc(tip)}" class="tag ${lim&&O.full?"warn":n?"ok":"gray"} clk" data-dev="${esc(g[0].tag)}">${n}${lim?` / ${lim}`:""} 台 ›</span>${(O.rejected||[]).length?`<div class="sib" style="color:var(--bad)">拒绝 ${O.rejected.length} 个新设备</div>`:""}${nb?`<div class="sib" style="color:var(--bad)">已踢出 ${nb} 个</div>`:""}`}
