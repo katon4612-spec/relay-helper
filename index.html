@@ -100,10 +100,12 @@ const protoName={vless:"VLESS-Reality",vless443:"VLESS-443共用",hysteria2:"Hys
 
 function renderLogin(){
   $("#app").innerHTML=`<div class="card login"><h2>中转助手 · 登录</h2>
-  <input id="pw" type="password" placeholder="登录密码" style="width:100%" autofocus>
-  <div style="margin-top:12px"><button class="pri" id="lg" style="width:100%">登录</button></div><p class="err" id="lerr"></p></div>`;
-  const go=async()=>{try{await api("login",{password:$("#pw").value});init()}catch(e){$("#lerr").textContent=e.message}};
-  $("#lg").onclick=go;$("#pw").onkeydown=e=>{if(e.key==="Enter")go()};
+  <input id="un" placeholder="账号（和 s-ui 面板一样）" style="width:100%" autocomplete="username" autofocus>
+  <input id="pw" type="password" placeholder="密码（和 s-ui 面板一样）" style="width:100%;margin-top:10px" autocomplete="current-password">
+  <div style="margin-top:12px"><button class="pri" id="lg" style="width:100%">登录</button></div><p class="err" id="lerr"></p>
+  <p class="hint" style="margin-top:6px">s-ui 连不上时，账号留空、用中转助手的备用密码登录。</p></div>`;
+  const go=async()=>{try{await api("login",{username:$("#un").value.trim(),password:$("#pw").value});init()}catch(e){$("#lerr").textContent=e.message}};
+  $("#lg").onclick=go;$("#pw").onkeydown=e=>{if(e.key==="Enter")go()};$("#un").onkeydown=e=>{if(e.key==="Enter")$("#pw").focus()};
 }
 
 function shell(){

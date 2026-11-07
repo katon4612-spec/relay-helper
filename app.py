@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.11.1"
+VERSION = "1.12.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2606,6 +2606,29 @@ def check_password(p):
                                hashlib.sha256(CFG["password"].encode()).digest()) and bool(CFG["password"])
 
 
+def check_sui_login(user, pw):
+    """
+    用 s-ui 的账号密码登录：每次都拿去问 s-ui，所以在 s-ui 里改了密码这里自动跟着变。
+    返回 True / False；s-ui 连不上时返回 None。
+    """
+    if not user or not pw:
+        return False
+    try:
+        Sui(dict(CFG, sui_user=user, sui_pass=pw)).login()
+    except SuiError as e:
+        return None if "连接 s-ui 失败" in str(e) else False
+    except Exception:
+        return None
+    if user != CFG.get("sui_user") or pw != CFG.get("sui_pass"):
+        # s-ui 改过密码：顺便更新中转助手连 s-ui 用的账号
+        try:
+            save_config({"sui_user": user, "sui_pass": pw})
+            globals()["SUI"] = Sui(CFG)
+        except Exception as e:
+            sys.stderr.write("update sui creds: %s\n" % e)
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "relay-helper"
 
@@ -2741,11 +2764,18 @@ class Handler(BaseHTTPRequestHandler):
             fl = [t for t in FAILS.get(ip, []) if t > time.time() - 600]
             if len(fl) >= 8:
                 return self._send(429, {"ok": False, "error": "失败次数太多，10 分钟后再试"})
-            if not check_password(body.get("password")):
+            # s-ui 的账号密码，或者中转助手自己的备用密码（s-ui 出问题时也能登录）
+            ok = check_password(body.get("password"))
+            sui_down = False
+            if not ok and body.get("username"):
+                r = check_sui_login(body.get("username", "").strip(), body.get("password") or "")
+                ok, sui_down = bool(r), r is None
+            if not ok:
                 fl.append(time.time())
                 FAILS[ip] = fl
                 time.sleep(1)
-                return self._send(200, {"ok": False, "error": "密码错误"})
+                return self._send(200, {"ok": False, "error": "s-ui 连不上，请用中转助手的备用密码登录（cat /opt/relay-helper/config.json 里的 password）"
+                                        if sui_down else "账号或密码错误（和 s-ui 面板的一样）"})
             sid = secrets.token_urlsafe(32)
             SESSIONS[sid] = time.time() + SESSION_AGE
             secure = "; Secure" if CFG.get("cert_file") else ""
