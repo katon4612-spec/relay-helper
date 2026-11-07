@@ -72,5 +72,37 @@ self_signed() {
   echo "✓ 已启用 HTTPS（自签名证书：浏览器第一次打开会提示不安全，点「高级 → 继续访问」即可，传输同样是加密的）"
 }
 
-[ -n "$RH_SKIP_LE" ] && { self_signed; exit $?; }
-issue_le || self_signed
+# s-ui 面板已经配了这个域名的证书：直接沿用（不用再申请，不用开 80 端口；s-ui 那边续签后中转助手会自动换上新证书）
+use_sui_cert() {
+  is_ip "$HOST" && return 1
+  local out
+  out="$(python3 - "$CFG" "$HOST" <<'PY'
+import json, sqlite3, ssl, sys, os, time
+cfg = json.load(open(sys.argv[1], encoding="utf-8-sig")); host = sys.argv[2]
+db = cfg.get("sui_db") or "/usr/local/s-ui/db/s-ui.db"
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    st = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in c.execute("select key, value from settings")}
+except Exception:
+    sys.exit(1)
+cert, key = st.get("webCertFile") or "", st.get("webKeyFile") or ""
+if not (cert and key and os.path.isfile(cert) and os.path.isfile(key)):
+    sys.exit(1)
+try:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+    info = ssl._ssl._test_decode_cert(cert)
+except Exception:
+    sys.exit(1)
+names = [v for k, v in info.get("subjectAltName", ()) if k == "DNS"]
+ok_name = any(n == host or (n.startswith("*.") and host.endswith(n[1:]) and host.count(".") == n.count(".")) for n in names)
+if not ok_name or ssl.cert_time_to_seconds(info["notAfter"]) < time.time():
+    sys.exit(1)
+print(cert + "|" + key)
+PY
+)" || return 1
+  cfg_set "cert_file=${out%%|*}" "key_file=${out##*|}" https_mode=sui https_declined=false
+  echo "✓ 已沿用 s-ui 面板的证书（${out%%|*}），和 s-ui 一样显示安全"
+}
+
+[ -n "$RH_SKIP_LE" ] && { use_sui_cert || self_signed; exit $?; }
+use_sui_cert || issue_le || self_signed

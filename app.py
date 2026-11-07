@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2826,6 +2826,22 @@ def main():
         ctx.load_cert_chain(CFG["cert_file"], CFG["key_file"])
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
         scheme = "https"
+
+        def cert_watch():
+            # 证书续签后（acme / s-ui 换了文件）自动换上新证书，不用重启
+            mt = lambda: tuple(os.path.getmtime(f) for f in (CFG["cert_file"], CFG["key_file"]))
+            last = mt()
+            while True:
+                time.sleep(3600)
+                try:
+                    now = mt()
+                    if now != last:
+                        ctx.load_cert_chain(CFG["cert_file"], CFG["key_file"])
+                        last = now
+                        sys.stderr.write("证书已更新\n")
+                except Exception as e:
+                    sys.stderr.write("cert reload: %s\n" % e)
+        threading.Thread(target=cert_watch, daemon=True).start()
     print("中转助手 %s 已启动：%s://<服务器>:%s%s" % (VERSION, scheme, CFG["port"], CFG["path"]))
     srv.serve_forever()
 
