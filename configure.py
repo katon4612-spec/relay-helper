@@ -63,10 +63,21 @@ def main():
     web_domain = st.get("webDomain") or ""
 
     print("\n客户链接里填的服务器地址（就是这台中转机的域名或 IP，例如 yyus.liveshop.work）")
-    default_host = old.get("public_host") or web_domain or st.get("subDomain") or ""
+    import ipaddress, re as _re
+    def valid_host(h):
+        h = (h or "").strip()
+        try:
+            ipaddress.ip_address(h.strip("[]"))
+            return True
+        except ValueError:
+            return bool(_re.fullmatch(r"([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}", h))
+    default_host = next((h for h in (old.get("public_host"), web_domain, st.get("subDomain")) if valid_host(h)), "")
     public_host = ""
     while not public_host:
         public_host = ask("中转机域名/IP", default_host)
+        if public_host and not valid_host(public_host):
+            print("✗「%s」不是域名或 IP，请只填域名（如 hk1.example.com）或 IP" % public_host)
+            public_host = ""
     if web_domain and web_domain != public_host:
         print("⚠ 注意：s-ui 设置了面板域名 %s，与 %s 不同。工具会用面板域名访问 s-ui，但客户链接地址可能变成面板域名。" % (web_domain, public_host))
 
