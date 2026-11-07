@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -971,7 +971,10 @@ def op_replace(body):
         with FO_LOCK:
             f = FO.get(row["outbound_tag"])
             if f:  # 有备用落地：换的是当前在用的那个
-                f[f.get("active", "primary")] = _ob_clean(ob)
+                side = f.get("active", "primary")
+                f[side] = _ob_clean(ob)
+                f.pop("pcountry" if side == "primary" else "bcountry", None)
+                _fo_fill_country(f)
                 FO_STATE.pop(row["outbound_tag"], None)
                 save_fo()
     chk = op_check({"tags": [row["outbound_tag"]]})["results"][0]
@@ -1746,6 +1749,29 @@ def _ob_addr(ob):
     return "%s:%s" % (ob.get("server", ""), ob.get("server_port", "")) if ob else ""
 
 
+def _country(ob):
+    host = (ob or {}).get("server") or ""
+    ip = resolve(host) if host else ""
+    return geo_lookup([ip]).get(ip, "") if ip else ""
+
+
+def _fo_fill_country(f):
+    """补上主/备落地的国家（只在缺的时候查一次）。返回是否有改动。"""
+    ch = False
+    for side, key in (("primary", "pcountry"), ("backup", "bcountry")):
+        if f.get(side) and not f.get(key):
+            c = _country(f[side])
+            if c:
+                f[key] = c
+                ch = True
+    return ch
+
+
+def _fo_label(f, side):
+    c = f.get("pcountry" if side == "primary" else "bcountry") or ""
+    return _ob_addr(f.get(side)) + ("（%s）" % c if c else "")
+
+
 def _write_ob(obs, tag, conf):
     ob = dict(conf)
     ob["tag"] = tag
@@ -1831,8 +1857,11 @@ def op_failover_set(body):
             f = {"primary": _ob_clean(obs[okey]), "active": "primary", "standby": stb, "log": []}
         if landing_key(ob) == landing_key(f["primary"]):
             raise SuiError("备用落地和主落地是同一个")
+        if f.get("backup") and landing_key(f["backup"]) != landing_key(ob):
+            f.pop("bcountry", None)
         f["backup"] = ob
         f["auto_back"] = bool(body.get("auto_back", True))
+        _fo_fill_country(f)
         if f["active"] == "backup":
             _write_ob(obs, okey, ob)      # 正在用备用：直接换掉在用的出站
         else:
@@ -1857,13 +1886,39 @@ def op_failover_switch(body):
     return {"switched": did}
 
 
+def op_failover_status(body):
+    """弹窗打开时：立刻检测主备两个落地，并补上国家。"""
+    data = SUI.load_all()
+    okey = _fo_row(data, body.get("tag"))["outbound_tag"]
+    with FO_LOCK:
+        f = FO.get(okey)
+        if not f:
+            raise SuiError("这条线路还没有备用落地")
+        f = json.loads(json.dumps(f))
+    r = op_check({"tags": [okey, f["standby"]]})["results"]
+    now = int(time.time())
+    a, sb = dict(r[0], ts=now), dict(r[1], ts=now)
+    with FO_LOCK:
+        cur = FO.get(okey)
+        if cur and cur.get("active") == f["active"]:
+            st = FO_STATE.setdefault(okey, {"afails": 0, "sok": 0})
+            st.update(active=a, standby=sb, ts=now)
+            if _fo_fill_country(cur):
+                save_fo()
+            f = cur
+    return {"active": f["active"], "state": {"active": a, "standby": sb},
+            "pcountry": f.get("pcountry", ""), "bcountry": f.get("bcountry", "")}
+
+
 def fo_summary():
     with FO_LOCK:
         out = {}
         for k, f in FO.items():
             st = FO_STATE.get(k) or {}
+            pi, bi = landing_info(f.get("primary") or {}), landing_info(f.get("backup") or {})
+            pi["country"], bi["country"] = f.get("pcountry", ""), f.get("bcountry", "")
             out[k] = {"active": f.get("active"), "auto_back": f.get("auto_back", True), "switched": f.get("switched", 0),
-                      "primary": landing_info(f.get("primary") or {}), "backup": landing_info(f.get("backup") or {}),
+                      "primary": pi, "backup": bi, "standby_tag": f.get("standby"),
                       "log": (f.get("log") or [])[:5],
                       "state": {"active": st.get("active"), "standby": st.get("standby"), "ts": st.get("ts", 0)}}
         return out
@@ -1903,7 +1958,7 @@ def failover_once():
         HEALTH[k] = {"ok": a["ok"], "delay": a.get("delay"), "error": a.get("error"), "fails": st["afails"], "ts": now,
                      "landing": _ob_addr(f.get(f["active"])), "name": groups[k][0]["tag"]}
         name = groups[k][0]["tag"]
-        pa, ba = _ob_addr(f.get("primary")), _ob_addr(f.get("backup"))
+        pa, ba = _fo_label(f, "primary"), _fo_label(f, "backup")
         try:
             if a["ok"] and st.get("both"):
                 st["both"] = False
@@ -2196,7 +2251,7 @@ def restore_file(path):
             "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status})
 
 
 # ------------------------------------------------------------- web server --

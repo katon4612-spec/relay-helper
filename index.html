@@ -508,18 +508,18 @@ function replaceDlg(tag){
 const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
 const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
 function foCell(r){const f=foOf(r);if(!f)return "";
-  return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}</div>`
-    :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}</div>`}
+  return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}${f.primary.country?` ${esc(f.primary.country)}`:""}</div>`
+    :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}${f.backup.country?` ${esc(f.backup.country)}`:""}</div>`}
 function foDlg(tag){
   const r=byTag(tag);const f=foOf(r);const st=(f&&f.state)||{};
   const chk=c=>!c?'<span class="muted">待检测</span>':c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`;
   const pri=f?f.primary:(r.landing_info||{}),bak=f?f.backup:null;
   const act=f?f.active:"primary";
-  const line=(lab,L,isAct,c)=>`<tr><td><b>${lab}</b>${isAct?' <span class="tag ok">在用</span>':""}</td><td class="mono">${esc(addr(L))}${L&&L.username?` <span class="muted">${esc(L.username)}</span>`:""}</td><td>${L&&L.server?chk(c):""}</td></tr>`;
+  const line=(id,lab,L,isAct,c)=>`<tr><td><b>${lab}</b>${isAct?' <span class="tag ok">在用</span>':""}</td><td class="mono">${esc(addr(L))}${L&&L.username?` <span class="muted">${esc(L.username)}</span>`:""}</td><td id="foc${id}">${L&&L.country?esc(L.country):(L&&L.server&&f?'<span class="spin"></span>':'<span class="muted">-</span>')}</td><td id="fos${id}">${L&&L.server?(f?'<span class="spin"></span> <span class="muted">检测中</span>':chk(c)):""}</td></tr>`;
   const cPri=act==="primary"?st.active:st.standby,cBak=act==="backup"?st.active:st.standby;
   modal(`<h2 style="margin-top:0">备用落地：${esc(tag)}</h2>
   <p class="hint">主落地连续两次检测不通（约 1 分钟）就自动切到备用落地，<b>客户链接、二维码、流量和设备限额都不变</b>，Telegram 会通知你。检测每 30 秒一次。</p>
-  <table style="margin:8px 0"><tr><th>落地</th><th>地址</th><th>状态</th></tr>${line("主落地",pri,act==="primary",cPri)}${bak?line("备用落地",bak,act==="backup",cBak):""}</table>
+  <table style="margin:8px 0"><tr><th>落地</th><th>地址</th><th>国家</th><th>状态</th></tr>${line("p","主落地",pri,act==="primary",cPri)}${bak?line("b","备用落地",bak,act==="backup",cBak):""}</table>
   <input id="fol" style="width:100%" placeholder="${f?"填新的备用落地可替换现有备用":"备用落地：socks5://账号:密码@IP:端口 或 IP:端口:账号:密码 或 vless://…"}" value="${f&&bak&&bak.plain?esc(bak.plain):""}">
   <label class="ck" style="margin-top:8px"><input type="checkbox" id="foab" ${!f||f.auto_back?"checked":""}>主落地恢复后自动切回（连续 3 次检测正常）</label>
   <div class="row" style="margin-top:12px"><button class="pri" id="fook">${f?"保存":"设为备用落地"}并检测</button>
@@ -527,6 +527,10 @@ function foDlg(tag){
   <p id="fomsg"></p>
   ${f&&f.log&&f.log.length?`<div class="hint" style="margin-top:8px"><b>切换记录</b><br>${f.log.map(x=>`${esc(fmtDate(x.ts))} → ${x.to==="backup"?"备用":"主"}落地：${esc(x.reason)}`).join("<br>")}</div>`:""}`);
   $("#focl").onclick=closeModal;
+  if(f)api("failover_status",{tag}).then(x=>{
+    const sp=x.active==="primary",cp=sp?x.state.active:x.state.standby,cb=sp?x.state.standby:x.state.active;
+    H("#fosp",chk(cp));H("#fosb",chk(cb));H("#focp",esc(x.pcountry||"未知"));H("#focb",esc(x.bcountry||"未知"));
+  }).catch(e=>{H("#fosp",'<span class="muted">检测失败</span>');H("#fosb","");H("#focp",esc(pri.country||"-"));H("#focb",esc((bak&&bak.country)||"-"))});
   const busy=(b,t)=>{b.disabled=true;b.innerHTML=`<span class="spin"></span> ${t}`};
   const refresh=async()=>{await loadRelays();drawTable()};
   $("#fook").onclick=async()=>{const b=$("#fook");const v=$("#fol").value.trim();if(!v)return H("#fomsg",'<span class="err">请填写备用落地</span>');busy(b,"检测中");
