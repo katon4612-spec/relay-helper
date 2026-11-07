@@ -52,6 +52,7 @@ td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .login{max-width:360px;margin:12vh auto}
 .protos{display:flex;gap:6px;flex-wrap:wrap}.ck{display:inline-flex!important;flex-direction:row!important;align-items:center;gap:5px;border:1px solid #cfd6e2;border-radius:8px;padding:6px 10px;color:var(--text)!important;font-size:13px!important;cursor:pointer;background:#fff}
 .ck input{margin:0}
+.btnlink{display:inline-block;border:1px solid #cfd6e2;border-radius:8px;padding:3px 9px;font-size:12px;color:var(--text);text-decoration:none;background:#fff}
 .modes{display:flex;gap:8px;flex-wrap:wrap}
 .tag{white-space:nowrap}.clk{cursor:pointer}.clk:hover{filter:brightness(.95);text-decoration:underline}th{white-space:nowrap}td.mono{white-space:nowrap}
 .bar{height:5px;background:#eef2f7;border-radius:3px;overflow:hidden;margin:3px 0;width:100px}.bar i{display:block;height:100%}
@@ -107,13 +108,13 @@ function renderLogin(){
 
 function shell(){
   $("#app").innerHTML=`<header><h1>中转助手</h1><span class="host" id="hostinfo"></span>
-  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
+  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button data-t="backup">备份</button><button data-t="settings">设置</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.onclick=()=>{state.tab=b.dataset.t;render()});
   $("#logout").onclick=async()=>{await fetch(BASE+"api/logout",{method:"POST"});renderLogin()};
 }
 function render(){
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.classList.toggle("on",b.dataset.t===state.tab));
-  if(state.tab==="create")renderCreate();else renderManage();
+  if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else renderManage();
 }
 
 /* ---------------- 一键中转 ---------------- */
@@ -323,8 +324,57 @@ async function downloadAllZip(items,zipName){
   toast(`已下载压缩包（${files.length} 张二维码）`);
 }
 
+function agoText(ts){if(!ts)return "";const s=Math.max(0,Math.floor(Date.now()/1000-ts));return s<60?"刚刚":s<3600?Math.floor(s/60)+" 分钟前":Math.floor(s/3600)+" 小时前"}
+function healthCell(g){const m=g[0];const c=state.checks[m.tag];if(c)return pcHtml(c);
+  const h=(state.health||{})[okeyOf(m)];if(!h)return '<span class="muted">-</span>';
+  return `${h.ok?`<span class="tag ok">通 ${h.delay}ms</span>`:`<span class="tag bad" title="${esc(h.error)}">不通${h.fails>1?` ×${h.fails}`:""}</span>`}<div class="sib">自动 ${agoText(h.ts)}</div>`}
+
+/* ---------------- 设置 ---------------- */
+async function renderSettings(){
+  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
+  let s;try{s=(await api("get_settings")).settings}catch(e){return toast(e.message)}
+  if(!$("#main"))return;
+  m.innerHTML=`<div class="card"><h2>Telegram 通知</h2>
+  <p class="hint">用于落地不通告警、恢复通知、每日备份文件。获取方法：在 Telegram 里找 <b>@BotFather</b> 发 /newbot 创建机器人，拿到 Token；然后给你的机器人发一条消息，再找 <b>@userinfobot</b> 获取你的 Chat ID（数字）。</p>
+  <div class="row"><label>Bot Token<input id="tgt" style="width:360px" placeholder="123456:ABC-DEF…" value="${esc(s.tg_token)}"></label>
+  <label>Chat ID<input id="tgc" style="width:180px" placeholder="如 123456789" value="${esc(s.tg_chat)}"></label>
+  <button id="tgtest">保存并发送测试消息</button></div></div>
+  <div class="card"><h2>落地自动巡检</h2>
+  <div class="row"><label>每隔几分钟检测（0=关闭）<input id="hi" type="number" min="0" value="${esc(s.health_interval_min)}" style="width:120px"></label>
+  <label>连续失败几次才告警<input id="hf" type="number" min="1" value="${esc(s.health_fail_times)}" style="width:120px"></label></div>
+  <p class="hint">只检测有在用用户的线路（已停用、已过期的不检测）。落地不通和恢复都会通过 Telegram 通知；「线路管理」的检测列会显示最新结果。</p></div>
+  <div class="card"><h2>自动备份</h2>
+  <div class="row"><label>每天几点备份（服务器时间，-1=关闭）<input id="bh" type="number" min="-1" max="23" value="${esc(s.backup_hour)}" style="width:120px"></label>
+  <label>保留几份<input id="bk" type="number" min="1" max="365" value="${esc(s.backup_keep)}" style="width:120px"></label>
+  <label class="ck" style="margin-top:18px"><input type="checkbox" id="btg" ${s.backup_to_tg?"checked":""}>每日备份同时发到 Telegram（异地保存）</label></div>
+  <p class="hint">备份内容：s-ui 数据库（所有节点、用户、路由）、限额记录、中转助手配置。</p></div>
+  <div class="row"><button class="pri" id="ssave">保存设置</button></div>`;
+  const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2"),backup_hour:parseInt($("#bh").value),backup_keep:parseInt($("#bk").value||"14"),backup_to_tg:$("#btg").checked});
+  $("#ssave").onclick=async()=>{try{await api("save_settings",collect());toast("已保存")}catch(e){toast(e.message)}};
+  $("#tgtest").onclick=async()=>{const b=$("#tgtest");b.disabled=true;try{await api("save_settings",collect());await api("tg_test");toast("测试消息已发送，请查看 Telegram")}catch(e){toast(e.message,6000)}finally{b.disabled=false}};
+}
+
+/* ---------------- 备份 ---------------- */
+async function renderBackup(){
+  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
+  let r;try{r=await api("backups")}catch(e){return toast(e.message)}
+  if(!$("#main"))return;
+  m.innerHTML=`<div class="card"><h2>备份</h2>
+  <p class="hint">${r.hour>=0?`每天 ${r.hour} 点自动备份`:"自动备份已关闭"}，保留最近 ${r.keep} 份（存放在服务器 ${esc(r.dir)}）。恢复前会自动先备份当前状态。</p>
+  <div class="row"><button class="pri" id="bnow">立即备份</button><button id="bnowtg">立即备份并发到 Telegram</button></div></div>
+  <div class="card"><table><tr><th>备份</th><th>时间</th><th>大小</th><th></th></tr>
+  ${r.backups.map(b=>`<tr><td class="mono">${esc(b.name)}</td><td>${esc(fmtDate(b.time))}</td><td>${fmtB(b.size)}</td>
+  <td><div class="acts"><a class="sm btnlink" href="${BASE}api/backup_download?name=${encodeURIComponent(b.name)}">下载</a><button class="sm danger" data-rs="${esc(b.name)}">恢复到这个备份</button></div></td></tr>`).join("")||'<tr><td colspan="4" class="muted">还没有备份</td></tr>'}</table></div>`;
+  const go=async(tg)=>{try{const x=await api("backup_now",{to_tg:tg});toast(`已备份 ${x.name}${tg?"，已发到 Telegram":""}`);renderBackup()}catch(e){toast(e.message,6000);renderBackup()}};
+  $("#bnow").onclick=()=>go(false);$("#bnowtg").onclick=()=>go(true);
+  document.querySelectorAll("[data-rs]").forEach(b=>b.onclick=async()=>{
+    const n=b.dataset.rs;if(prompt(`恢复到备份 ${n}？\n\n所有节点、用户、路由、限额都会回到那时的状态，之后新建/修改的会丢失（恢复前会先自动备份当前状态）。s-ui 会重启，所有线路断开几秒。\n\n确认请输入：恢复`)!=="恢复")return;
+    toast("正在恢复…",30000);
+    try{const x=await api("restore",{name:n});toast(`已恢复到 ${n}${x.core==="ok"?"，s-ui 已正常运行":"，⚠ s-ui 内核未启动，请检查"}（恢复前的状态已备份为 ${x.before}）`,8000);renderBackup()}catch(e){toast(e.message,8000)}});
+}
+
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   H("#secbox",n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
@@ -378,7 +428,7 @@ function drawTable(){
   ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
   ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
-  ${i===0?`<td rowspan="${n}">${pcHtml(state.checks[r.tag])}</td>`:""}
+  ${i===0?`<td rowspan="${n}">${healthCell(g)}</td>`:""}
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>

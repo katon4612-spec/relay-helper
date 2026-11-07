@@ -38,6 +38,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/
 2. 创建完成后可以复制全部链接、下载全部二维码（文件名就是节点名）
 3. 「线路管理」：按客户名/IP 搜索，勾选后可批量检测、续期、停用、导出、删除
 
+## 安全与运维
+
+- **HTTPS**：安装/升级时会询问是否启用。中转机地址是域名、且 80 端口空闲时，自动用 acme.sh 申请 Let's Encrypt 证书并自动续签（需要云安全组放行 TCP 80）；否则使用自签名证书（同样加密，浏览器首次打开点「继续访问」）。之后单独重新配置：`bash /opt/relay-helper/https.sh /opt/relay-helper force`
+- **Telegram 通知**：在「设置」页填 Bot Token 和 Chat ID，可发送测试消息。
+- **落地自动巡检**：默认每 5 分钟检测所有在用线路的落地，连续 2 次不通发 Telegram 告警，恢复后通知；「线路管理」检测列显示最新结果。
+- **自动备份**：默认每天 4 点备份 s-ui 数据库、限额记录和工具配置，保留 14 份（`/opt/relay-helper/backups`），可同时发到 Telegram 异地保存；「备份」页可手动备份、下载、恢复（恢复前自动备份当前状态，不会恢复工具自己的登录配置）。
+
 ## 需要知道的
 
 - **创建和删除会重启一次 s-ui**（约 3 秒断线）：s-ui 改路由规则必须重启内核，而 s-ui 1.3.10 在面板里直接重启内核时，有 Hysteria2 节点就可能出现 `address already in use`，导致所有节点掉线。工具改为直接重启 s-ui 服务，每次都能干净恢复。批量创建/删除只重启一次。

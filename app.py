@@ -20,6 +20,8 @@ import random
 import re
 import secrets
 import shutil
+import sqlite3
+import ssl
 import socket
 import string
 import subprocess
@@ -39,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -56,6 +58,16 @@ DEFAULTS = {
     "geo_lookup": True,
     "auto_firewall": True,
     "sui_restart_cmd": "systemctl restart s-ui",
+    "sui_stop_cmd": "systemctl stop s-ui",
+    "sui_start_cmd": "systemctl start s-ui",
+    "sui_db": "/usr/local/s-ui/db/s-ui.db",
+    "tg_token": "",
+    "tg_chat": "",
+    "health_interval_min": 5,
+    "health_fail_times": 2,
+    "backup_hour": 4,
+    "backup_keep": 14,
+    "backup_to_tg": True,
     "reserve_ports": True,
     "cert_file": "",
     "key_file": "",
@@ -879,7 +891,8 @@ def op_list(body):
     with LIM_LOCK:
         lim = json.loads(json.dumps(LIMITS))
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
-            "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE)}
+            "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
+            "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0)}
 
 
 def op_links(body):
@@ -1537,7 +1550,330 @@ def drop_group_limits(okeys):
             save_limits()
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick})
+# ------------------------------------------------------- 设置 / Telegram --
+SETTING_KEYS = ("tg_token", "tg_chat", "health_interval_min", "health_fail_times", "backup_hour", "backup_keep", "backup_to_tg")
+
+
+def save_config(updates):
+    """原子写回 config.json 并更新内存里的配置。"""
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
+        cur = json.load(f)
+    cur.update(updates)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+    CFG.update(updates)
+
+
+def tg_ready():
+    return bool(CFG.get("tg_token") and CFG.get("tg_chat"))
+
+
+def tg_send(text):
+    if not tg_ready():
+        return False, "未配置 Telegram"
+    try:
+        body = json.dumps({"chat_id": CFG["tg_chat"], "text": text[:4000], "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request("%s/bot%s/sendMessage" % (CFG.get("tg_api") or "https://api.telegram.org", CFG["tg_token"]), data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            res = json.loads(r.read().decode())
+        return bool(res.get("ok")), res.get("description", "")
+    except urllib.error.HTTPError as e:
+        try:
+            return False, json.loads(e.read().decode()).get("description", str(e))
+        except Exception:
+            return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+def tg_send_file(path, caption=""):
+    if not tg_ready():
+        return False, "未配置 Telegram"
+    try:
+        boundary = "----rh%s" % secrets.token_hex(8)
+        parts = []
+        for k, v in (("chat_id", str(CFG["tg_chat"])), ("caption", caption[:1000])):
+            parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode())
+        with open(path, "rb") as f:
+            data = f.read()
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                      % (boundary, os.path.basename(path))).encode() + data + b"\r\n")
+        parts.append(("--%s--\r\n" % boundary).encode())
+        req = urllib.request.Request("%s/bot%s/sendDocument" % (CFG.get("tg_api") or "https://api.telegram.org", CFG["tg_token"]), data=b"".join(parts),
+                                     headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.loads(r.read().decode())
+        return bool(res.get("ok")), res.get("description", "")
+    except Exception as e:
+        return False, str(e)
+
+
+def op_get_settings(body):
+    s = {k: CFG.get(k) for k in SETTING_KEYS}
+    tok = s.get("tg_token") or ""
+    s["tg_token"] = ("••••" + tok[-4:]) if tok else ""
+    s["tg_token_set"] = bool(tok)
+    return {"settings": s, "health_last": HEALTH_META.get("last", 0), "backup_last": BACKUP_META.get("last", 0)}
+
+
+def op_save_settings(body):
+    up = {}
+    for k in SETTING_KEYS:
+        if k not in body:
+            continue
+        v = body[k]
+        if k == "tg_token":
+            v = (v or "").strip()
+            if v.startswith("••••"):
+                continue  # 没改
+        elif k == "tg_chat":
+            v = str(v or "").strip()
+        elif k == "backup_to_tg":
+            v = bool(v)
+        elif k == "health_interval_min":
+            v = max(0, int(v or 0))
+        elif k == "health_fail_times":
+            v = max(1, int(v or 1))
+        elif k == "backup_hour":
+            v = int(v) if str(v).strip() != "" and int(v) >= 0 else -1
+            v = min(23, v)
+        elif k == "backup_keep":
+            v = max(1, min(365, int(v or 14)))
+        up[k] = v
+    save_config(up)
+    return {"saved": list(up)}
+
+
+def op_tg_test(body):
+    ok, err = tg_send("✅ 中转助手（%s）Telegram 通知测试成功" % CFG["public_host"])
+    if not ok:
+        raise SuiError("发送失败：%s" % err)
+    return {}
+
+
+# ------------------------------------------------------------ 落地自动巡检 --
+HEALTH = {}        # okey -> {"ok", "delay", "error", "fails", "alerted", "ts", "landing", "name"}
+HEALTH_META = {}
+
+
+def health_once():
+    data = SUI.load_all()
+    rows = build_relays(data)
+    groups = group_rows(rows)
+    now = time.time()
+    targets = []
+    for k, rs in groups.items():
+        m = rs[0]
+        if not m.get("outbound_tag") or not any(r.get("enable") and (not r.get("expiry") or r["expiry"] > now) for r in rs):
+            HEALTH.pop(k, None)  # 没有在用的用户：不检测，避免对过期/停用线路误报
+            continue
+        targets.append((k, m))
+    url = CFG.get("check_url")
+
+    def one(item):
+        k, m = item
+        try:
+            r = SUI.check_outbound(m["outbound_tag"], url) or {}
+            return k, m, bool(r.get("OK")), r.get("Delay"), r.get("Error") or ""
+        except Exception as e:
+            return k, m, False, None, str(e)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(one, targets))
+    need = int(CFG.get("health_fail_times") or 2)
+    down, up = [], []
+    for k, m, ok, delay, err in res:
+        h = HEALTH.setdefault(k, {"fails": 0, "alerted": False})
+        h.update(ok=ok, delay=delay, error=err, ts=int(now), landing=m.get("landing"), name=m["tag"])
+        if ok:
+            if h.get("alerted"):
+                up.append(h)
+            h["fails"], h["alerted"] = 0, False
+        else:
+            h["fails"] = h.get("fails", 0) + 1
+            if h["fails"] >= need and not h.get("alerted"):
+                h["alerted"] = True
+                down.append(h)
+    for k in list(HEALTH):
+        if k not in groups:
+            HEALTH.pop(k, None)
+    HEALTH_META["last"] = int(now)
+    HEALTH_META["count"] = len(targets)
+    host = CFG["public_host"]
+    if down:
+        tg_send("⚠️ 落地不通（%s，%d 条）\n" % (host, len(down)) +
+                "\n".join("• %s\n   落地 %s：%s" % (h["name"], h["landing"], (h["error"] or "超时")[:80]) for h in down[:40]) +
+                ("\n…还有 %d 条" % (len(down) - 40) if len(down) > 40 else ""))
+    if up:
+        tg_send("✅ 落地已恢复（%s，%d 条）\n" % (host, len(up)) + "\n".join("• %s（%s，%sms）" % (h["name"], h["landing"], h["delay"]) for h in up[:40]))
+
+
+def health_loop():
+    time.sleep(int(CFG.get("health_first_delay", 30)))
+    while True:
+        secs = int(CFG.get("health_interval_sec") or 0) or int(CFG.get("health_interval_min") or 0) * 60
+        if secs > 0:
+            try:
+                health_once()
+            except Exception as e:
+                sys.stderr.write("health: %s\n" % e)
+            time.sleep(secs)
+        else:
+            time.sleep(60)
+
+
+# ---------------------------------------------------------------- 备份/恢复 --
+BACKUP_META = {}
+BACKUP_RE = re.compile(r"^backup-[0-9A-Za-z_.-]+\.tar\.gz$")
+
+
+def backup_dir():
+    d = CFG.get("backup_dir") or os.path.join(os.path.dirname(CONFIG_PATH), "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def make_backup(reason="manual"):
+    import tarfile, tempfile
+    db = CFG.get("sui_db")
+    if not db or not os.path.exists(db):
+        raise SuiError("找不到 s-ui 数据库：%s（配置项 sui_db）" % db)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    name = "backup-%s-%s.tar.gz" % (stamp, reason)
+    out = os.path.join(backup_dir(), name)
+    with tempfile.TemporaryDirectory() as td:
+        snap = os.path.join(td, "s-ui.db")
+        src = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=30)
+        dst = sqlite3.connect(snap)
+        with dst:
+            src.backup(dst)  # 在线一致性快照，s-ui 运行中也安全
+        src.close()
+        dst.close()
+        meta = os.path.join(td, "backup-info.json")
+        with open(meta, "w", encoding="utf-8") as f:
+            json.dump({"time": stamp, "reason": reason, "host": CFG["public_host"], "version": VERSION, "sui_db": db}, f, ensure_ascii=False)
+        with tarfile.open(out + ".tmp", "w:gz") as tar:
+            tar.add(snap, "s-ui.db")
+            tar.add(meta, "backup-info.json")
+            for fn in (LIMITS_PATH, CONFIG_PATH):
+                if os.path.exists(fn):
+                    tar.add(fn, os.path.basename(fn))
+    os.replace(out + ".tmp", out)
+    os.chmod(out, 0o600)
+    prune_backups()
+    BACKUP_META["last"] = int(time.time())
+    return out
+
+
+def list_backups():
+    d = backup_dir()
+    out = []
+    for fn in os.listdir(d):
+        if BACKUP_RE.match(fn):
+            st = os.stat(os.path.join(d, fn))
+            out.append({"name": fn, "size": st.st_size, "time": int(st.st_mtime)})
+    out.sort(key=lambda x: x["time"], reverse=True)
+    return out
+
+
+def prune_backups():
+    keep = int(CFG.get("backup_keep") or 14)
+    for b in list_backups()[keep:]:
+        try:
+            os.remove(os.path.join(backup_dir(), b["name"]))
+        except OSError:
+            pass
+
+
+def backup_loop():
+    last_day = None
+    while True:
+        try:
+            h = int(CFG.get("backup_hour", 4))
+            now = time.localtime()
+            if h >= 0 and now.tm_hour == h and last_day != now.tm_yday:
+                last_day = now.tm_yday
+                path = make_backup("daily")
+                if CFG.get("backup_to_tg") and tg_ready():
+                    ok, err = tg_send_file(path, "中转助手每日备份（%s）%s" % (CFG["public_host"], os.path.basename(path)))
+                    if not ok:
+                        sys.stderr.write("tg backup: %s\n" % err)
+        except Exception as e:
+            sys.stderr.write("backup: %s\n" % e)
+            tg_send("❌ 中转助手（%s）自动备份失败：%s" % (CFG["public_host"], e))
+        time.sleep(60)
+
+
+def op_backups(body):
+    return {"backups": list_backups(), "dir": backup_dir(), "keep": CFG.get("backup_keep"), "hour": CFG.get("backup_hour")}
+
+
+def op_backup_now(body):
+    path = make_backup("manual")
+    sent = None
+    if body.get("to_tg"):
+        sent, err = tg_send_file(path, "中转助手手动备份（%s）" % CFG["public_host"])
+        if not sent:
+            raise SuiError("已备份，但发送到 Telegram 失败：%s" % err)
+    return {"name": os.path.basename(path), "sent": sent}
+
+
+def op_restore(body):
+    import tarfile, tempfile
+    name = body.get("name") or ""
+    if not BACKUP_RE.match(name):
+        raise SuiError("备份文件名不对")
+    path = os.path.join(backup_dir(), name)
+    if not os.path.exists(path):
+        raise SuiError("备份不存在")
+    db = CFG.get("sui_db")
+    with LOCK:
+        before = make_backup("before-restore")  # 恢复前先把现在的状态备份一份
+        with tempfile.TemporaryDirectory() as td:
+            with tarfile.open(path, "r:gz") as tar:
+                for m in tar.getmembers():
+                    if m.name in ("s-ui.db", os.path.basename(LIMITS_PATH)) and m.isfile():
+                        tar.extract(m, td)
+            snap = os.path.join(td, "s-ui.db")
+            if not os.path.exists(snap):
+                raise SuiError("备份里没有 s-ui.db")
+            c = sqlite3.connect(snap)
+            ok = c.execute("pragma integrity_check").fetchone()[0]
+            c.close()
+            if ok != "ok":
+                raise SuiError("备份里的数据库校验失败：%s" % ok)
+            subprocess.run(CFG.get("sui_stop_cmd") or "systemctl stop s-ui", shell=True, timeout=60, capture_output=True)
+            time.sleep(1)
+            for ext in ("-wal", "-shm"):
+                try:
+                    os.remove(db + ext)
+                except OSError:
+                    pass
+            shutil.copyfile(snap, db + ".restore")
+            os.replace(db + ".restore", db)
+            lim = os.path.join(td, os.path.basename(LIMITS_PATH))
+            if os.path.exists(lim):
+                shutil.copyfile(lim, LIMITS_PATH)
+                with LIM_LOCK:
+                    load_limits()
+            subprocess.run(CFG.get("sui_start_cmd") or "systemctl start s-ui", shell=True, timeout=60, capture_output=True)
+        deadline = time.time() + 40
+        time.sleep(2)
+        core = "down"
+        while time.time() < deadline:
+            if core_running():
+                core = "ok"
+                break
+            time.sleep(1)
+    return {"restored": name, "before": os.path.basename(before), "core": core}
+
+
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "backups": op_backups, "backup_now": op_backup_now, "restore": op_restore})
 
 
 # ------------------------------------------------------------- web server --
@@ -1584,9 +1920,29 @@ class Handler(BaseHTTPRequestHandler):
     def _ip(self):
         return self.client_address[0]
 
+    def setup(self):
+        # HTTPS：TLS 握手放在处理线程里做，慢客户端不会卡住主线程
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(15)
+            self.request.do_handshake()
+            self.request.settimeout(None)
+        super().setup()
+
     def do_GET(self):
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
+        if path == p + "api/backup_download":
+            if not self._authed():
+                return self._send(401, "请先登录", "text/plain; charset=utf-8")
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            name = (q.get("name") or [""])[0]
+            fp = os.path.join(backup_dir(), name)
+            if not BACKUP_RE.match(name) or not os.path.isfile(fp):
+                return self._send(404, "not found", "text/plain")
+            with open(fp, "rb") as f:
+                data = f.read()
+            return self._send(200, data, "application/gzip",
+                              headers={"Content-Disposition": "attachment; filename=\"%s\"" % name})
         if path == p.rstrip("/"):
             return self._send(302, "", headers={"Location": p})
         if path == p or path == p + "index.html":
@@ -1655,13 +2011,15 @@ def main():
         print("警告：暂时无法登录 s-ui：", e)
     load_limits()
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=health_loop, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)
     scheme = "http"
     if CFG.get("cert_file") and CFG.get("key_file"):
-        import ssl
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(CFG["cert_file"], CFG["key_file"])
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
         scheme = "https"
     print("中转助手 %s 已启动：%s://<服务器>:%s%s" % (VERSION, scheme, CFG["port"], CFG["path"]))
     srv.serve_forever()

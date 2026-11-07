@@ -41,10 +41,12 @@ systemctl list-unit-files 2>/dev/null | grep -q '^s-ui\.service' || echo "âš  æ²
 mkdir -p "$DIR"
 if [ "$SRC" != "$DIR" ]; then
   install -m 644 "$SRC/app.py" "$SRC/qrencoder.py" "$SRC/index.html" "$SRC/configure.py" "$DIR/"
+  install -m 755 "$SRC/https.sh" "$DIR/"
   install -m 755 "$SRC/install.sh" "$DIR/"
 fi
 
 python3 "$DIR/configure.py"
+bash "$DIR/https.sh" "$DIR" || true
 
 cat > "$SVC" <<EOF
 [Unit]
