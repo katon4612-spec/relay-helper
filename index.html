@@ -633,7 +633,8 @@ function replaceDlg(tag){
 const fmtD=ts=>{if(!ts)return "";const d=new Date(ts*1000);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`};
 const chkTag=c=>!c?'<span class="muted">未检测</span>':(c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`)+`<div class="sib">${agoText(c.ts)}</div>`;
 function poolStatus(it){if(it.disabled)return '<span class="tag gray">已停用</span>';if(it.expired)return '<span class="tag bad">已到期</span>';
-  return it.used_by.length?`<span class="tag warn">使用中</span><div class="sib">${it.used_by.map(esc).join("、")}</div>`:'<span class="tag ok">空闲</span>'}
+  return it.used_by.length?`<span class="tag warn">${it.used_by.length} 条线路在用</span><div class="sib">${it.used_by.map(esc).join("、")}</div>`:'<span class="tag ok">空闲</span>'}
+const useTag=it=>it.used_by.length?`<span class="tag warn" title="${esc(it.used_by.join("、"))}">${it.used_by.length} 条在用</span>`:'<span class="tag ok">空闲</span>';
 async function poolSection(tag){
   let x;try{x=await api("pool_candidates",{tag})}catch(e){return H("#poolbox",`<span class="err">${esc(e.message)}</span>`)}
   const box=$("#poolbox");if(!box)return;
@@ -641,10 +642,10 @@ async function poolSection(tag){
   box.innerHTML=`<b>从落地库换</b> <span class="hint">当前：${esc(c.addr)}　${esc(c.country||"国家未知")}　网段 ${esc(c.net||"-")}${c.in_pool?"":"（不在落地库里）"}</span>
   <div class="row" style="margin-top:8px;align-items:center"><button class="pri sm" id="pauto1">自动挑一个能通的换上</button>
   <label class="ck"><input type="checkbox" id="pautochk" ${x.auto?"checked":""} ${x.has_failover?"disabled":""}>落地不通时自动从库里换${x.has_failover?"（已设备用落地，由备用落地负责）":""}</label></div>
-  <p class="hint">优先挑同国家、<b>不同网段</b>、最近检测能通的空闲落地；换之前会先检测。客户链接不变。</p>
-  ${x.candidates.length?`<table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>到期</th><th></th></tr>${x.candidates.slice(0,8).map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
-    <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag warn">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
-    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有${esc(c.country||"")}的空闲落地，可以到「落地库」页导入。</p>`}
+  <p class="hint">优先挑同国家、<b>不同网段</b>、最近检测能通、在用线路少的落地（落地可以多条线路共用）；换之前会先检测。客户链接不变。</p>
+  ${x.candidates.length?`<table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th><th></th></tr>${x.candidates.slice(0,8).map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
+    <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag warn">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
+    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有别的${esc(c.country||"")}落地，可以到「落地库」页导入。</p>`}
   <p id="pmsg"></p>`;
   const done=async(p)=>{const r=await p;state.checks[tag]=r.check;H("#pmsg",`<span class="tag ${r.check&&r.check.ok?"ok":"bad"}">已换成 ${esc(r.to)}（${esc(r.country||"")} ${esc(r.net||"")}）${r.check&&r.check.ok?"，连通 "+r.check.delay+"ms":"，但检测不通"}</span>${r.same_net?' <span class="tag warn">注意：和原来是同一网段</span>':""}`);await loadRelays();drawTable();setTimeout(()=>{if($("#poolbox"))replaceDlg(tag)},1800)};
   $("#pauto1").onclick=async()=>{const b=$("#pauto1");b.disabled=true;b.innerHTML='<span class="spin"></span> 检测并更换中…';try{await done(api("pool_switch",{tag}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="自动挑一个能通的换上"}};
@@ -654,15 +655,15 @@ async function poolSection(tag){
 async function poolPicker(cb){
   let x;try{x=await api("pool_list")}catch(e){return toast(e.message)}
   const rank=it=>it.check?(it.check.ok?0:2):1;
-  const idle=x.items.filter(it=>!it.used_by.length&&!it.disabled&&!it.expired).sort((a,b)=>rank(a)-rank(b)||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9));
+  const idle=x.items.filter(it=>!it.disabled&&!it.expired).sort((a,b)=>rank(a)-rank(b)||a.used_by.length-b.used_by.length||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9));
   const cs=[...new Set(idle.map(it=>it.country||"未知"))];
   let cur=cs[0]||"";
   const draw=()=>{const list=idle.filter(it=>(it.country||"未知")===cur);
-    H("#ppl",list.length?`<table><tr><th><input type="checkbox" id="ppall"></th><th>落地</th><th>网段</th><th>检测</th><th>到期</th></tr>${list.map(it=>`<tr><td><input type="checkbox" data-pp="${esc(it.id)}"></td><td class="mono">${esc(it.host)}:${esc(it.port)}</td><td class="mono">${esc(it.net||"-")}</td><td>${chkTag(it.check)}</td><td>${it.expire?esc(fmtD(it.expire)):"-"}</td></tr>`).join("")}</table>`:'<p class="hint">没有空闲落地</p>');
+    H("#ppl",list.length?`<table><tr><th><input type="checkbox" id="ppall"></th><th>落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th></tr>${list.map(it=>`<tr><td><input type="checkbox" data-pp="${esc(it.id)}"></td><td class="mono">${esc(it.host)}:${esc(it.port)}</td><td class="mono">${esc(it.net||"-")}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):"-"}</td></tr>`).join("")}</table>`:'<p class="hint">这个国家没有可用落地</p>');
     if($("#ppall"))$("#ppall").onchange=()=>document.querySelectorAll("[data-pp]").forEach(c=>c.checked=$("#ppall").checked);
     document.querySelectorAll("#ppc button").forEach(b=>b.classList.toggle("pri",b.dataset.c===cur))};
-  modal(`<h2 style="margin-top:0">从落地库选（空闲 ${idle.length} 个）</h2>
-  <div class="row" id="ppc" style="gap:6px">${cs.map(c=>`<button class="sm" data-c="${esc(c)}">${esc(c)}（${idle.filter(it=>(it.country||"未知")===c).length}）</button>`).join("")||'<span class="hint">落地库里没有空闲落地，先到「落地库」页导入。</span>'}</div>
+  modal(`<h2 style="margin-top:0">从落地库选（可用 ${idle.length} 个）</h2>
+  <div class="row" id="ppc" style="gap:6px">${cs.map(c=>`<button class="sm" data-c="${esc(c)}">${esc(c)}（${idle.filter(it=>(it.country||"未知")===c).length}）</button>`).join("")||'<span class="hint">落地库里还没有落地，先到「落地库」页导入。</span>'}</div>
   <div id="ppl" style="max-height:52vh;overflow:auto;margin-top:10px"></div>
   <div class="row" style="margin-top:12px"><button class="pri" id="ppok">加入到落地输入框</button><button id="ppcl">取消</button></div>`);
   document.querySelectorAll("#ppc button").forEach(b=>b.onclick=()=>{cur=b.dataset.c;draw()});draw();
@@ -679,10 +680,10 @@ async function renderPool(){
   const by={};items.forEach(it=>{const c=it.country||"未知";(by[c]=by[c]||{n:0,idle:0,bad:0}).n++;if(!it.used_by.length&&!it.disabled&&!it.expired)by[c].idle++;if(it.check&&!it.check.ok)by[c].bad++});
   const soon=items.filter(it=>it.expire&&it.expire>now&&it.expire<now+7*86400).length;
   m.innerHTML=`<div class="card"><h2>落地库</h2>
-  <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（优先同国家、不同网段），也可以给线路开「自动换」。是否在用、被哪条线路用，按线路实时算。</p>
+  <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（优先同国家、不同网段），也可以给线路开「自动换」。一个落地可以多条线路共用，「状态」里标出有几条线路在用、是哪几条。</p>
   <div class="row" style="gap:6px;margin:10px 0"><button class="sm" data-pc="">全部（${items.length}）</button>${Object.entries(by).map(([c,v])=>`<button class="sm" data-pc="${esc(c)}">${esc(c)} ${v.n}<span class="muted">（空闲 ${v.idle}${v.bad?`，<span class="err">不通 ${v.bad}</span>`:""}）</span></button>`).join("")}</div>
   <div class="toolbar"><input id="pq" class="grow" placeholder="搜 IP / 网段 / 供应商 / 备注 / 使用的线路" value="${esc(state.pf.q)}">
-   <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">使用中</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
+   <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">有线路在用</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
    <button class="pri" id="pimp">导入落地</button></div>
   <div class="toolbar" id="pbulk"></div><div id="ptable"></div></div>
   ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;

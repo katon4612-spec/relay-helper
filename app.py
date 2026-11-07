@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2878,7 +2878,8 @@ def _current(okey, data):
 
 
 def _candidates(cur, use, country=None):
-    """同国家、空闲、没停用、没到期的落地，排序：不同网段优先 → 最近检测能通 → 未检测 → 延迟低。"""
+    """同国家、没停用、没到期的落地（可以和别的线路共用），
+    排序：不同网段优先 → 最近没失败 → 所在网段最近没失败 → 检测能通 → 在用的线路少 → 延迟低。"""
     country = cur["country"] if country is None else country
     now = time.time()
     bad_nets = set()
@@ -2890,8 +2891,10 @@ def _candidates(cur, use, country=None):
             bad_nets.add(it.get("net"))
     out = []
     for it in items:
-        if it.get("disabled") or (it.get("expire") and it["expire"] < now) or use.get(landing_key(it["ob"])):
+        if it.get("disabled") or (it.get("expire") and it["expire"] < now):
             continue
+        if cur.get("ob") and landing_key(it["ob"]) == landing_key(cur["ob"]):
+            continue  # 就是现在用的这个
         if country and it.get("country") != country:
             continue
         if it.get("id") == cur.get("rec_id"):
@@ -2899,7 +2902,8 @@ def _candidates(cur, use, country=None):
         c = it.get("check") or {}
         recent_fail = c and not c.get("ok") and now - (c.get("ts") or 0) < 600
         same_net = bool(cur.get("net")) and it.get("net") == cur["net"]
-        score = (same_net, recent_fail, it.get("net") in bad_nets, not (c and c.get("ok")), c.get("delay") or 99999)
+        n_use = len([u for u in use.get(landing_key(it["ob"]), []) if not u.endswith("（备用）")])
+        score = (same_net, recent_fail, it.get("net") in bad_nets, not (c and c.get("ok")), n_use, c.get("delay") or 99999)
         out.append((score, it))
     out.sort(key=lambda x: x[0])
     return [it for _, it in out]
@@ -2942,7 +2946,7 @@ def op_pool_switch(body):
         cur = _current(row["outbound_tag"], data)
         it = _pick_working(cur, _pool_usage(data), body.get("country"))
         if not it:
-            raise SuiError("落地库里没有能用的%s落地（空闲、没停用、没到期、检测能通）" % (cur["country"] or "同国家"))
+            raise SuiError("落地库里没有能用的%s落地（没停用、没到期、检测能通）" % (cur["country"] or "同国家"))
     res = _switch_to(row, it, "手动")
     return {"from": cur["addr"], "to": "%s:%s" % (it["host"], it["port"]), "country": it.get("country"), "net": it.get("net"),
             "same_net": bool(cur["net"]) and cur["net"] == it.get("net"), "check": res.get("check")}
