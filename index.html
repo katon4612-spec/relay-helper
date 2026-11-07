@@ -29,6 +29,9 @@ header nav button:hover{color:var(--ink);background:transparent}
 header nav button.on{background:var(--card);color:var(--ink);box-shadow:0 1px 2px rgba(43,38,32,.14),0 0 0 1px var(--line)}
 header nav #logout{color:var(--muted);margin-left:6px;border-left:1px solid var(--line);border-radius:0 7px 7px 0}
 
+.srvsel{margin-left:6px;padding:5px 10px;border-radius:8px;font-weight:600;max-width:240px}
+#app.remote header{box-shadow:inset 0 -3px 0 var(--p-vless443)}
+#app.remote .srvsel{border-color:var(--p-vless443);color:var(--p-vless443)}
 main{max-width:1380px;margin:22px auto;padding:0 18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
 .card h2{font-size:16px;margin:0 0 14px;font-weight:600;color:var(--ink)}
@@ -140,10 +143,12 @@ const BASE="__BASE__";
 const $=s=>document.querySelector(s);
 const H=(sel,html)=>{const e=document.querySelector(sel);if(e)e.innerHTML=html;return e};
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let state={tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
+const LS={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+let state={srv:LS.get("rh_srv")||"local",servers:[],tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
 
-async function api(a,body){
-  const r=await fetch(BASE+"api/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+async function api(a,body,opt){
+  const hd={"Content-Type":"application/json"};if(state.srv&&state.srv!=="local"&&!(opt&&opt.local))hd["X-RH-Server"]=state.srv;
+  const r=await fetch(BASE+"api/"+a,{method:"POST",headers:hd,body:JSON.stringify(body||{})});
   const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
   if(j.login){renderLogin();throw new Error("请先登录")}
   if(!j.ok)throw new Error(j.error||"操作失败");
@@ -171,14 +176,30 @@ function renderLogin(){
 }
 
 function shell(){
-  $("#app").innerHTML=`<header><h1>中转助手</h1><span class="host" id="hostinfo"></span>
-  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button data-t="backup">备份</button><button data-t="settings">设置</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
+  $("#app").innerHTML=`<header><h1>中转助手</h1><span class="host" id="hostinfo"></span><select id="srvsel" class="srvsel" title="选择要管理的服务器" style="display:none"></select>
+  <nav><button data-t="create">一键中转</button><button data-t="manage">线路管理</button><button data-t="backup">备份</button><button data-t="settings">设置</button><button data-t="servers">服务器</button><button id="logout">退出</button></nav></header><main id="main"></main>`;
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.onclick=()=>{state.tab=b.dataset.t;render()});
   $("#logout").onclick=async()=>{await fetch(BASE+"api/logout",{method:"POST"});renderLogin()};
 }
 function render(){
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.classList.toggle("on",b.dataset.t===state.tab));
-  if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else renderManage();
+  if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else if(state.tab==="servers")renderServers();else renderManage();
+}
+async function loadServers(){
+  try{const x=await api("servers_list",{},{local:true});state.servers=x.servers;state.local=x.local}catch(e){state.servers=[]}
+  if(state.srv!=="local"&&!state.servers.some(s=>s.id===state.srv)){state.srv="local";LS.set("rh_srv","local")}
+  const sel=$("#srvsel");if(!sel)return;
+  sel.style.display=state.servers.length?"":"none";
+  sel.innerHTML=`<option value="local">本机 · ${esc((state.local||{}).public_host||"")}</option>`+state.servers.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("");
+  sel.value=state.srv;$("#app").classList.toggle("remote",state.srv!=="local");
+  sel.onchange=()=>switchSrv(sel.value);
+}
+function switchSrv(id,tab){
+  state.srv=id;LS.set("rh_srv",id);state.relays=[];state.sel=new Set();state.q="";state.page=1;state.only=null;
+  if($("#srvsel"))$("#srvsel").value=id;$("#app").classList.toggle("remote",id!=="local");
+  if(tab)state.tab=tab;if(state.tab==="servers")state.tab="manage";
+  api("status").then(s=>{state.host=s.public_host;$("#hostinfo").textContent=s.public_host}).catch(e=>toast(e.message,6000));
+  render();
 }
 
 /* ---------------- 一键中转 ---------------- */
@@ -445,14 +466,14 @@ function renderBackup(){
   <li>打开新服务器的中转助手，点「恢复备份」，选刚才下载的文件。</li>
   <li>到云服务商安全组放行节点端口（和旧服务器一样）。</li></ol>
   <p class="hint">恢复后 s-ui 的面板端口、路径、登录账号会变成旧服务器的。恢复前的状态会自动存一份在服务器 <span class="mono">/opt/relay-helper/before-restore.tar.gz</span>，恢复错了可以用它再恢复回去。</p></div>`;
-  $("#bdl").onclick=()=>{location.href=`${BASE}api/backup_download?full=${$("#bfull").checked?1:0}&t=${Date.now()}`;toast("正在生成备份…",3000)};
+  $("#bdl").onclick=()=>{location.href=`${BASE}api/backup_download?full=${$("#bfull").checked?1:0}&srv=${encodeURIComponent(state.srv)}&t=${Date.now()}`;toast("正在生成备份…",3000)};
   $("#brs").onclick=()=>{$("#bfile").value="";$("#bfile").click()};
   $("#bfile").onchange=async()=>{
     const f=$("#bfile").files[0];if(!f)return;
     if(prompt(`用 ${f.name} 恢复？\n\n当前这台服务器上的所有节点、用户、路由、限额都会被备份里的内容替换，s-ui 会重启，所有线路断开几秒。\n\n确认请输入：恢复`)!=="恢复")return;
     const b=$("#brs");b.disabled=true;b.innerHTML='<span class="spin"></span> 正在恢复…';
     try{
-      const r=await fetch(`${BASE}api/restore_upload`,{method:"POST",body:f,credentials:"same-origin",headers:{"Content-Type":"application/octet-stream"}});
+      const r=await fetch(`${BASE}api/restore_upload`,{method:"POST",body:f,credentials:"same-origin",headers:Object.assign({"Content-Type":"application/octet-stream"},state.srv!=="local"?{"X-RH-Server":state.srv}:{})});
       let x;try{x=await r.json()}catch(e){throw new Error("恢复失败（HTTP "+r.status+"）")}
       if(!x.ok){if(x.login)location.reload();throw new Error(x.error)}
       let msg=`已恢复：${x.inbounds} 个节点、${x.clients} 个用户${x.from_host?`（来自 ${x.from_host}${x.backup_time?" "+x.backup_time:""}）`:""}，`+(x.core==="ok"?"s-ui 已正常运行。":"⚠ s-ui 内核未启动，请到 s-ui 面板查看。");
@@ -533,6 +554,7 @@ function drawTable(){
   <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
+  ${i===0?`<button class="sm" data-a="sub" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"} title="这条线路所有协议节点的订阅链接，客户导入一次，以后刷新就自动更新">订阅</button>`:""}
   <button class="sm" data-a="fo" data-t="${esc(r.tag)}" ${r.outbound_tag&&r.landing_type!=="direct"?"":"disabled"}>备用落地</button>
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
@@ -553,7 +575,7 @@ function drawTable(){
     $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bport").onclick=()=>portDlg([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,sub:subDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -601,6 +623,74 @@ function replaceDlg(tag){
       H("#rmsg",x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`);
       await loadRelays();drawTable()}catch(e){H("#rmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="替换并检测"}}};
 }
+/* ---------------- 服务器 ---------------- */
+async function renderServers(){
+  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span> 正在读取各服务器…</div>';
+  await loadServers();
+  let ov;try{ov=(await api("servers_overview",{},{local:true})).servers}catch(e){return H("#main",`<div class="card err">${esc(e.message)}</div>`)}
+  if(!$("#main")||state.tab!=="servers")return;
+  const L=state.local||{};
+  const cell=(v,cls)=>v?`<span class="tag ${cls}">${v}</span>`:'<span class="muted">0</span>';
+  m.innerHTML=`<div class="card"><h2>所有服务器</h2>
+  <table><tr><th>服务器</th><th>地址</th><th>状态</th><th>线路</th><th>7 天内到期</th><th>已过期</th><th>落地不通</th><th></th></tr>
+  ${ov.map(s=>`<tr><td><b>${esc(s.name)}</b>${s.id===state.srv?' <span class="tag ok">正在管理</span>':""}</td><td class="mono">${esc(s.public_host||s.url)}</td>
+    <td>${s.ok?`<span class="tag ok">在线</span> <span class="muted" style="font-size:12px">v${esc(s.version||"?")}</span>`:`<span class="tag bad" title="${esc(s.error)}">连不上</span><div class="sib" style="max-width:260px">${esc(s.error)}</div>`}</td>
+    <td>${s.ok?`${s.lines} <span class="muted">（${s.nodes} 节点）</span>`:"-"}</td><td>${s.ok?cell(s.soon,"warn"):"-"}</td><td>${s.ok?cell(s.expired,"bad"):"-"}</td><td>${s.ok?cell(s.bad,"bad"):"-"}</td>
+    <td><div class="acts"><button class="sm" data-go="${esc(s.id)}">管理</button>${s.id!=="local"?`<button class="sm" data-ed="${esc(s.id)}">编辑</button><button class="sm danger" data-rm="${esc(s.id)}">移除</button>`:""}</div></td></tr>`).join("")}</table>
+  <div class="row" style="margin-top:14px"><label style="flex:1">在所有服务器里找客户 / 节点 / 落地 IP<input id="gq" placeholder="如：见山 或 216.36" style="width:100%"></label></div>
+  <div id="gres"></div></div>
+  <div class="card"><h2 id="sfh">添加服务器</h2>
+  <p class="hint">在另一台服务器上装好中转助手，打开它的「服务器」页，复制「本机地址」和「本机连接密钥」填到这里。</p>
+  <div class="row"><label>名称<input id="sname" placeholder="如：香港2" style="width:140px"></label>
+  <label style="flex:1">地址<input id="surl" placeholder="https://hk2.example.com:2097/kaide/" style="width:100%"></label>
+  <label>连接密钥<input id="stok" placeholder="对方的本机连接密钥" style="width:240px"></label></div>
+  <div class="row" style="margin-top:10px"><label class="ck"><input type="checkbox" id="sins">忽略证书校验（对方是自签名证书时勾选）</label>
+  <button class="pri" id="ssv">添加并测试连接</button><button id="scn" style="display:none">取消编辑</button></div><p id="smsg"></p></div>
+  <div class="card"><h2>本机的地址和连接密钥</h2>
+  <p class="hint">在主控服务器上添加这台服务器时填这两项。密钥等于这台服务器的管理权限，不要发给别人；泄露了就点重置，再到主控里更新。</p>
+  <div class="kv"><b>本机地址</b><span>${esc(L.url||"")}</span><button class="sm" id="cpu">复制</button>
+  <b>连接密钥</b><span id="tokv">••••••••••••${esc((L.token||"").slice(-4))}</span><button class="sm" id="cpt">复制</button></div>
+  <div class="row"><button class="sm" id="shw">显示密钥</button><button class="sm danger" id="rst">重置密钥</button></div></div>`;
+  const all=ov.flatMap(s=>(s.rows||[]).map(r=>Object.assign({srv:s.id,sname:s.name},r)));
+  $("#gq").oninput=()=>{const q=$("#gq").value.trim().toLowerCase();if(!q)return H("#gres","");
+    const hit=all.filter(r=>(r.tag+" "+r.landing).toLowerCase().includes(q)).slice(0,60);
+    H("#gres",hit.length?`<table style="margin-top:8px"><tr><th>服务器</th><th>节点</th><th>落地</th><th>到期</th><th></th></tr>${hit.map(r=>`<tr><td>${esc(r.sname)}</td><td>${esc(r.tag)}</td><td class="mono">${esc(r.landing)}</td><td>${expTag(r)}</td><td><button class="sm" data-find="${esc(r.srv)}" data-q="${esc(r.tag)}">去管理</button></td></tr>`).join("")}</table>`:'<p class="hint">没有找到</p>');
+    document.querySelectorAll("[data-find]").forEach(b=>b.onclick=()=>{switchSrv(b.dataset.find,"manage");state.q=b.dataset.q;setTimeout(()=>{if($("#q")){$("#q").value=b.dataset.q;$("#q").dispatchEvent(new Event("input"))}},400)})};
+  document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>switchSrv(b.dataset.go,"manage"));
+  let editing=null;
+  document.querySelectorAll("[data-ed]").forEach(b=>b.onclick=()=>{const s=state.servers.find(x=>x.id===b.dataset.ed);editing=s.id;
+    $("#sfh").textContent="编辑服务器："+s.name;$("#sname").value=s.name;$("#surl").value=s.url;$("#stok").value="";$("#stok").placeholder="不改密钥就留空";$("#sins").checked=s.insecure;$("#ssv").textContent="保存并测试连接";$("#scn").style.display="";$("#sname").scrollIntoView({behavior:"smooth",block:"center"})});
+  $("#scn").onclick=()=>renderServers();
+  document.querySelectorAll("[data-rm]").forEach(b=>b.onclick=async()=>{const s=state.servers.find(x=>x.id===b.dataset.rm);
+    if(!confirm(`从列表里移除「${s.name}」？只是不在这里管理了，那台服务器上的节点不受影响。`))return;
+    await api("server_del",{id:s.id},{local:true});if(state.srv===s.id)state.srv="local",LS.set("rh_srv","local");toast("已移除");renderServers()});
+  $("#ssv").onclick=async()=>{const b=$("#ssv");b.disabled=true;H("#smsg",'<span class="spin"></span> 正在连接…');
+    try{const x=await api("server_save",{id:editing,name:$("#sname").value,url:$("#surl").value,token:$("#stok").value,insecure:$("#sins").checked},{local:true});
+      toast(`已连接：${x.remote.public_host}（v${x.remote.version}）`,4000);renderServers()}catch(e){H("#smsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false}};
+  $("#cpu").onclick=()=>copy(L.url||"");$("#cpt").onclick=()=>copy(L.token||"");
+  $("#shw").onclick=()=>H("#tokv",esc(L.token||""));
+  $("#rst").onclick=async()=>{if(!confirm("重置后，主控里填的旧密钥就失效了，需要到主控里编辑这台服务器、填新密钥。确定重置？"))return;
+    const x=await api("local_token_reset",{},{local:true});state.local.token=x.token;H("#tokv",esc(x.token));toast("已重置")};
+}
+
+/* ---------------- 订阅 ---------------- */
+async function subDlg(tag,reset){
+  let x;try{x=await api("sub_get",{tag,reset:!!reset})}catch(e){return toast(e.message)}
+  modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2>
+  <p class="hint">包含这条线路的全部 ${x.nodes} 个协议节点（已停用、已过期的不会出现在订阅里）。客户导入一次，以后你换端口、换落地、加协议，客户在软件里<b>更新订阅</b>就行，不用重新发链接。</p>
+  <div style="display:flex;gap:16px;align-items:center;margin:12px 0">
+    <div style="width:132px;height:132px;flex:none">${x.svg.replace("<svg",'<svg style="width:132px;height:132px;display:block"')}</div>
+    <div style="min-width:0;flex:1">
+      <div class="muted" style="font-size:13px;margin-bottom:4px">v2rayN / Shadowrocket / Clash 通用（Clash 会自动识别）</div>
+      <p class="mono" style="word-break:break-all;margin:0 0 8px">${esc(x.url)}</p>
+      <div class="row" style="gap:8px"><button class="pri sm" id="scp">复制订阅链接</button><button class="sm" id="scl">复制 Clash 专用链接</button></div>
+    </div></div>
+  <p class="hint">Shadowrocket 可以直接扫左边二维码。链接泄露了就点「重置」，旧链接立刻失效，再把新链接发给客户。</p>
+  <div class="row" style="margin-top:12px"><button class="danger" id="srs">重置订阅链接</button><button id="scl2">关闭</button></div>`);
+  $("#scp").onclick=()=>copy(x.url);$("#scl").onclick=()=>copy(x.clash);$("#scl2").onclick=closeModal;
+  $("#srs").onclick=()=>{if(confirm("重置后旧的订阅链接马上失效，客户需要重新导入新链接。确定重置？"))subDlg(tag,true)};
+}
+
 /* ---------------- 换端口 ---------------- */
 function portDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&!r.shared);if(!rs.length)return toast("443 共用节点不能单独换端口");
@@ -762,7 +852,7 @@ async function delTags(tags){
 }
 
 async function init(){
-  shell();
+  shell();await loadServers();
   try{const s=await api("status");state.host=s.public_host;$("#hostinfo").textContent=s.public_host;
     if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000);
     if((s.unprotected||[]).length){state.tab="manage";setTimeout(()=>toast(`⚠ ${s.unprotected.length} 个节点有安全风险，见页面顶部提醒`,6000),300)}}catch(e){return}

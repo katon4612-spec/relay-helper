@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.12.6"
+VERSION = "1.13.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -965,7 +965,7 @@ def op_list(body):
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
             "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary(),
-            "fw_error": FW_STATE["error"]}
+            "fw_error": FW_STATE["error"], "version": VERSION}
 
 
 def op_links(body):
@@ -1247,6 +1247,9 @@ def op_delete(body):
                     try:
                         SUI.save("outbounds", "del", ot)
                         drop_group_limits([ot])
+                        with SUBS_LOCK:
+                            if SUBS.pop(ot, None):
+                                save_subs()
                         with FO_LOCK:
                             f = FO.pop(ot, None)
                             FO_STATE.pop(ot, None)
@@ -2343,6 +2346,350 @@ def op_whoami(body):
     return {"id": INSTANCE}
 
 
+# ------------------------------------------------------------- 订阅链接 --
+# 每条线路（同一个落地的所有协议节点）一个订阅链接。客户在 v2rayN / Shadowrocket / Clash 里导入一次，
+# 之后换端口、换落地、加协议，客户刷新订阅就自动更新。链接里带随机令牌，不需要登录；可以随时重置。
+SUBS_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "subs.json")
+SUBS = {}  # 线路 key -> 令牌
+SUBS_LOCK = threading.Lock()
+
+
+def load_subs():
+    global SUBS
+    try:
+        with open(SUBS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        SUBS = d if isinstance(d, dict) else {}
+    except Exception:
+        SUBS = {}
+
+
+def save_subs():
+    tmp = SUBS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(SUBS, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SUBS_PATH)
+
+
+def base_url():
+    scheme = "https" if CFG.get("cert_file") else "http"
+    return "%s://%s:%s%s" % (scheme, CFG["public_host"], CFG["port"], CFG["path"])
+
+
+def _sub_url(token):
+    return base_url() + "sub/" + token
+
+
+def op_sub_get(body):
+    data = SUI.load_all()
+    rows = {r["tag"]: r for r in build_relays(data)}
+    row = rows.get(body.get("tag"))
+    if not row:
+        raise SuiError("找不到这条线路")
+    k = okey_of(row)
+    with SUBS_LOCK:
+        if body.get("reset") or k not in SUBS:
+            SUBS[k] = secrets.token_urlsafe(18)
+            save_subs()
+        tok = SUBS[k]
+    n = len([r for r in rows.values() if okey_of(r) == k and r.get("client_id")])
+    url = _sub_url(tok)
+    return {"url": url, "clash": url + "?format=clash", "nodes": n, "svg": qr_svg(url)}
+
+
+def _sub_links(k):
+    """这条线路当前可用的节点链接（停用、过期的不给），以及流量/到期信息。"""
+    data = SUI.load_all()
+    rs = group_rows(build_relays(data)).get(k) or []
+    now = time.time()
+    links, up, down, exp = [], 0, 0, 0
+    for r in rs:
+        up += r.get("up") or 0
+        down += r.get("down") or 0
+        e = r.get("expiry") or 0
+        if e > 0:
+            exp = e if not exp else min(exp, e)
+        if not r.get("client_id") or not r.get("enable") or (e > 0 and e < now):
+            continue
+        try:
+            links += client_links(r["client_id"])
+        except Exception:
+            pass
+    with LIM_LOCK:
+        q = float((LIMITS.get(k) or {}).get("quota_gb") or 0)
+    name = re.sub(r"-(HY2|S5|VL|443)(-\d+)?$", "", min((r["tag"] for r in rs), key=len)) if rs else "订阅"
+    return links, {"upload": up, "download": down, "total": int(q * 1024 ** 3), "expire": int(exp)}, name
+
+
+def _v2rayn_link(u):
+    """s-ui 的 socks5://账号:密码@主机:端口 换成 v2rayN / Shadowrocket 认的 socks://base64(账号:密码)@主机:端口#名字"""
+    if not u.startswith("socks5://"):
+        return u
+    rest = u[len("socks5://"):]
+    cred, _, hp = rest.rpartition("@")
+    name = urllib.parse.unquote(cred.split(":", 1)[0])
+    b = base64.urlsafe_b64encode(urllib.parse.unquote(cred).encode()).decode().rstrip("=")
+    return "socks://%s@%s#%s" % (b, hp.split("#")[0], urllib.parse.quote(name))
+
+
+def _yq(s):
+    return json.dumps(str(s), ensure_ascii=False)  # JSON 字符串就是合法的 YAML 字符串
+
+
+def _clash_proxy(u):
+    p = urllib.parse.urlsplit(u)
+    name = urllib.parse.unquote(p.fragment) if p.fragment else ""
+    q = dict(urllib.parse.parse_qsl(p.query))
+    host, port = p.hostname, p.port
+    if p.scheme == "vless":
+        name = name or "%s:%s" % (host, port)
+        d = [("name", name), ("type", "vless"), ("server", host), ("port", port), ("uuid", urllib.parse.unquote(p.username or "")),
+             ("network", q.get("type") or "tcp"), ("udp", True)]
+        if q.get("flow"):
+            d.append(("flow", q["flow"]))
+        if q.get("security") in ("reality", "tls"):
+            d += [("tls", True), ("servername", q.get("sni") or host), ("client-fingerprint", q.get("fp") or "chrome")]
+            if q.get("security") == "reality":
+                d.append(("reality-opts", [("public-key", q.get("pbk", "")), ("short-id", q.get("sid", ""))]))
+        return d
+    if p.scheme in ("hysteria2", "hy2"):
+        name = name or "%s:%s" % (host, port)
+        d = [("name", name), ("type", "hysteria2"), ("server", host), ("port", port), ("password", urllib.parse.unquote(p.username or ""))]
+        if q.get("sni"):
+            d.append(("sni", q["sni"]))
+        d.append(("skip-cert-verify", q.get("insecure") == "1"))
+        return d
+    if p.scheme in ("socks5", "socks"):
+        rest = u.split("://", 1)[1]
+        cred, _, hp = rest.rpartition("@")
+        user, _, pw = urllib.parse.unquote(cred).partition(":")
+        name = name or user or "%s:%s" % (host, port)
+        return [("name", name), ("type", "socks5"), ("server", host), ("port", port), ("username", user), ("password", pw), ("udp", True)]
+    return None
+
+
+def _yaml_item(d, ind):
+    out = []
+    for i, (k, v) in enumerate(d):
+        pre = (" " * ind + "- ") if i == 0 else (" " * (ind + 2))
+        if isinstance(v, list):
+            out.append("%s%s:" % (pre, k))
+            out += ["%s%s: %s" % (" " * (ind + 4), kk, _yq(vv)) for kk, vv in v]
+        elif isinstance(v, bool):
+            out.append("%s%s: %s" % (pre, k, "true" if v else "false"))
+        elif isinstance(v, int):
+            out.append("%s%s: %d" % (pre, k, v))
+        else:
+            out.append("%s%s: %s" % (pre, k, _yq(v)))
+    return out
+
+
+def clash_yaml(links, title):
+    proxies = [x for x in (_clash_proxy(u) for u in links) if x]
+    names = [dict(x)["name"] for x in proxies]
+    lines = ["# %s（由中转助手生成）" % title, "mixed-port: 7890", "allow-lan: false", "mode: rule", "log-level: info", "", "proxies:"]
+    for x in proxies:
+        lines += _yaml_item(x, 2)
+    if not proxies:
+        lines[-1] = "proxies: []"
+    lines += ["", "proxy-groups:", "  - name: %s" % _yq("节点选择"), "    type: select", "    proxies:"]
+    lines += ["      - %s" % _yq(n) for n in names] + ["      - DIRECT"]
+    lines += ["", "rules:", "  - %s" % _yq("MATCH,节点选择"), ""]
+    return "\n".join(lines)
+
+
+def serve_sub(handler, token, query):
+    with SUBS_LOCK:
+        k = next((kk for kk, t in SUBS.items() if hmac.compare_digest(t, token)), None)
+    if not k:
+        return handler._send(404, "订阅不存在或已重置", "text/plain; charset=utf-8")
+    try:
+        links, info, name = _sub_links(k)
+    except Exception as e:
+        return handler._send(503, "暂时无法获取节点：%s" % e, "text/plain; charset=utf-8")
+    ua = (handler.headers.get("User-Agent") or "").lower()
+    fmt = (urllib.parse.parse_qs(query).get("format") or [""])[0].lower()
+    if not fmt:
+        fmt = "clash" if any(x in ua for x in ("clash", "mihomo", "stash", "meta")) else "base64"
+    hdr = {"Subscription-Userinfo": "; ".join("%s=%d" % kv for kv in info.items() if kv[0] != "total" or kv[1]),
+           "Profile-Update-Interval": "6",
+           "Content-Disposition": "attachment; filename*=UTF-8''%s" % urllib.parse.quote(name),
+           "Profile-Title": "base64:" + base64.b64encode(name.encode()).decode()}
+    if fmt == "clash":
+        body = clash_yaml(links, name)
+        return handler._send(200, body, "text/yaml; charset=utf-8", headers=hdr)
+    body = base64.b64encode("\n".join(_v2rayn_link(u) for u in links).encode()).decode()
+    return handler._send(200, body, "text/plain; charset=utf-8", headers=hdr)
+
+
+# ------------------------------------------------------------ 多服务器 --
+# 每台服务器照常装中转助手；在其中一台（主控）里添加其他服务器的地址和「连接密钥」，
+# 主控把页面上的操作转发给选中的服务器。连接密钥 = 对方中转助手配置里的 api_token。
+SERVERS_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "servers.json")
+SERVERS = []
+SRV_LOCK = threading.Lock()
+LOCAL_ONLY = {"login", "logout", "servers_list", "server_save", "server_del", "servers_overview", "local_token_reset"}
+
+
+def load_servers():
+    global SERVERS
+    try:
+        with open(SERVERS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        SERVERS = d if isinstance(d, list) else []
+    except Exception:
+        SERVERS = []
+
+
+def save_servers():
+    tmp = SERVERS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(SERVERS, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SERVERS_PATH)
+
+
+def _server(sid):
+    with SRV_LOCK:
+        sv = next((s for s in SERVERS if s.get("id") == sid), None)
+    if not sv:
+        raise SuiError("没有这台服务器（可能已被删除），请在顶部重新选择")
+    return sv
+
+
+def _remote(sv, path, data=None, headers=None, timeout=120, method=None):
+    import ssl
+    h = {"X-RH-Token": sv.get("token", ""), "User-Agent": "relay-helper/%s" % VERSION}
+    h.update(headers or {})
+    req = urllib.request.Request(sv["url"] + path, data=data, headers=h, method=method)
+    hs = [urllib.request.ProxyHandler({})]
+    if sv.get("insecure"):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        hs.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*hs).open(req, timeout=timeout)
+
+
+def proxy_json(sid, action, body, timeout=120):
+    try:
+        sv = _server(sid)
+    except SuiError as e:
+        return {"ok": False, "error": str(e)}
+    name = sv.get("name") or sv["url"]
+    try:
+        with _remote(sv, "api/" + action, json.dumps(body or {}).encode(), {"Content-Type": "application/json"}, timeout) as r:
+            res = json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read().decode("utf-8") or "{}")
+        except Exception:
+            return {"ok": False, "error": "服务器「%s」返回 HTTP %s（检查地址是不是对方中转助手的完整地址，含路径）" % (name, e.code)}
+    except Exception as e:
+        msg = str(getattr(e, "reason", e))
+        if "CERTIFICATE" in msg.upper():
+            msg += "（对方用的是自签名证书的话，编辑这台服务器勾选「忽略证书校验」）"
+        return {"ok": False, "error": "连不上服务器「%s」：%s" % (name, msg)}
+    if isinstance(res, dict) and res.get("login"):
+        return {"ok": False, "error": "服务器「%s」的连接密钥不对（在那台服务器的「服务器」页复制本机连接密钥）" % name}
+    return res
+
+
+def _norm_url(u):
+    u = (u or "").strip()
+    if not re.match(r"^https?://[^/\s]+", u):
+        raise SuiError("地址要以 http:// 或 https:// 开头，例如 https://hk2.example.com:2097/kaide/")
+    u = u.split("#", 1)[0].split("?", 1)[0]
+    if "/api/" in u:
+        u = u.split("/api/", 1)[0]
+    return u.rstrip("/") + "/"
+
+
+def op_ping(body):
+    return {"version": VERSION, "public_host": CFG.get("public_host")}
+
+
+def op_servers_list(body):
+    with SRV_LOCK:
+        lst = [{"id": s["id"], "name": s.get("name", ""), "url": s["url"], "insecure": bool(s.get("insecure"))} for s in SERVERS]
+    return {"servers": lst, "local": {"public_host": CFG.get("public_host"), "url": base_url(), "token": CFG.get("api_token", "")}}
+
+
+def op_server_save(body):
+    url = _norm_url(body.get("url"))
+    sid = body.get("id") or secrets.token_hex(4)
+    with SRV_LOCK:
+        old = next((s for s in SERVERS if s.get("id") == sid), None)
+    token = (body.get("token") or "").strip() or (old or {}).get("token", "")
+    if not token:
+        raise SuiError("请填写对方的连接密钥")
+    sv = {"id": sid, "name": (body.get("name") or "").strip() or urllib.parse.urlsplit(url).hostname, "url": url,
+          "token": token, "insecure": bool(body.get("insecure"))}
+    if url.rstrip("/") == base_url().rstrip("/"):
+        raise SuiError("这是本机的地址，不用添加")
+    with SRV_LOCK:
+        dup = next((s for s in SERVERS if s.get("url") == url and s.get("id") != sid), None)
+    if dup:
+        raise SuiError("这个地址已经添加过了（「%s」）" % dup.get("name"))
+    # 先试连
+    with SRV_LOCK:
+        tmp = [s for s in SERVERS if s.get("id") != sid] + [sv]
+        bak = list(SERVERS)
+        SERVERS[:] = tmp
+    res = proxy_json(sid, "ping", {}, timeout=15)
+    if not res.get("ok"):
+        with SRV_LOCK:
+            SERVERS[:] = bak
+        raise SuiError(res.get("error") or "连接失败")
+    with SRV_LOCK:
+        save_servers()
+    return {"id": sid, "remote": {"version": res.get("version"), "public_host": res.get("public_host")}}
+
+
+def op_server_del(body):
+    with SRV_LOCK:
+        SERVERS[:] = [s for s in SERVERS if s.get("id") != body.get("id")]
+        save_servers()
+    return {}
+
+
+def op_local_token_reset(body):
+    save_config({"api_token": secrets.token_urlsafe(24)})
+    return {"token": CFG["api_token"]}
+
+
+def _summary(res):
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error", "")}
+    rows, now = res.get("relays") or [], res.get("now") or time.time()
+    groups = {}
+    for r in rows:
+        groups.setdefault(r.get("outbound_tag") or "#" + r["tag"], []).append(r)
+    soon = expired = 0
+    for g in groups.values():
+        ex = [r.get("expiry") or 0 for r in g if r.get("client_id")]
+        if ex and all(0 < e < now for e in ex):
+            expired += 1
+        elif any(now < e < now + 7 * 86400 for e in ex):
+            soon += 1
+    bad = sum(1 for h in (res.get("health") or {}).values() if h and h.get("ok") is False)
+    return {"ok": True, "public_host": res.get("public_host"), "version": res.get("version"), "lines": len(groups),
+            "nodes": len(rows), "soon": soon, "expired": expired, "bad": bad,
+            "rows": [{"tag": r["tag"], "landing": r.get("landing") or "", "expiry": r.get("expiry") or 0, "enable": r.get("enable")} for r in rows]}
+
+
+def op_servers_overview(body):
+    with SRV_LOCK:
+        lst = list(SERVERS)
+    out = [dict(_summary(dict(op_list({}), ok=True)), id="local", name="本机", url=base_url())]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(lambda s: (s, proxy_json(s["id"], "list", {}, timeout=25)), lst))
+    for s, r in res:
+        out.append(dict(_summary(r), id=s["id"], name=s.get("name", ""), url=s["url"]))
+    return {"servers": out}
+
+
 # ---------------------------------------------------------------- 备份/恢复 --
 # 和 s-ui 自带的「下载备份 / 恢复备份」一样：下载时现做一份发给浏览器（服务器上不留），恢复时上传文件。
 # 换服务器：旧机下载备份 → 域名解析到新机 → 新机装好 s-ui + 中转助手 → 上传恢复，节点/用户/到期/限额/证书全部带过去。
@@ -2424,6 +2771,10 @@ def make_backup(full=False, out=None):
                 tar.add(LIMITS_PATH, "limits.json")
             if os.path.exists(FO_PATH):
                 tar.add(FO_PATH, "failover.json")
+            if os.path.exists(SUBS_PATH):
+                tar.add(SUBS_PATH, "subs.json")
+            if os.path.exists(SERVERS_PATH):
+                tar.add(SERVERS_PATH, "servers.json")
             for fp in files:
                 tar.add(fp, "files" + fp)
     os.chmod(out, 0o600)
@@ -2471,7 +2822,7 @@ def restore_file(path):
                         nm = m.name
                         if not m.isfile() or ".." in nm.split("/") or nm.startswith("/"):
                             continue
-                        if nm in ("s-ui.db", "limits.json", "failover.json", "relay-helper-settings.json", "backup-info.json") or \
+                        if nm in ("s-ui.db", "limits.json", "failover.json", "subs.json", "servers.json", "relay-helper-settings.json", "backup-info.json") or \
                                 (nm.startswith("files/") and m.size < 1024 * 1024):
                             dest = os.path.join(td, "x", nm)
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -2556,6 +2907,16 @@ def restore_file(path):
             with FO_LOCK:
                 load_fo()
                 FO_STATE.clear()
+            sb = os.path.join(td, "x", "subs.json")
+            if os.path.exists(sb):
+                shutil.copyfile(sb, SUBS_PATH)
+            with SUBS_LOCK:
+                load_subs()
+            sv = os.path.join(td, "x", "servers.json")
+            if os.path.exists(sv):
+                shutil.copyfile(sv, SERVERS_PATH)
+                with SRV_LOCK:
+                    load_servers()
             up = _sui_conn_from_db(db)
             if isinstance(settings, dict):
                 for k in SETTING_KEYS:
@@ -2592,7 +2953,9 @@ def restore_file(path):
             "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port, "change_domain": op_change_domain})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port, "change_domain": op_change_domain, "sub_get": op_sub_get, "ping": op_ping, "servers_list": op_servers_list,
+            "server_save": op_server_save, "server_del": op_server_del, "servers_overview": op_servers_overview,
+            "local_token_reset": op_local_token_reset})
 
 
 # ------------------------------------------------------------- web server --
@@ -2661,6 +3024,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self):
+        return self._session() or self._token_ok()
+
+    def _token_ok(self):
+        t = self.headers.get("X-RH-Token") or ""
+        return bool(t and CFG.get("api_token") and hmac.compare_digest(t, CFG["api_token"]))
+
+    def _remote_sid(self):
+        """页面上选了别的服务器：返回服务器 id（只有用页面登录的会话才能转发，用密钥调用的不再往下转）。"""
+        sid = self.headers.get("X-RH-Server") or ""
+        return sid if sid and sid != "local" and self._session() else ""
+
+    def _session(self):
         ck = self.headers.get("Cookie") or ""
         m = re.search(r"rh_sess=([A-Za-z0-9_\-]+)", ck)
         if not m:
@@ -2682,6 +3057,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
+        if path.startswith(p + "sub/"):  # 客户订阅，不需要登录，靠链接里的随机令牌
+            return serve_sub(self, path[len(p + "sub/"):].strip("/"), self.path.split("?", 1)[1] if "?" in self.path else "")
         if path == p + "api/whoami":  # 只返回随机实例号，用于检查新域名是否指向本机
             return self._send(200, {"id": INSTANCE})
         if path == p + "api/backup_download":
@@ -2689,6 +3066,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(401, "请先登录", "text/plain; charset=utf-8")
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             full = (q.get("full") or ["0"])[0] == "1"
+            sid = (q.get("srv") or [""])[0]
+            if sid and sid != "local" and self._session():
+                try:
+                    sv = _server(sid)
+                    with _remote(sv, "api/backup_download?full=%d" % full, timeout=600) as r:
+                        self.send_response(200)
+                        for hk in ("Content-Type", "Content-Length", "Content-Disposition"):
+                            if r.headers.get(hk):
+                                self.send_header(hk, r.headers[hk])
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        shutil.copyfileobj(r, self.wfile, 256 * 1024)
+                    return
+                except Exception as e:
+                    return self._send(502, "从服务器下载备份失败：%s" % e, "text/plain; charset=utf-8")
             try:
                 fp, name = make_backup(full)
             except Exception as e:
@@ -2728,6 +3120,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"ok": False, "error": "没有收到文件"})
         if n > RESTORE_MAX:
             return self._send(413, {"ok": False, "error": "文件太大（%.0f MB）" % (n / 1048576)})
+        sid = self._remote_sid()
+        if sid:  # 转发给选中的服务器去恢复
+            try:
+                sv = _server(sid)
+                with tempfile.TemporaryFile(dir=os.path.dirname(CONFIG_PATH)) as tf:
+                    left = n  # 只读上传的这 n 个字节（连接是长连接，不会自己结束）
+                    while left > 0:
+                        chunk = self.rfile.read(min(256 * 1024, left))
+                        if not chunk:
+                            break
+                        tf.write(chunk)
+                        left -= len(chunk)
+                    tf.seek(0)
+                    with _remote(sv, "api/restore_upload", data=tf, timeout=600,
+                                 headers={"Content-Type": "application/octet-stream", "Content-Length": str(n)}) as r:
+                        return self._send(200, r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return self._send(200, {"ok": False, "error": "服务器返回 HTTP %s" % e.code})
+            except Exception as e:
+                return self._send(200, {"ok": False, "error": "转发失败：%s" % e})
         fd, tmp = tempfile.mkstemp(prefix="rh-upload-", dir=os.path.dirname(CONFIG_PATH))
         try:
             with os.fdopen(fd, "wb") as f:  # 边收边写硬盘，不占内存
@@ -2794,6 +3206,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True}, headers={"Set-Cookie": "rh_sess=; Path=%s; Max-Age=0" % p})
         if not self._authed():
             return self._send(401, {"ok": False, "error": "请先登录", "login": True})
+        sid = self._remote_sid()
+        if sid and action not in LOCAL_ONLY:
+            return self._send(200, proxy_json(sid, action, body))
         fn = OPS.get(action)
         if not fn:
             return self._send(404, {"ok": False, "error": "unknown action"})
@@ -2824,6 +3239,10 @@ def main():
         print("警告：暂时无法登录 s-ui：", e)
     load_limits()
     load_fo()
+    load_subs()
+    load_servers()
+    if not CFG.get("api_token"):
+        save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=failover_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
