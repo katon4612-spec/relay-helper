@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.10.2"
+VERSION = "1.11.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2267,6 +2267,76 @@ def failover_loop():
         time.sleep(max(10, int(CFG.get("failover_interval_sec") or 30)))
 
 
+# ------------------------------------------------------------ 更换链接域名 --
+INSTANCE = secrets.token_hex(8)  # 用来确认「新域名访问到的就是这台服务器上的这个程序」
+HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
+
+
+def _domain_points_here(domain):
+    import ssl
+    scheme = "https" if CFG.get("cert_file") else "http"
+    url = "%s://%s:%s%sapi/whoami" % (scheme, domain, CFG["port"], CFG["path"])
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(url, timeout=8, context=ctx) as r:
+            return json.loads(r.read().decode()).get("id") == INSTANCE, ""
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def op_change_domain(body):
+    """
+    把客户链接里的服务器地址换成新域名：改中转助手的 public_host、s-ui 的面板/订阅域名（如果设置了），
+    再重新保存每个用户，让 s-ui 用新域名重新生成链接。客户需要拿新链接。
+    """
+    domain = (body.get("domain") or "").strip().lower().rstrip(".")
+    if not (HOST_RE.match(domain) or is_ip(domain)):
+        raise SuiError("域名格式不对")
+    old = CFG.get("public_host") or ""
+    ip = resolve(domain) or ""
+    if not body.get("force"):
+        ok, err = _domain_points_here(domain)
+        if not ok:
+            return {"ok_here": False, "resolved": ip,
+                    "error": "通过 %s 访问不到这台服务器上的中转助手（%s 解析到 %s）。请先把域名解析到这台服务器的 IP；"
+                             "如果确定已经解析对了（有的云服务器从本机访问不了自己的公网地址），可以强制更换。" % (domain, domain, ip or "无记录")}
+    with LOCK:
+        st = SUI.get("settings") or {}
+        sui_changed = False
+        for k in ("webDomain", "subDomain"):
+            if st.get(k) and st.get(k) != domain:
+                st[k] = domain
+                sui_changed = True
+        if sui_changed:
+            SUI.save("settings", "edit", st)
+            subprocess.run(CFG.get("sui_restart_cmd") or "systemctl restart s-ui", shell=True, timeout=90, capture_output=True)
+        save_config({"public_host": domain, "sui_host": domain if st.get("webDomain") else ""})
+        globals()["SUI"] = Sui(CFG)
+        if sui_changed:
+            for _ in range(30):  # 等 s-ui 起来
+                try:
+                    SUI.get("settings")
+                    break
+                except Exception:
+                    time.sleep(1)
+        n, errs = 0, []
+        for c in SUI.load_all().get("clients") or []:
+            try:
+                SUI.save("clients", "edit", full_client(c["id"]))  # s-ui 保存用户时按请求的域名重新生成链接
+                n += 1
+            except Exception as e:
+                errs.append("%s：%s" % (c.get("name"), e))
+        core = "ok" if wait_core(8) else ensure_core()
+    return {"ok_here": True, "old": old, "domain": domain, "clients": n, "errors": errs[:20], "sui_changed": sui_changed,
+            "core": core, "https_note": bool(CFG.get("cert_file"))}
+
+
+def op_whoami(body):
+    return {"id": INSTANCE}
+
+
 # ---------------------------------------------------------------- 备份/恢复 --
 # 和 s-ui 自带的「下载备份 / 恢复备份」一样：下载时现做一份发给浏览器（服务器上不留），恢复时上传文件。
 # 换服务器：旧机下载备份 → 域名解析到新机 → 新机装好 s-ui + 中转助手 → 上传恢复，节点/用户/到期/限额/证书全部带过去。
@@ -2516,7 +2586,7 @@ def restore_file(path):
             "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port, "change_domain": op_change_domain})
 
 
 # ------------------------------------------------------------- web server --
@@ -2574,6 +2644,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
+        if path == p + "api/whoami":  # 只返回随机实例号，用于检查新域名是否指向本机
+            return self._send(200, {"id": INSTANCE})
         if path == p + "api/backup_download":
             if not self._authed():
                 return self._send(401, "请先登录", "text/plain; charset=utf-8")

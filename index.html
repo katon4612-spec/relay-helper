@@ -344,9 +344,24 @@ async function renderSettings(){
   <div class="row"><label>每隔几分钟检测（0=关闭）<input id="hi" type="number" min="0" value="${esc(s.health_interval_min)}" style="width:120px"></label>
   <label>连续失败几次才告警<input id="hf" type="number" min="1" value="${esc(s.health_fail_times)}" style="width:120px"></label></div>
   <p class="hint">只检测有在用用户的线路（已停用、已过期的不检测）。落地不通和恢复都会通过 Telegram 通知；「线路管理」的检测列会显示最新结果。</p></div>
-  <div class="row"><button class="pri" id="ssave">保存设置</button></div>`;
+  <div class="row"><button class="pri" id="ssave">保存设置</button></div>
+  <div class="card" style="margin-top:16px"><h2>客户链接里的服务器域名</h2>
+  <p class="hint">当前：<b class="mono">${esc(state.host||"")}</b>。换服务器或换域名后，在这里改成<b>解析到这台服务器</b>的域名，所有节点的链接和二维码会重新生成，然后把新链接发给客户（线路管理里「导出链接」）。</p>
+  <div class="row"><label>新域名<input id="ndom" style="width:280px" placeholder="如 hk2.example.com"></label><button id="dchg">更换并更新所有链接</button></div><p id="dmsg"></p></div>`;
   const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2")});
   $("#ssave").onclick=async()=>{try{await api("save_settings",collect());toast("已保存")}catch(e){toast(e.message)}};
+  const chg=async force=>{const d=$("#ndom").value.trim();if(!d)return;
+    if(!force&&!confirm(`把所有节点链接里的服务器地址改成 ${d}？\n\n改完后旧链接（${state.host}）不会再指向这台服务器，要把新链接发给客户。过程中 s-ui 可能重启一次（约 3 秒断线）。`))return;
+    const b=$("#dchg");b.disabled=true;b.innerHTML='<span class="spin"></span> 处理中…';H("#dmsg","");
+    try{const x=await api("change_domain",{domain:d,force:!!force});
+      if(!x.ok_here){H("#dmsg",`<div class="warnbox">${esc(x.error)}<div style="margin-top:8px"><button class="danger sm" id="dforce">我确定已解析好，强制更换</button></div></div>`);$("#dforce").onclick=()=>chg(true);return}
+      state.host=x.domain;$("#hostinfo").textContent=x.domain;
+      H("#dmsg",`<div class="okbox" style="padding:10px;border-radius:8px;background:#ecfdf5">✓ 已改为 <b>${esc(x.domain)}</b>，重新生成了 ${x.clients} 个用户的链接${x.sui_changed?"（s-ui 面板域名也一起改了）":""}。到「线路管理」全选后「导出链接」发给客户即可。
+      ${x.errors&&x.errors.length?`<div class="err">失败 ${x.errors.length} 个：${esc(x.errors.join("；"))}</div>`:""}
+      ${x.https_note?`<div class="hint">中转助手页面的 HTTPS 证书还是旧域名的，用新域名打开会提示不安全。在服务器执行 <span class="mono">bash /opt/relay-helper/https.sh /opt/relay-helper force</span> 重新申请。</div>`:""}</div>`);
+      $("#ndom").value="";
+    }catch(e){H("#dmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="更换并更新所有链接"}}};
+  $("#dchg").onclick=()=>chg(false);
   $("#tgtest").onclick=async()=>{const b=$("#tgtest");b.disabled=true;try{await api("save_settings",collect());await api("tg_test");toast("测试消息已发送，请查看 Telegram")}catch(e){toast(e.message,6000)}finally{b.disabled=false}};
 }
 
