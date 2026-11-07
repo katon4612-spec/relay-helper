@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -68,6 +68,7 @@ DEFAULTS = {
     "backup_hour": 4,
     "backup_keep": 14,
     "backup_to_tg": True,
+    "backup_full": False,
     "reserve_ports": True,
     "cert_file": "",
     "key_file": "",
@@ -1551,7 +1552,7 @@ def drop_group_limits(okeys):
 
 
 # ------------------------------------------------------- 设置 / Telegram --
-SETTING_KEYS = ("tg_token", "tg_chat", "health_interval_min", "health_fail_times", "backup_hour", "backup_keep", "backup_to_tg")
+SETTING_KEYS = ("tg_token", "tg_chat", "health_interval_min", "health_fail_times", "backup_hour", "backup_keep", "backup_to_tg", "backup_full")
 
 
 def save_config(updates):
@@ -1600,16 +1601,33 @@ def tg_send_file(path, caption=""):
         parts = []
         for k, v in (("chat_id", str(CFG["tg_chat"])), ("caption", caption[:1000])):
             parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode())
-        with open(path, "rb") as f:
-            data = f.read()
-        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-                      % (boundary, os.path.basename(path))).encode() + data + b"\r\n")
-        parts.append(("--%s--\r\n" % boundary).encode())
-        req = urllib.request.Request("%s/bot%s/sendDocument" % (CFG.get("tg_api") or "https://api.telegram.org", CFG["tg_token"]), data=b"".join(parts),
-                                     headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        size = os.path.getsize(path)
+        if size > 49 * 1024 * 1024:
+            return False, "文件 %.1f MB 超过 Telegram 机器人 50MB 上限" % (size / 1048576)
+        head = b"".join(parts) + ("--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                                    % (boundary, os.path.basename(path))).encode()
+        tail = ("\r\n--%s--\r\n" % boundary).encode()
+
+        def body():  # 分块读，不把整个文件读进内存
+            yield head
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            yield tail
+        req = urllib.request.Request("%s/bot%s/sendDocument" % (CFG.get("tg_api") or "https://api.telegram.org", CFG["tg_token"]), data=body(),
+                                     headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary,
+                                              "Content-Length": str(len(head) + size + len(tail))})
+        with urllib.request.urlopen(req, timeout=120) as r:
             res = json.loads(r.read().decode())
         return bool(res.get("ok")), res.get("description", "")
+    except urllib.error.HTTPError as e:
+        try:
+            return False, json.loads(e.read().decode()).get("description", str(e))
+        except Exception:
+            return False, str(e)
     except Exception as e:
         return False, str(e)
 
@@ -1634,7 +1652,7 @@ def op_save_settings(body):
                 continue  # 没改
         elif k == "tg_chat":
             v = str(v or "").strip()
-        elif k == "backup_to_tg":
+        elif k in ("backup_to_tg", "backup_full"):
             v = bool(v)
         elif k == "health_interval_min":
             v = max(0, int(v or 0))
@@ -1753,10 +1771,21 @@ def make_backup(reason="manual"):
         with dst:
             src.backup(dst)  # 在线一致性快照，s-ui 运行中也安全
         src.close()
+        if not CFG.get("backup_full"):
+            # 默认不带流量统计历史（stats，每 10 秒每个节点一条，几百 MB）和操作记录（changes）：
+            # 只用于 s-ui 面板画曲线，恢复节点用不上；每个用户的累计流量在 clients 表里，照常备份
+            for tb in ("stats", "changes"):
+                try:
+                    dst.execute('DELETE FROM "%s"' % tb)
+                except sqlite3.Error:
+                    pass
+            dst.commit()
+            dst.execute("VACUUM")
         dst.close()
         meta = os.path.join(td, "backup-info.json")
         with open(meta, "w", encoding="utf-8") as f:
-            json.dump({"time": stamp, "reason": reason, "host": CFG["public_host"], "version": VERSION, "sui_db": db}, f, ensure_ascii=False)
+            json.dump({"time": stamp, "reason": reason, "host": CFG["public_host"], "version": VERSION, "sui_db": db,
+                       "full": bool(CFG.get("backup_full"))}, f, ensure_ascii=False)
         with tarfile.open(out + ".tmp", "w:gz") as tar:
             tar.add(snap, "s-ui.db")
             tar.add(meta, "backup-info.json")
@@ -1803,6 +1832,7 @@ def backup_loop():
                     ok, err = tg_send_file(path, "中转助手每日备份（%s）%s" % (CFG["public_host"], os.path.basename(path)))
                     if not ok:
                         sys.stderr.write("tg backup: %s\n" % err)
+                        tg_send("⚠️ 中转助手（%s）今日备份已保存在服务器，但没能发到 Telegram：%s" % (CFG["public_host"], err))
         except Exception as e:
             sys.stderr.write("backup: %s\n" % e)
             tg_send("❌ 中转助手（%s）自动备份失败：%s" % (CFG["public_host"], e))
@@ -1939,10 +1969,15 @@ class Handler(BaseHTTPRequestHandler):
             fp = os.path.join(backup_dir(), name)
             if not BACKUP_RE.match(name) or not os.path.isfile(fp):
                 return self._send(404, "not found", "text/plain")
-            with open(fp, "rb") as f:
-                data = f.read()
-            return self._send(200, data, "application/gzip",
-                              headers={"Content-Disposition": "attachment; filename=\"%s\"" % name})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(os.path.getsize(fp)))
+            self.send_header("Content-Disposition", "attachment; filename=\"%s\"" % name)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(fp, "rb") as f:  # 分块发送，不把整个文件读进内存
+                shutil.copyfileobj(f, self.wfile, 256 * 1024)
+            return
         if path == p.rstrip("/"):
             return self._send(302, "", headers={"Location": p})
         if path == p or path == p + "index.html":

@@ -43,7 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/
 - **HTTPS**：安装/升级时会询问是否启用。中转机地址是域名、且 80 端口空闲时，自动用 acme.sh 申请 Let's Encrypt 证书并自动续签（需要云安全组放行 TCP 80）；否则使用自签名证书（同样加密，浏览器首次打开点「继续访问」）。之后单独重新配置：`bash /opt/relay-helper/https.sh /opt/relay-helper force`
 - **Telegram 通知**：在「设置」页填 Bot Token 和 Chat ID，可发送测试消息。
 - **落地自动巡检**：默认每 5 分钟检测所有在用线路的落地，连续 2 次不通发 Telegram 告警，恢复后通知；「线路管理」检测列显示最新结果。
-- **自动备份**：默认每天 4 点备份 s-ui 数据库、限额记录和工具配置，保留 14 份（`/opt/relay-helper/backups`），可同时发到 Telegram 异地保存；「备份」页可手动备份、下载、恢复（恢复前自动备份当前状态，不会恢复工具自己的登录配置）。
+- **自动备份**：默认每天 4 点备份 s-ui 数据库、限额记录和工具配置，保留 14 份（`/opt/relay-helper/backups`），可同时发到 Telegram 异地保存；默认不含 s-ui 的流量统计历史（stats 表，占体积的 99%），一份只有几十 KB，节点/客户/到期/流量用量都完整保留，需要历史曲线可在「设置」里勾选「包含流量统计历史」；下载和发送都是流式的，不占内存；超过 Telegram 50MB 上限会发消息提醒；「备份」页可手动备份、下载、恢复（恢复前自动备份当前状态，不会恢复工具自己的登录配置）。
 
 ## 需要知道的
 

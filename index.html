@@ -346,10 +346,11 @@ async function renderSettings(){
   <div class="card"><h2>自动备份</h2>
   <div class="row"><label>每天几点备份（服务器时间，-1=关闭）<input id="bh" type="number" min="-1" max="23" value="${esc(s.backup_hour)}" style="width:120px"></label>
   <label>保留几份<input id="bk" type="number" min="1" max="365" value="${esc(s.backup_keep)}" style="width:120px"></label>
-  <label class="ck" style="margin-top:18px"><input type="checkbox" id="btg" ${s.backup_to_tg?"checked":""}>每日备份同时发到 Telegram（异地保存）</label></div>
-  <p class="hint">备份内容：s-ui 数据库（所有节点、用户、路由）、限额记录、中转助手配置。</p></div>
+  <label class="ck" style="margin-top:18px"><input type="checkbox" id="btg" ${s.backup_to_tg?"checked":""}>每日备份同时发到 Telegram（异地保存）</label>
+  <label class="ck" style="margin-top:18px"><input type="checkbox" id="bfull" ${s.backup_full?"checked":""}>包含流量统计历史（文件会大很多）</label></div>
+  <p class="hint">备份内容：s-ui 数据库（所有节点、用户、路由、每个用户的累计流量）、限额记录、中转助手配置。默认不含 s-ui 面板的流量曲线历史，备份通常只有几百 KB；勾选后可能有上百 MB，超过 50MB 发不了 Telegram。</p></div>
   <div class="row"><button class="pri" id="ssave">保存设置</button></div>`;
-  const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2"),backup_hour:parseInt($("#bh").value),backup_keep:parseInt($("#bk").value||"14"),backup_to_tg:$("#btg").checked});
+  const collect=()=>({tg_token:$("#tgt").value.trim(),tg_chat:$("#tgc").value.trim(),health_interval_min:parseInt($("#hi").value||"0"),health_fail_times:parseInt($("#hf").value||"2"),backup_hour:parseInt($("#bh").value),backup_keep:parseInt($("#bk").value||"14"),backup_to_tg:$("#btg").checked,backup_full:$("#bfull").checked});
   $("#ssave").onclick=async()=>{try{await api("save_settings",collect());toast("已保存")}catch(e){toast(e.message)}};
   $("#tgtest").onclick=async()=>{const b=$("#tgtest");b.disabled=true;try{await api("save_settings",collect());await api("tg_test");toast("测试消息已发送，请查看 Telegram")}catch(e){toast(e.message,6000)}finally{b.disabled=false}};
 }
