@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.8.3"
+VERSION = "1.9.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -979,6 +979,72 @@ def op_replace(body):
                 save_fo()
     chk = op_check({"tags": [row["outbound_tag"]]})["results"][0]
     return {"ok": True, "landing": "%s:%s" % (ob.get("server"), ob.get("server_port")), "check": chk}
+
+
+def full_inbound(iid):
+    r = SUI.get("inbounds", id=str(iid))
+    lst = r.get("inbounds") if isinstance(r, dict) else r
+    if not lst:
+        raise SuiError("找不到入站 %s" % iid)
+    return lst[0]
+
+
+def op_change_port(body):
+    """
+    更换入站端口（客户当地封端口时用）。端口在客户链接里，换完要把新链接发给客户。
+    tags: 要换的节点；port: 只换一个节点时可指定端口，留空随机。
+    """
+    tags = list(dict.fromkeys(body.get("tags") or []))
+    want = body.get("port")
+    if want not in (None, ""):
+        want = int(want)
+        if len(tags) != 1:
+            raise SuiError("指定端口时一次只能换一个节点")
+        if not 1 <= want <= 65535:
+            raise SuiError("端口范围 1-65535")
+    else:
+        want = None
+    out, changed = [], []
+    with LOCK:
+        data = SUI.load_all()
+        rows = {r["tag"]: r for r in build_relays(data)}
+        taken = used_ports(data)
+        for t in tags:
+            row = rows.get(t)
+            if not row:
+                out.append({"tag": t, "ok": False, "error": "不存在"})
+                continue
+            try:
+                inb = full_inbound(row["inbound_id"])
+                udp = inb.get("type") in ("hysteria2", "hysteria", "tuic")
+                old = inb.get("listen_port")
+                if want is not None:
+                    if want == old:
+                        raise SuiError("和原端口相同")
+                    if want in taken or not port_free(want, udp):
+                        raise SuiError("端口 %d 已被占用" % want)
+                    port = want
+                    taken.add(port)
+                else:
+                    port = pick_port(taken, udp)
+                inb["listen_port"] = port
+                if isinstance(inb.get("out_json"), dict) and "server_port" in inb["out_json"]:
+                    inb["out_json"]["server_port"] = port
+                SUI.save("inbounds", "edit", inb)
+                fw = open_firewall(port, udp)
+                changed.append(t)
+                out.append({"tag": t, "ok": True, "old": old, "port": port, "firewall": fw, "client_id": row.get("client_id"), "type": inb.get("type")})
+            except Exception as e:
+                out.append({"tag": t, "ok": False, "error": str(e)})
+        core = ensure_core() if changed else "ok"
+    for r in out:
+        if r.get("ok") and r.get("client_id"):
+            try:
+                r["links"] = client_links(r["client_id"])
+                r["svg"] = qr_svg(r["links"][0]) if r["links"] else ""
+            except Exception as e:
+                r["links"], r["error"] = [], "端口已换，但获取新链接失败：%s" % e
+    return {"results": out, "core": core}
 
 
 def full_client(cid):
@@ -2251,7 +2317,7 @@ def restore_file(path):
             "backup_time": info.get("time", ""), "before": before, "warnings": warnings}
 
 
-OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status})
+OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kick": op_kick, "get_settings": op_get_settings, "save_settings": op_save_settings, "tg_test": op_tg_test, "failover_set": op_failover_set, "failover_switch": op_failover_switch, "failover_status": op_failover_status, "change_port": op_change_port})
 
 
 # ------------------------------------------------------------- web server --

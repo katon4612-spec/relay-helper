@@ -435,7 +435,7 @@ function drawTable(){
    <button class="sm" id="seloff" ${offG.length?"":"disabled"} title="整条线路的客户端都已停用、但没过期（手动停用或流量用完）">选中已停用（${offG.length}）</button>
    <button class="sm" id="selexp" ${expG.length?"":"disabled"} title="整条线路的客户端都已过期">选中已过期（${expG.length}）</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
    <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
-   <button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
+   <button class="sm" id="bport">批量换端口</button><button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
   $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>流量</th><th>设备</th><th>检测</th><th>操作</th></tr>
   ${gs.map(g=>{const n=g.length,m=g[0],on=g.every(r=>state.sel.has(r.tag));
@@ -454,6 +454,7 @@ function drawTable(){
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
   <button class="sm" data-a="lim" data-t="${esc(r.tag)}">限额</button>`:""}
+  <button class="sm" data-a="port" data-t="${esc(r.tag)}" title="客户当地封了这个端口时用，换完要把新链接发给客户">换端口</button>
   <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</tbody>`}).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
   if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
@@ -468,8 +469,8 @@ function drawTable(){
     const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
     $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
-    $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+    $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bport").onclick=()=>portDlg([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -517,6 +518,38 @@ function replaceDlg(tag){
       H("#rmsg",x.check.ok?`<span class="tag ok">已替换为 ${esc(x.landing)}，连通 ${x.check.delay}ms</span>`:`<span class="tag bad">已替换为 ${esc(x.landing)}，但检测不通：${esc(x.check.error)}</span>`);
       await loadRelays();drawTable()}catch(e){H("#rmsg",`<span class="err">${esc(e.message)}</span>`)}finally{if(b.isConnected){b.disabled=false;b.textContent="替换并检测"}}};
 }
+/* ---------------- 换端口 ---------------- */
+function portDlg(tags){
+  const rs=tags.map(byTag).filter(Boolean);if(!rs.length)return;
+  const one=rs.length===1;
+  modal(`<h2 style="margin-top:0">更换端口${one?"："+esc(rs[0].tag):`（${rs.length} 个节点）`}</h2>
+  <p class="hint">客户当地封了端口时用。换完后<b>旧链接失效，要把新链接/二维码发给客户</b>；落地、到期、流量、设备限额都不变。会重启 s-ui（约 3 秒断线）。</p>
+  ${one?`<div class="row"><label>当前端口<input value="${esc(rs[0].port)}" disabled style="width:110px"></label>
+  <label>新端口（留空随机）<input id="npt" type="number" min="1" max="65535" style="width:160px" placeholder="随机"></label></div>`
+  :`<div class="hint" style="max-height:160px;overflow:auto">${rs.map(r=>`${esc(r.tag)} <span class="mono">${esc(r.port)}</span>`).join("<br>")}</div><p class="hint">每个节点随机分配一个新端口。</p>`}
+  <p class="hint">记得到云服务商安全组放行新端口（系统防火墙会自动放行）。</p>
+  <div class="row" style="margin-top:12px"><button class="pri" id="pok">更换端口</button><button id="pcl">取消</button></div><p id="pmsg"></p>`);
+  $("#pcl").onclick=closeModal;
+  $("#pok").onclick=async()=>{const b=$("#pok");b.disabled=true;b.innerHTML='<span class="spin"></span> 更换中…';
+    try{const body={tags:rs.map(r=>r.tag)};if(one&&$("#npt").value.trim())body.port=parseInt($("#npt").value);
+      const x=await api("change_port",body);const ok=x.results.filter(r=>r.ok),bad=x.results.filter(r=>!r.ok);
+      if(!ok.length){H("#pmsg",`<span class="err">${esc(bad.map(r=>r.tag+"："+r.error).join("；"))}</span>`);b.disabled=false;b.textContent="更换端口";return}
+      await loadRelays();drawTable();
+      const items=ok.map(r=>({name:r.tag,svg:r.svg,port:r.port,uri:(r.links||[])[0]||""}));
+      modal(`<h2 style="margin-top:0">已更换 ${ok.length} 个节点的端口${x.core==="down"?coreMsg("down"):""}</h2>
+      ${bad.length?`<p class="err">${esc(bad.map(r=>r.tag+"："+r.error).join("；"))}</p>`:""}
+      <p class="hint">请把新链接发给客户，旧链接已失效。</p>
+      <div style="max-height:52vh;overflow:auto">${ok.map((r,i)=>`<div style="border-bottom:1px solid var(--line);padding:8px 0;display:flex;gap:12px;align-items:center">
+        <div class="pqr" style="width:110px;height:110px;flex:none">${(r.svg||"").replace("<svg",'<svg style="width:110px;height:110px;display:block"')}</div><div style="min-width:0"><b>${esc(r.tag)}</b> <span class="mono">${esc(r.old)} → <b>${esc(r.port)}</b></span>
+        <p class="mono" style="word-break:break-all;font-size:12px;margin:4px 0">${esc(items[i].uri)}</p><button class="sm" data-pcp="${i}">复制链接</button></div></div>`).join("")}</div>
+      <div class="row" style="margin-top:12px"><button class="pri" id="pall">复制全部链接</button><button id="pzip">下载全部二维码</button><button id="pcl2">关闭</button></div>`);
+      document.querySelectorAll("[data-pcp]").forEach(b=>b.onclick=()=>copy(items[+b.dataset.pcp].uri));
+      $("#pall").onclick=()=>copy(items.map(x=>x.uri).join("\n"));
+      $("#pzip").onclick=()=>items.length===1?downloadQR(items[0].name,items[0].svg,items[0].port):downloadAllZip(items,"换端口_二维码");
+      $("#pcl2").onclick=closeModal;
+    }catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`);if(b.isConnected){b.disabled=false;b.textContent="更换端口"}}};
+}
+
 /* ---------------- 备用落地 ---------------- */
 const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
 const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
