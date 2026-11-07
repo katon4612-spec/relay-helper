@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -395,11 +395,13 @@ def build_relays(data):
     clients = data.get("clients") or []
     cfg = data.get("config") or {}
     rules = ((cfg.get("route") or {}).get("rules")) or []
-    route_of = {}
+    route_of, route_user = {}, {}
     for r in rules:
         if r.get("action", "route") == "route" and r.get("outbound"):
             for t in r.get("inbound") or []:
                 route_of.setdefault(t, r["outbound"])
+                for u in r.get("auth_user") or []:
+                    route_user.setdefault((t, u), r["outbound"])
     clients_by_inb = {}
     for c in clients:
         try:
@@ -412,15 +414,21 @@ def build_relays(data):
             clients_by_inb.setdefault(i, []).append(c)
     rows = []
     for inb in inbounds:
-        tag = inb.get("tag")
-        ot = route_of.get(tag)
-        ob = outbounds.get(ot) if ot else None
+        itag = inb.get("tag")
         cl = clients_by_inb.get(inb.get("id"), [])
-        main = next((c for c in cl if c.get("name") == tag), cl[0] if cl else None)
-        rows.append({
+        if is_shared(itag):
+            # 共用入站（如 443）：每个用户一行，按 auth_user 规则找各自的落地
+            units = [(c.get("name"), c, route_user.get((itag, c.get("name")))) for c in cl]
+        else:
+            units = [(itag, next((c for c in cl if c.get("name") == itag), cl[0] if cl else None), route_of.get(itag))]
+        for tag, main, ot in units:
+          ob = outbounds.get(ot) if ot else None
+          rows.append({
             "tag": tag,
+            "inbound_tag": itag,
+            "shared": is_shared(itag),
             "inbound_id": inb.get("id"),
-            "type": inb.get("type"),
+            "type": "vless443" if is_shared(itag) else inb.get("type"),
             "port": inb.get("listen_port"),
             "outbound_tag": ot,
             "outbound_id": ob.get("id") if ob else None,
@@ -430,7 +438,7 @@ def build_relays(data):
             "landing_info": landing_info(ob) if ob else None,
             "client_id": main.get("id") if main else None,
             "client_name": main.get("name") if main else None,
-            "clients": len(cl),
+            "clients": 1 if is_shared(itag) else len(cl),
             "enable": bool(main.get("enable")) if main else None,
             "expiry": main.get("expiry") if main else None,
             "up": main.get("up") if main else 0,
@@ -444,7 +452,7 @@ def build_relays(data):
     for r in rows:
         r["siblings"] = [{"tag": x["tag"], "type": x["type"], "port": x["port"]}
                          for x in by_out.get(r["outbound_tag"], []) if x["tag"] != r["tag"]]
-    rows.sort(key=lambda r: r.get("inbound_id") or 0, reverse=True)
+    rows.sort(key=lambda r: (r.get("inbound_id") or 0, r.get("client_id") or 0), reverse=True)
     return rows
 
 
@@ -678,7 +686,7 @@ def groups_by_landing(rows, data):
     for r in rows:
         if r.get("outbound_tag") in obs:
             by_out.setdefault(r["outbound_tag"], []).append(r)
-    order = {"vless": 0, "hysteria2": 1, "socks": 2}
+    order = {"vless": 0, "vless443": 1, "hysteria2": 2, "socks": 3}
     out = []
     for ot, rs in by_out.items():
         rs.sort(key=lambda r: (order.get(r["type"], 9), r.get("inbound_id") or 0))
@@ -688,14 +696,61 @@ def groups_by_landing(rows, data):
 
 
 PROTO_SUFFIX = {"vless": "", "hysteria2": "-HY2", "socks": "-S5"}
-PROTO_LABEL = {"vless": "VLESS-Reality", "hysteria2": "Hysteria2", "socks": "SOCKS5"}
+PROTO_LABEL = {"vless": "VLESS-Reality", "hysteria2": "Hysteria2", "socks": "SOCKS5", "vless443": "VLESS-443共用"}
+PROTO_SUFFIX["vless443"] = "-443"
+SHARED_PREFIX = "共用"
+
+
+def is_shared(tag):
+    """共用入站：多个客户共用一个端口（默认 443），按用户名分流到各自落地。"""
+    return isinstance(tag, str) and re.fullmatch(SHARED_PREFIX + r"\d+-VLESS", tag) is not None
+
+
+def _ensure_shared(data, tls_id, taken_ports):
+    """找到或建好共用 VLESS-Reality 入站，返回 (tag, id, 需要加的兜底规则)。"""
+    port = int(CFG.get("shared_port") or 443)
+    tag = "%s%d-VLESS" % (SHARED_PREFIX, port)
+    for i in data.get("inbounds") or []:
+        if i.get("tag") == tag:
+            return tag, i["id"], []
+    for i in data.get("inbounds") or []:
+        if str(i.get("listen_port")) == str(port):
+            raise SuiError("端口 %d 已被节点「%s」占用。先在线路管理里用「换端口」把它换到别的端口，再建共用节点" % (port, i.get("tag")))
+    if not port_free(port, False):
+        raise SuiError("端口 %d 被这台服务器上的其他程序占用（比如 nginx），共用节点用不了" % port)
+    inb = {"type": "vless", "tag": tag, "listen": "::", "listen_port": port, "tls_id": tls_id, "addrs": [],
+           "out_json": {}, "transport": {}}
+    res = SUI.save("inbounds", "new", inb, init_users="")
+    iid = next((i["id"] for i in (res or {}).get("inbounds") or [] if i.get("tag") == tag), None)
+    if not iid:
+        raise SuiError("共用入站创建后未找到 id")
+    taken_ports.add(port)
+    data.setdefault("inbounds", []).append({"id": iid, "tag": tag, "listen_port": port, "type": "vless"})
+    open_firewall(port, False)
+    # 兜底：共用入站上没匹配到任何用户规则的连接一律拒绝
+    return tag, iid, [{"inbound": [tag], "action": "reject"}]
+
+
+def _make_shared_user(name, shared, expiry, group, outbound_tag):
+    tag, iid, extra = shared
+    client = {"enable": True, "name": name, "config": client_config(name), "inbounds": [iid],
+              "links": [], "volume": 0, "expiry": int(expiry or 0), "up": 0, "down": 0,
+              "desc": "中转助手创建（共用 %s）" % tag, "group": group or ""}
+    res = SUI.save("clients", "new", client)
+    cid = next((c["id"] for c in (res or {}).get("clients") or [] if c.get("name") == name), None)
+    if not cid:
+        raise SuiError("用户创建后未找到 id")
+    port = int(CFG.get("shared_port") or 443)
+    return {"name": name, "protocol": "vless443", "port": port, "client_id": cid, "ok": True, "firewall": "",
+            "outbound": outbound_tag, "shared": True,
+            "rules": [{"inbound": [tag], "auth_user": [name], "action": "route", "outbound": outbound_tag}] + extra}
 
 
 def _prepare(data, protos):
     """检查协议需要的 TLS 配置，返回 {proto: tls_id}，以及已占用的名字和端口。"""
     tls = {}
     for proto in protos:
-        if proto == "vless":
+        if proto in ("vless", "vless443"):
             tls[proto] = find_tls(data, "reality")
             if not tls[proto]:
                 raise SuiError("s-ui 里没有 Reality 配置。请先在面板「TLS 设置」里添加一个 reality 类型的配置")
@@ -765,6 +820,9 @@ def _apply_rules(results, new_outbounds):
     new_rules = [x for r in results if r.get("ok") and "rules" in r for x in r.pop("rules")]
     if not new_rules:
         return "ok"
+    # 兜底拒绝规则必须排在同一入站的所有用户规则后面（共用入站一批会有多个用户）
+    rej = lambda x: x.get("action") == "reject" and not x.get("auth_user")
+    new_rules = [x for x in new_rules if not rej(x)] + [x for x in new_rules if rej(x)]
     cfg = SUI.get("config")
     cfg = cfg.get("config", cfg) if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict) else cfg
     rules = cfg.setdefault("route", {}).setdefault("rules", [])
@@ -799,7 +857,7 @@ def op_create(body):
     with LOCK:
         data = SUI.load_all()
         tls, taken_names, taken_ports = _prepare(data, protos)
-        results, new_outbounds = [], []
+        results, new_outbounds, shared = [], [], []
         for it in items:
             base = unique_name(it["name"], taken_names) if it["name"] in taken_names else it["name"]
             taken_names.add(base)
@@ -815,7 +873,13 @@ def op_create(body):
                 name = base if i == 0 else unique_name(base + PROTO_SUFFIX[proto], taken_names)
                 taken_names.add(name)
                 try:
-                    made.append(_make_inbound(name, proto, tls[proto], expiry, group, taken_ports, base))
+                    if proto == "vless443":
+                        if not shared:
+                            shared.append(_ensure_shared(data, tls[proto], taken_ports))
+                        made.append(_make_shared_user(name, shared[0], expiry, group, base))
+                        shared[0] = shared[0][:2] + ([],)  # 兜底规则只加一次
+                    else:
+                        made.append(_make_inbound(name, proto, tls[proto], expiry, group, taken_ports, base))
                 except Exception as e:
                     made.append({"name": name, "protocol": proto, "ok": False, "error": str(e)})
             if not any(m["ok"] for m in made):
@@ -843,14 +907,14 @@ def op_add_protocol(body):
         rows = {r["tag"]: r for r in build_relays(data)}
         groups = {c.get("id"): c.get("group", "") for c in data.get("clients") or []}
         tls, taken_names, taken_ports = _prepare(data, protos)
-        results = []
+        results, shared = [], []
         for t in tags:
             row = rows.get(t)
             if not row or not row.get("outbound_tag"):
                 results.append({"name": t, "ok": False, "error": "找不到这条线路的落地"})
                 continue
             have = {s["type"] for s in row.get("siblings") or []} | {row["type"]}
-            base = re.sub(r"-(HY2|S5|VL)(-\d+)?$", "", t)
+            base = re.sub(r"-(HY2|S5|VL|443)(-\d+)?$", "", t)
             for proto in protos:
                 if proto in have:
                     results.append({"name": t, "protocol": proto, "ok": False, "skipped": True,
@@ -860,8 +924,15 @@ def op_add_protocol(body):
                 name = unique_name(base + suffix, taken_names)
                 taken_names.add(name)
                 try:
-                    results.append(_make_inbound(name, proto, tls[proto], row.get("expiry") or 0,
-                                                 groups.get(row.get("client_id"), ""), taken_ports, row["outbound_tag"]))
+                    if proto == "vless443":
+                        if not shared:
+                            shared.append(_ensure_shared(data, tls[proto], taken_ports))
+                        results.append(_make_shared_user(name, shared[0], row.get("expiry") or 0,
+                                                         groups.get(row.get("client_id"), ""), row["outbound_tag"]))
+                        shared[0] = shared[0][:2] + ([],)
+                    else:
+                        results.append(_make_inbound(name, proto, tls[proto], row.get("expiry") or 0,
+                                                     groups.get(row.get("client_id"), ""), taken_ports, row["outbound_tag"]))
                 except Exception as e:
                     results.append({"name": name, "protocol": proto, "ok": False, "error": str(e)})
         core = _apply_rules(results, [])
@@ -1015,6 +1086,8 @@ def op_change_port(body):
                 out.append({"tag": t, "ok": False, "error": "不存在"})
                 continue
             try:
+                if row.get("shared"):
+                    raise SuiError("443 共用节点所有客户共用一个端口，不能单独换端口；可以给这条线路加一个独立端口的协议")
                 inb = full_inbound(row["inbound_id"])
                 udp = inb.get("type") in ("hysteria2", "hysteria", "tuic")
                 old = inb.get("listen_port")
@@ -1105,13 +1178,20 @@ def op_delete(body):
     with LOCK:
         data = SUI.load_all()
         rows = {r["tag"]: r for r in build_relays(data)}
-        deleted = set()
+        deleted, deleted_rows, del_users = set(), set(), set()
         for t in tags:
             row = rows.get(t)
             if not row:
                 out.append({"tag": t, "ok": False, "error": "不存在"})
                 continue
             try:
+                if row.get("shared"):
+                    if row.get("client_id"):
+                        SUI.save("clients", "del", row["client_id"])
+                    del_users.add((row["inbound_tag"], t))
+                    deleted_rows.add(t)
+                    out.append({"tag": t, "ok": True})
+                    continue
                 if row.get("client_id"):
                     c = full_client(row["client_id"])
                     ids = [i for i in (c.get("inbounds") or []) if i != row["inbound_id"]]
@@ -1122,17 +1202,24 @@ def op_delete(body):
                         SUI.save("clients", "del", row["client_id"])
                 SUI.save("inbounds", "del", t)
                 deleted.add(t)
+                deleted_rows.add(t)
                 out.append({"tag": t, "ok": True})
             except Exception as e:
                 out.append({"tag": t, "ok": False, "error": str(e)})
         core = "ok"
-        if deleted:
+        if deleted or del_users:
             cfg = SUI.get("config")
             cfg = cfg.get("config", cfg) if isinstance(cfg, dict) and isinstance(cfg.get("config"), dict) else cfg
             rules = (cfg.get("route") or {}).get("rules") or []
             newrules = []
             for r in rules:
                 inb = r.get("inbound")
+                if inb and len(inb) == 1 and r.get("auth_user") and any((inb[0], u) in del_users for u in r["auth_user"]):
+                    au = [u for u in r["auth_user"] if (inb[0], u) not in del_users]
+                    if not au:
+                        continue  # 共用入站上这个用户的分流规则
+                    r = dict(r)
+                    r["auth_user"] = au
                 if inb and any(x in deleted for x in inb):
                     keep = [x for x in inb if x not in deleted]
                     if not keep:
@@ -1149,7 +1236,7 @@ def op_delete(body):
                 cfg["route"]["rules"] = newrules
                 SUI.save("config", "edit", cfg)
                 core = ensure_core()
-            for t in deleted:
+            for t in deleted_rows:
                 ot = rows[t].get("outbound_tag")
                 if ot and ot not in still_used and ot != "direct":
                     try:
@@ -1449,11 +1536,11 @@ def _monitor_once():
     ports = {}
     for k, rs in groups.items():
         for r in rs:
-            if r.get("port"):
+            if r.get("port") and not r.get("shared"):  # 共用端口上分不出是哪个客户，不按端口统计
                 ports[int(r["port"])] = (k, "udp" if r["type"] in ("hysteria2", "hysteria", "tuic") else "tcp")
     tp = tcp_peers({p for p, (k, pr) in ports.items() if pr == "tcp"})
     up = udp_peers({p for p, (k, pr) in ports.items() if pr == "udp"})
-    udp_tags = {r["tag"]: okey_of(r) for r in rows if r.get("port") and ports.get(int(r["port"]), ("", ""))[1] == "udp"}
+    udp_tags = {r["tag"]: okey_of(r) for r in rows if r.get("port") and not r.get("shared") and ports.get(int(r["port"]), ("", ""))[1] == "udp"}
     lp = log_peers(set(udp_tags))
     seen_now = {}
     keep = lambda i: i not in ("127.0.0.1", "::1") or CFG.get("count_loopback")
@@ -1490,7 +1577,7 @@ def _monitor_once():
             full = False
         if full or B:
             for r in rs:
-                if r.get("port"):
+                if r.get("port") and not r.get("shared"):
                     blocks.append((ports[int(r["port"])][1], int(r["port"]), A if full else None, list(B)))
         if active or n or B:
             online[k] = {"active": active, "allowed": A if n else active, "full": full,

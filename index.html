@@ -96,7 +96,7 @@ function coreMsg(c){if(c==="restarted")return "，已重启 s-ui 使路由生效
 const fmtDate=ts=>{if(!ts)return "永久";const d=new Date(ts*1000);const p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`};
 function daysLeft(ts){if(!ts)return null;const d=(ts*1000-Date.now())/86400000;return d<0?-1:Math.ceil(d)}
 function expTag(r){const d=daysLeft(r.expiry);if(d!==null&&d<0)return '<span class="tag bad">已过期</span>';if(r.enable===false)return '<span class="tag gray">已停用</span>';if(d===null)return '<span class="tag ok">永久</span>';if(d<0)return '<span class="tag bad">已过期</span>';if(d<=7)return `<span class="tag warn">${d} 天</span>`;return `<span class="tag ok">${d} 天</span>`}
-const protoName={vless:"VLESS-Reality",hysteria2:"Hysteria2",socks:"SOCKS5",mixed:"Mixed",vmess:"VMess",trojan:"Trojan",shadowsocks:"SS",tuic:"TUIC",anytls:"AnyTLS",http:"HTTP"};
+const protoName={vless:"VLESS-Reality",vless443:"VLESS-443共用",hysteria2:"Hysteria2",socks:"SOCKS5",mixed:"Mixed",vmess:"VMess",trojan:"Trojan",shadowsocks:"SS",tuic:"TUIC",anytls:"AnyTLS",http:"HTTP"};
 
 function renderLogin(){
   $("#app").innerHTML=`<div class="card login"><h2>中转助手 · 登录</h2>
@@ -129,7 +129,8 @@ function renderCreate(){
     <label>入站协议（客户连接用，可多选）<span class="protos" id="protos">
       <label class="ck"><input type="checkbox" value="vless">VLESS-Reality</label>
       <label class="ck"><input type="checkbox" value="hysteria2">Hysteria2</label>
-      <label class="ck"><input type="checkbox" value="socks">SOCKS5</label></span></label>
+      <label class="ck"><input type="checkbox" value="socks">SOCKS5</label>
+      <label class="ck" title="所有客户共用一个 443 端口（像普通 HTTPS），按用户分流到各自落地；不占新端口。设备数只能统计独立端口的节点"><input type="checkbox" value="vless443">VLESS-443 共用</label></span></label>
     <label>到期 <select id="days"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option><option value="0">永久</option><option value="custom">指定日期…</option></select></label>
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
     <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
@@ -244,7 +245,7 @@ const okeyOf=r=>r.outbound_tag||("#"+r.tag);
 function trafficCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},used=g.reduce((s,r)=>s+(r.up||0)+(r.down||0),0),q=(L.quota_gb||0)*1073741824;
   const pct=q?Math.min(100,used/q*100):0,col=L.over||pct>=100?"var(--bad)":pct>=80?"var(--warn)":"var(--ok)";
   return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}`}
-function deviceCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
+function deviceCell(g){if(g.every(r=>r.shared))return '<span class="tag gray" title="443 共用端口上分不出是哪个客户的设备，只能统计/限制独立端口的节点">共用不统计</span>';const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
   const tip=(O.active||[]).map(ip=>ip+((O.rejected||[]).includes(ip)?"（被拒）":"")).join("\n");
   const nb=Object.keys(O.banned||{}).length;
   return `<span title="${esc(tip)}" class="tag ${lim&&O.full?"warn":n?"ok":"gray"} clk" data-dev="${esc(g[0].tag)}">${n}${lim?` / ${lim}`:""} 台 ›</span>${(O.rejected||[]).length?`<div class="sib" style="color:var(--bad)">拒绝 ${O.rejected.length} 个新设备</div>`:""}${nb?`<div class="sib" style="color:var(--bad)">已踢出 ${nb} 个</div>`:""}`}
@@ -404,13 +405,15 @@ async function renderManage(){
   try{await loadRelays();drawTable()}catch(e){toast(e.message)}
 }
 /* 同一落地（同一个落地出站）的节点算一组：同一客户同一条线路的不同协议 */
-const PORD={vless:0,hysteria2:1,socks:2};
+const PORD={vless:0,vless443:1,hysteria2:2,socks:3};
 const gkey=r=>r.outbound_tag?"o:"+r.outbound_tag:"t:"+r.tag;
 function groupsOf(list){
   const m=new Map();for(const r of list){const k=gkey(r);if(!m.has(k))m.set(k,[]);m.get(k).push(r)}
   const gs=[...m.values()];
   gs.forEach(g=>g.sort((a,b)=>((PORD[a.type]??9)-(PORD[b.type]??9))||((a.inbound_id||0)-(b.inbound_id||0))));
-  gs.sort((a,b)=>Math.max(...b.map(x=>x.inbound_id||0))-Math.max(...a.map(x=>x.inbound_id||0)));
+  // 新建的线路在前：按落地出站的 id（每条线路建时新建），共用 443 的节点入站 id 都一样，不能用来排序
+  const gid=g=>Math.max(...g.map(x=>x.outbound_id||0)),iid=g=>Math.max(...g.map(x=>x.shared?0:(x.inbound_id||0)));
+  gs.sort((a,b)=>(gid(b)-gid(a))||(iid(b)-iid(a)));
   return gs;
 }
 const groupOf=t=>{const r=byTag(t);if(!r)return [];const k=gkey(r);return state.relays.filter(x=>gkey(x)===k)};
@@ -454,7 +457,7 @@ function drawTable(){
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
   <button class="sm" data-a="lim" data-t="${esc(r.tag)}">限额</button>`:""}
-  <button class="sm" data-a="port" data-t="${esc(r.tag)}" title="客户当地封了这个端口时用，换完要把新链接发给客户">换端口</button>
+  <button class="sm" data-a="port" data-t="${esc(r.tag)}" ${r.shared?'disabled title="443 共用端口不能单独换"':'title="客户当地封了这个端口时用，换完要把新链接发给客户"'}>换端口</button>
   <button class="sm danger" data-a="del" data-t="${esc(r.tag)}">删除</button></div></td></tr>`).join("")}</tbody>`}).join("")}</table>`;
   $("#pg").innerHTML=pages>1?`<button class="sm" id="pp" ${state.page<=1?"disabled":""}>上一页</button><span>${state.page} / ${pages}</span><button class="sm" id="np" ${state.page>=pages?"disabled":""}>下一页</button>`:"";
   if($("#pp")){$("#pp").onclick=()=>{state.page--;drawTable()};$("#np").onclick=()=>{state.page++;drawTable()}}
@@ -520,7 +523,7 @@ function replaceDlg(tag){
 }
 /* ---------------- 换端口 ---------------- */
 function portDlg(tags){
-  const rs=tags.map(byTag).filter(Boolean);if(!rs.length)return;
+  const rs=tags.map(byTag).filter(r=>r&&!r.shared);if(!rs.length)return toast("443 共用节点不能单独换端口");
   const one=rs.length===1;
   modal(`<h2 style="margin-top:0">更换端口${one?"："+esc(rs[0].tag):`（${rs.length} 个节点）`}</h2>
   <p class="hint">客户当地封了端口时用。换完后<b>旧链接失效，要把新链接/二维码发给客户</b>；落地、到期、流量、设备限额都不变。会重启 s-ui（约 3 秒断线）。</p>
@@ -594,7 +597,7 @@ function foDlg(tag){
 function addProtoDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&r.outbound_tag);if(!rs.length)return toast("所选线路没有落地");
   const have=new Set();if(rs.length===1){have.add(rs[0].type);(rs[0].siblings||[]).forEach(s=>have.add(s.type))}
-  const opt=[["vless","VLESS-Reality"],["hysteria2","Hysteria2"],["socks","SOCKS5"]];
+  const opt=[["vless","VLESS-Reality"],["vless443","VLESS-443 共用"],["hysteria2","Hysteria2"],["socks","SOCKS5"]];
   modal(`<h2 style="margin-top:0">加协议（${rs.length} 条线路）</h2>
   <p class="hint">给同一个落地再加其他协议的节点：共用这个落地出口，到期时间跟原线路一致。客户可以按网络情况选用。</p>
   <div class="protos" id="aps" style="margin:10px 0">${opt.map(([v,l])=>`<label class="ck"><input type="checkbox" value="${v}" ${have.has(v)?"disabled":""}>${l}${have.has(v)?"（已有）":""}</label>`).join("")}</div>
