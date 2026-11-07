@@ -7,14 +7,14 @@
 <link rel="icon" href="data:,">
 <style>
 :root{
-  --bg:#F4F1EB;--card:#FFFDF9;--soft:#F7F3EC;--ink:#2B2620;--muted:#7A7064;--line:#E7E0D4;--line2:#D8CEBF;
+  --bg:#F4F1EB;--card:#FFFDF9;--soft:#F7F3EC;--ink:#1F1B16;--muted:#625849;--line:#E7E0D4;--line2:#D8CEBF;
   --pri:#D97757;--pri2:#C2613F;--ring:rgba(217,119,87,.30);
   --ok:#4E8A5A;--warn:#B57E22;--bad:#B8473A;--rail:#DCCDB9;
   --p-vless:#C8643F;--p-vless443:#3E6FA8;--p-hysteria2:#8A5BA8;--p-socks:#9A7838;
-  --mono:"JetBrains Mono","Cascadia Mono","SF Mono",Consolas,ui-monospace,monospace;
+  --mono:Consolas,"SF Mono",Menlo,"Cascadia Mono",ui-monospace,monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 "HarmonyOS Sans SC","MiSans","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.6 -apple-system,"PingFang SC","Microsoft YaHei","Microsoft YaHei UI","Hiragino Sans GB","Noto Sans SC","Source Han Sans SC",sans-serif;font-variant-numeric:tabular-nums}
 ::selection{background:#F5D8CB}
 
 /* 顶栏：浅色，Logo 是两个站点连成一条线 */
@@ -22,9 +22,9 @@ header{background:var(--card);border-bottom:1px solid var(--line);padding:10px 2
 header h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.5px;display:flex;align-items:center;gap:10px}
 header h1::before{content:"";width:24px;height:10px;flex:none;
   background:radial-gradient(circle at 5px 5px,var(--pri) 4px,transparent 4.5px),radial-gradient(circle at 19px 5px,var(--card) 2px,transparent 2.5px),radial-gradient(circle at 19px 5px,var(--pri) 4.5px,transparent 5px),linear-gradient(var(--pri),var(--pri)) 5px 4px/14px 2px no-repeat}
-header .host{color:var(--muted);font:12px var(--mono);padding-left:14px;border-left:1px solid var(--line)}
+header .host{color:var(--muted);font:13px var(--mono);padding-left:14px;border-left:1px solid var(--line)}
 header nav{margin-left:auto;display:flex;gap:2px;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:3px}
-header nav button{background:transparent;color:var(--muted);border:0;border-radius:7px;padding:6px 16px;font-weight:500}
+header nav button{background:transparent;color:#4A4135;border:0;border-radius:7px;padding:6px 16px;font-weight:600}
 header nav button:hover{color:var(--ink);background:transparent}
 header nav button.on{background:var(--card);color:var(--ink);box-shadow:0 1px 2px rgba(43,38,32,.14),0 0 0 1px var(--line)}
 header nav #logout{color:var(--muted);margin-left:6px;border-left:1px solid var(--line);border-radius:0 7px 7px 0}
@@ -33,13 +33,13 @@ main{max-width:1380px;margin:22px auto;padding:0 18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
 .card h2{font-size:16px;margin:0 0 14px;font-weight:600;color:var(--ink)}
 .row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
-.row label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
+.row label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted);font-weight:500}
 
 input,select,textarea{font:inherit;border:1px solid var(--line2);border-radius:8px;padding:7px 11px;background:#fff;color:var(--ink);transition:border-color .15s,box-shadow .15s}
 textarea{width:100%;min-height:150px;font-family:var(--mono);font-size:13px;line-height:1.6;background:var(--soft)}
 textarea:focus{background:#fff}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px var(--ring)}
-input::placeholder,textarea::placeholder{color:#AEA394}
+input::placeholder,textarea::placeholder{color:#958A7B}
 
 button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line2);background:var(--card);padding:7px 15px;color:var(--ink);transition:background .12s,border-color .12s}
 button:hover{background:var(--soft);border-color:#C9BBA8}
@@ -48,19 +48,19 @@ button.pri{background:var(--pri);border-color:var(--pri);color:#fff;font-weight:
 button.pri:hover{background:var(--pri2);border-color:var(--pri2)}
 button.danger{color:var(--bad);border-color:#E3C2BE}
 button.danger:hover{background:#F8ECEA;border-color:#D9A7A1}
-button.sm{padding:3px 10px;font-size:12px;border-radius:6px}
+button.sm{padding:3px 10px;font-size:13px;border-radius:6px}
 button:disabled{opacity:.42;cursor:default;background:var(--card)}
-.hint{color:var(--muted);font-size:12px;margin:6px 0 0;line-height:1.65}
+.hint{color:var(--muted);font-size:13px;margin:6px 0 0;line-height:1.65}
 
 /* 表格 */
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
-th{font-size:12px;color:var(--muted);font-weight:500;background:transparent;white-space:nowrap;border-bottom:1px solid var(--line2);padding-top:4px}
-td.mono,.mono{font-family:var(--mono);font-size:12px}
+th{font-size:13px;color:var(--muted);font-weight:600;background:transparent;white-space:nowrap;border-bottom:1px solid var(--line2);padding-top:4px}
+td.mono,.mono{font-family:var(--mono);font-size:13px;color:var(--ink)}
 td.mono{white-space:nowrap}
 
 /* 标签：协议各有颜色，状态用对应颜色的浅底 */
-.tag{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;line-height:20px;white-space:nowrap;--c:#6E6458;color:var(--c);background:color-mix(in srgb,var(--c) 11%,var(--card));border:1px solid color-mix(in srgb,var(--c) 20%,transparent)}
+.tag{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12.5px;font-weight:500;line-height:20px;white-space:nowrap;--c:#6E6458;color:var(--c);background:color-mix(in srgb,var(--c) 11%,var(--card));border:1px solid color-mix(in srgb,var(--c) 20%,transparent)}
 .tag.ok{--c:var(--ok)}.tag.bad{--c:var(--bad)}.tag.warn{--c:var(--warn)}.tag.gray{--c:#8A8073}
 .tag.p-vless{--c:var(--p-vless)}.tag.p-vless443{--c:var(--p-vless443)}.tag.p-hysteria2{--c:var(--p-hysteria2)}.tag.p-socks{--c:var(--p-socks)}
 .clk{cursor:pointer}.clk:hover{text-decoration:underline;text-underline-offset:3px}
@@ -70,8 +70,8 @@ tbody.grp{border-bottom:1px solid var(--line2)}
 tbody.grp:hover{background:#FAF6EF}
 tbody.grp tr:not(:last-child) td{border-bottom-color:transparent}
 tbody.grp tr.sub td{border-top:0}
-td.nm{position:relative;padding-left:34px;font-weight:500}
-tbody.grp tr.sub td.nm{font-weight:400;color:#4A4239}
+td.nm{position:relative;padding-left:34px;font-weight:600}
+tbody.grp tr.sub td.nm{font-weight:500;color:#3A332B}
 td.nm::before{content:"";position:absolute;left:15px;width:3px;border-radius:2px;background:var(--rail);top:50%;bottom:0}
 tbody.grp tr.sub td.nm::before{top:0;bottom:0}
 tbody.grp tr.sub:last-child td.nm::before{bottom:50%}
@@ -80,10 +80,10 @@ td.nm::after{content:"";position:absolute;left:10px;top:50%;width:13px;height:13
 tbody.grp tr.sub td.nm::after{background:var(--card)}
 td.nm.p-vless{--c:var(--p-vless)}td.nm.p-vless443{--c:var(--p-vless443)}td.nm.p-hysteria2{--c:var(--p-hysteria2)}td.nm.p-socks{--c:var(--p-socks)}
 .branch{display:none}
-.sib{font-size:11.5px;color:var(--muted);margin-top:3px;font-weight:400}
+.sib{font-size:12.5px;color:var(--muted);margin-top:3px;font-weight:400}
 
 .acts{display:flex;gap:2px 4px;flex-wrap:wrap}
-.acts button.sm{background:transparent;border-color:transparent;color:#4A4239;padding:3px 8px}
+.acts button.sm{background:transparent;border-color:transparent;color:#2F2922;padding:3px 8px;font-weight:500}
 .acts button.sm:hover{background:var(--card);border-color:var(--line2)}
 .acts button.sm.danger{color:var(--bad)}
 .acts button.sm.danger:hover{background:#F8ECEA;border-color:#E3C2BE}
