@@ -656,7 +656,8 @@ async function poolSection(tag){
   $("#pautochk").onchange=async()=>{try{await api("pool_auto",{tags:[tag],on:$("#pautochk").checked});toast($("#pautochk").checked?"已开启：落地不通时自动从落地库换":"已关闭自动换");await loadRelays();drawTable()}catch(e){toast(e.message)}};
 }
 async function poolPicker(cb){
-  let x;try{x=await api("pool_list")}catch(e){return toast(e.message)}
+  modal('<h2 style="margin-top:0">从落地库选</h2><p><span class="spin"></span> 正在读取落地库…</p>');
+  let x;try{x=await api("pool_list")}catch(e){closeModal();return toast(e.message)}
   const rank=it=>it.check?(it.check.ok?0:2):1;
   const idle=x.items.filter(it=>!it.disabled&&!it.expired).sort((a,b)=>rank(a)-rank(b)||a.used_by.length-b.used_by.length||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9));
   const cs=[...new Set(idle.map(it=>it.country||"未知"))];

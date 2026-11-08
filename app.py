@@ -10,6 +10,7 @@
 只依赖 Python 3 标准库，通过 s-ui 自带的 API 操作，不直接改数据库。
 """
 import base64
+import gzip
 import hashlib
 import hmac
 import http.cookiejar
@@ -41,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2681,8 +2682,11 @@ def proxy_json(sid, action, body, timeout=120):
         return {"ok": False, "error": str(e)}
     name = sv.get("name") or sv["url"]
     try:
-        with _remote(sv, "api/" + action, json.dumps(body or {}).encode(), {"Content-Type": "application/json"}, timeout) as r:
-            res = json.loads(r.read().decode("utf-8") or "{}")
+        with _remote(sv, "api/" + action, json.dumps(body or {}).encode(), {"Content-Type": "application/json", "Accept-Encoding": "gzip"}, timeout) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            res = json.loads(raw.decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
         try:
             res = json.loads(e.read().decode("utf-8") or "{}")
@@ -2854,7 +2858,6 @@ def _rec_public(it, use, now):
     r = {k: it.get(k) for k in ("id", "raw", "host", "ip", "port", "type", "country", "net", "supplier", "cost", "expire", "note", "disabled", "added", "check")}
     r["used_by"] = use.get(landing_key(it["ob"]), [])
     r["expired"] = bool(it.get("expire") and it["expire"] < now)
-    r["info"] = landing_info(it["ob"])
     return r
 
 
@@ -3516,8 +3519,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(body, ensure_ascii=False)
         if isinstance(body, str):
             body = body.encode("utf-8")
+        gz = (len(body) > 1400 and "gzip" in (self.headers.get("Accept-Encoding") or "")
+              and ctype.split("/")[0] in ("application", "text") and "zip" not in ctype and "octet" not in ctype)
+        if gz:   # 落地库这种大列表压缩后小 5~10 倍，跨境访问快很多
+            body = gzip.compress(body, 5)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
@@ -3717,8 +3727,11 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             return self._send(404, {"ok": False, "error": "unknown action"})
         try:
+            t0 = time.time()
             res = fn(body)
             res["ok"] = res.get("ok", True)
+            if time.time() - t0 > 3:
+                sys.stderr.write("slow op %s: %.1fs\n" % (action, time.time() - t0))
             return self._send(200, res)
         except (SuiError, ValueError) as e:
             return self._send(200, {"ok": False, "error": str(e)})
