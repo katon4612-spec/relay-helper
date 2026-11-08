@@ -659,18 +659,31 @@ async function poolPicker(cb){
   modal('<h2 style="margin-top:0">从落地库选</h2><p><span class="spin"></span> 正在读取落地库…</p>');
   let x;try{x=await api("pool_list")}catch(e){closeModal();return toast(e.message)}
   const rank=it=>it.check?(it.check.ok?0:2):1;
-  const idle=x.items.filter(it=>!it.disabled&&!it.expired).sort((a,b)=>rank(a)-rank(b)||a.used_by.length-b.used_by.length||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9));
+  const cmp=(a,b)=>rank(a)-rank(b)||a.used_by.length-b.used_by.length||((a.check||{}).delay||9e9)-((b.check||{}).delay||9e9);
+  const idle=x.items.filter(it=>!it.disabled&&!it.expired).sort(cmp);
   const cs=[...new Set(idle.map(it=>it.country||"未知"))];
   let cur=cs[0]||"";
+  let checking=false;
   const draw=()=>{const list=idle.filter(it=>(it.country||"未知")===cur);
+    const nun=list.filter(it=>!it.check).length;
+    if(!checking)H("#ppchk",list.length?`<button class="sm" id="ppck">检测这个国家的 ${list.length} 个落地</button>${nun?`<span class="hint">${nun} 个还没在这台服务器上检测过</span>`:""}`:"");
+    if($("#ppck"))$("#ppck").onclick=()=>chk(list);
     H("#ppl",list.length?`<table><tr><th><input type="checkbox" id="ppall"></th><th>落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th></tr>${list.map(it=>`<tr><td><input type="checkbox" data-pp="${esc(it.id)}"></td><td class="mono">${esc(it.host)}:${esc(it.port)}</td><td class="mono">${esc(it.net||"-")}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):"-"}</td></tr>`).join("")}</table>`:'<p class="hint">这个国家没有可用落地</p>');
     if($("#ppall"))$("#ppall").onchange=()=>document.querySelectorAll("[data-pp]").forEach(c=>c.checked=$("#ppall").checked);
     document.querySelectorAll("#ppc button").forEach(b=>b.classList.toggle("pri",b.dataset.c===cur))};
   modal(`<h2 style="margin-top:0">从落地库选（可用 ${idle.length} 个）</h2>
   <div class="row" id="ppc" style="gap:6px">${cs.map(c=>`<button class="sm" data-c="${esc(c)}">${esc(c)}（${idle.filter(it=>(it.country||"未知")===c).length}）</button>`).join("")||'<span class="hint">落地库里还没有落地，先到「落地库」页导入。</span>'}</div>
+  <div class="row" id="ppchk" style="margin-top:10px;gap:10px;align-items:center"></div>
   <div id="ppl" style="max-height:52vh;overflow:auto;margin-top:10px"></div>
   <div class="row" style="margin-top:12px"><button class="pri" id="ppok">加入到落地输入框</button><button id="ppcl">取消</button></div>`);
-  document.querySelectorAll("#ppc button").forEach(b=>b.onclick=()=>{cur=b.dataset.c;draw()});draw();
+  const chk=async list=>{checking=true;const ids=list.map(it=>it.id),by=Object.fromEntries(idle.map(it=>[it.id,it]));let ok=0;
+    for(let i=0;i<ids.length;i+=30){if(!$("#ppchk"))return;H("#ppchk",`<span class="spin"></span> 正在检测 ${Math.min(i+30,ids.length)}/${ids.length}…（可以先勾选上面已经通的）`);
+      try{const r=await api("pool_check",{ids:ids.slice(i,i+30)});const now=Date.now()/1000;
+        r.results.forEach(c=>{const it=by[c.id];if(it){it.check={ok:c.ok,delay:c.delay,error:c.error,ts:now};if(c.ok)ok++}})}catch(e){toast(e.message)}
+      const keep=new Set([...document.querySelectorAll("[data-pp]:checked")].map(c=>c.dataset.pp));idle.sort(cmp);draw();
+      document.querySelectorAll("[data-pp]").forEach(c=>c.checked=keep.has(c.dataset.pp))}
+    checking=false;if($("#ppchk")){draw();toast(`检测完成：${ok} 个能通，${ids.length-ok} 个不通`)}};
+  document.querySelectorAll("#ppc button").forEach(b=>b.onclick=()=>{if(checking)return toast("正在检测，稍等");cur=b.dataset.c;draw()});draw();
   $("#ppcl").onclick=closeModal;
   $("#ppok").onclick=()=>{const ids=new Set([...document.querySelectorAll("[data-pp]:checked")].map(c=>c.dataset.pp));if(!ids.size)return toast("先勾选落地");
     cb(idle.filter(it=>ids.has(it.id)).map(it=>it.raw));closeModal()};
@@ -691,12 +704,14 @@ async function renderPool(){
    <button id="pexp">导出</button><button class="pri" id="pimp">导入落地</button></div>
   <div class="toolbar" id="pbulk"></div><div id="ptable"></div></div>
   ${by["未知"]?`<div class="warnbox">有 ${by["未知"].n} 个落地国家还没识别出来：服务器每 30 分钟会在后台自动补一次；也可以点「未知」→「全选当前」→「重新识别国家」马上补。查不到的（比如 IP 太新、查询库里没有）用「编辑」手动填国家。</div>`:""}
+  ${x.bg_check&&x.bg_check.running?`<div class="warnbox"><span class="spin"></span> 正在后台检测新加进来的落地：${x.bg_check.done}/${x.bg_check.total}，页面每 20 秒自动刷新。</div>`:""}
   ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;
   document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;renderPool()}});
   $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
   $("#pq").oninput=()=>{state.pf.q=$("#pq").value;drawPool()};
   $("#pimp").onclick=poolImportDlg;$("#pexp").onclick=poolExportDlg;
   drawPool();
+  clearTimeout(state.poolT);if(x.bg_check&&x.bg_check.running)state.poolT=setTimeout(()=>{if(state.tab==="pool"&&!document.querySelector("#modal.show")&&!state.psel.size)renderPool()},20000);
 }
 function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now()/1000;
   return state.pool.filter(it=>(!f.c||(it.country||"未知")===f.c)&&
@@ -759,7 +774,7 @@ async function poolExportDlg(){
   if($("#xpush"))$("#xpush").onclick=async()=>{const b=$("#xpush"),to=$("#xsrv").value;b.disabled=true;b.innerHTML='<span class="spin"></span> 复制中';
     try{const recs=await getRecs();let added=0,dup=0,err=0;
       for(let i=0;i<recs.length;i+=500){const x=await api("pool_import",{records:recs.slice(i,i+500)},{srv:to});added+=x.added;dup+=x.dup;err+=x.errors.length}
-      H("#xmsg",`<span class="ok">已复制到「${esc($("#xsrv").selectedOptions[0].textContent)}」：新增 ${added} 个${dup?`，对方已有跳过 ${dup} 个`:""}${err?`，${err} 个无法识别`:""}。</span>`)}
+      H("#xmsg",`<span class="ok">已复制到「${esc($("#xsrv").selectedOptions[0].textContent)}」：新增 ${added} 个${dup?`，对方已有跳过 ${dup} 个`:""}${err?`，${err} 个无法识别`:""}。${added?"对方服务器正在后台检测这些新落地，过几分钟在那台的落地库里就能看到通不通。":""}</span>`)}
     catch(e){H("#xmsg",`<span class="err">${esc(e.message)}</span>`)}b.disabled=false;b.textContent="复制过去"};
 }
 function poolImportDlg(){
@@ -776,7 +791,7 @@ function poolImportDlg(){
     try{const j=JSON.parse(t);recs=Array.isArray(j)?j:j.records;if(!Array.isArray(recs))throw 0;H("#ifinfo",`文件里有 ${recs.length} 个落地（带国家/供应商/到期等信息）`)}
     catch(e){recs=null;$("#it").value=t;H("#ifinfo","已把文件内容放进上面的输入框")}};
   $("#iok").onclick=async()=>{const b=$("#iok");b.disabled=true;b.innerHTML='<span class="spin"></span> 导入中';
-    try{const x=await api("pool_import",{text:$("#it").value,records:recs||[],supplier:$("#isup").value,cost:$("#icost").value,country:$("#icty").value,note:$("#inote").value,
+    try{const x=await api("pool_import",{bg_check:false,text:$("#it").value,records:recs||[],supplier:$("#isup").value,cost:$("#icost").value,country:$("#icty").value,note:$("#inote").value,
         expire:$("#iexp").value?Math.floor(new Date($("#iexp").value+"T23:59:59").getTime()/1000):0});
       H("#imsg",`已导入 ${x.added} 个${x.dup?`，跳过重复 ${x.dup} 个`:""}${x.errors.length?`<div class="err">${x.errors.length} 行无法识别：${x.errors.slice(0,5).map(e=>esc(e.line)).join("；")}</div>`:""}`);
       if(x.added){b.innerHTML='<span class="spin"></span> 检测中';const l=await api("pool_list");const fresh=l.items.filter(it=>!it.check).map(it=>it.id);

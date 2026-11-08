@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.15.2"
+VERSION = "1.15.3"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -986,6 +986,8 @@ def op_create(body):
     if to_pool and body.get("to_pool", True):
         try:
             pool_added = _pool_add(to_pool)[0]
+            if pool_added:
+                threading.Thread(target=pool_bg_check, daemon=True).start()
         except Exception as e:
             sys.stderr.write("pool add: %s\n" % e)
     return {"results": results, "core": core, "pool_added": pool_added}
@@ -2869,7 +2871,7 @@ def op_pool_list(body):
         items = [_rec_public(it, use, now) for it in POOL["items"]]
         auto = dict(POOL["auto"])
     groups = group_rows(build_relays(data))
-    return {"items": items, "auto": [k for k, v in auto.items() if v and k in groups], "now": now}
+    return {"items": items, "auto": [k for k, v in auto.items() if v and k in groups], "now": now, "bg_check": dict(BG_CHECK)}
 
 
 def _pool_add(entries, defaults=None):
@@ -2932,6 +2934,8 @@ def op_pool_import(body):
         except Exception as ex:
             errors.append({"line": ln, "error": str(ex)})
     added, dup = _pool_add(entries, {k: body.get(k) for k in ("country", "supplier", "cost", "expire", "note")})
+    if added and body.get("bg_check", True):
+        threading.Thread(target=pool_bg_check, daemon=True).start()
     with POOL_LOCK:
         missing = len([1 for it in POOL["items"] if not it.get("country")])
     return {"added": added, "dup": dup, "errors": errors, "geo_missing": missing}
@@ -2983,6 +2987,36 @@ def _pool_check_items(items):
                 it["check"] = {"ok": r["ok"], "delay": r.get("delay"), "error": (r.get("error") or "")[:160], "ts": now}
         save_pool()
     return by
+
+
+BG_CHECK = {"running": False, "done": 0, "total": 0}
+BG_CHECK_LOCK = threading.Lock()
+
+
+def pool_bg_check():
+    """后台检测落地库里还没检测过的落地（从别的服务器复制过来、导入 .json、新建线路自动入库之后）。"""
+    if not BG_CHECK_LOCK.acquire(blocking=False):
+        return
+    try:
+        BG_CHECK.update(running=True, done=0, total=0)
+        tried = set()
+        while True:
+            with POOL_LOCK:
+                todo = [dict(it) for it in POOL["items"] if not it.get("check") and it["id"] not in tried and not it.get("disabled")]
+            if not todo:
+                break
+            BG_CHECK["total"] = BG_CHECK["done"] + len(todo)
+            batch = todo[:30]
+            tried.update(it["id"] for it in batch)
+            try:
+                _pool_check_items(batch)
+            except Exception as e:
+                sys.stderr.write("pool bg check: %s\n" % e)
+            BG_CHECK["done"] += len(batch)
+            time.sleep(1)   # 让其他操作插进来
+    finally:
+        BG_CHECK["running"] = False
+        BG_CHECK_LOCK.release()
 
 
 def op_pool_check(body):
