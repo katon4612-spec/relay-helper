@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.14.2"
+VERSION = "1.14.3"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -284,8 +284,10 @@ def parse_landing(raw):
 GEO_CACHE = {}
 
 
-def geo_lookup(ips):
-    """ip -> 国家中文名, via ip-api.com batch (free, http)."""
+def geo_lookup(ips, wait=False):
+    """ip -> 国家中文名, via ip-api.com batch (free, http).
+    免费接口限每分钟 15 次批量查询（每次 100 个）；超了会返回 429。
+    wait=True 时碰到限速就按它给的秒数等一等再查（后台补识别用），否则直接放弃剩下的。"""
     out = {}
     todo = []
     for ip in ips:
@@ -295,20 +297,90 @@ def geo_lookup(ips):
             out[ip] = GEO_CACHE[ip]
         elif ip not in todo:
             todo.append(ip)
-    if todo and CFG.get("geo_lookup", True):
-        for i in range(0, len(todo), 100):
-            chunk = todo[i:i + 100]
-            try:
-                body = json.dumps([{"query": ip, "fields": "status,country,query", "lang": "zh-CN"} for ip in chunk]).encode()
-                req = urllib.request.Request("http://ip-api.com/batch", data=body, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    for item in json.loads(r.read().decode()):
-                        if item.get("status") == "success":
-                            GEO_CACHE[item["query"]] = item.get("country", "")
-                            out[item["query"]] = item.get("country", "")
-            except Exception:
-                pass
+    if not (todo and CFG.get("geo_lookup", True)):
+        return out
+    i, tries = 0, 0
+    while i < len(todo):
+        chunk = todo[i:i + 100]
+        body = json.dumps([{"query": ip, "fields": "status,country,query", "lang": "zh-CN"} for ip in chunk]).encode()
+        req = urllib.request.Request("http://ip-api.com/batch", data=body, headers={"Content-Type": "application/json"})
+        ttl = 0
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                for item in json.loads(r.read().decode()):
+                    if item.get("status") == "success" and item.get("country"):
+                        GEO_CACHE[item["query"]] = item["country"]
+                        out[item["query"]] = item["country"]
+                if r.headers.get("X-Rl") == "0":          # 这一分钟的额度用完了
+                    ttl = int(r.headers.get("X-Ttl") or 60)
+            i += 100
+            tries = 0
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                i += 100
+                continue
+            ttl = int(e.headers.get("X-Ttl") or 60)
+            tries += 1
+        except Exception:
+            tries += 1
+            if tries >= 3:
+                i += 100
+                tries = 0
+            elif wait:
+                time.sleep(5)
+            continue
+        if ttl and i < len(todo):
+            if not wait or tries >= 5:
+                break
+            time.sleep(ttl + 1)
     return out
+
+
+GEO_FILL_LOCK = threading.Lock()
+
+
+def pool_geo_fill(ids=None):
+    """后台把落地库里国家为空的补上（导入太多时 ip-api 会限速，没识别到的在这里慢慢补）。"""
+    if not GEO_FILL_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        with POOL_LOCK:
+            todo = [dict(it) for it in POOL["items"] if (it["id"] in ids if ids is not None else not it.get("country"))]
+        if not todo:
+            return 0
+        for it in todo:
+            if not it.get("ip"):
+                it["ip"] = resolve(it["host"]) or ""
+        geo = geo_lookup([it["ip"] for it in todo if it["ip"]], wait=True)
+        n = 0
+        with POOL_LOCK:
+            byid = {it["id"]: it for it in POOL["items"]}
+            for t in todo:
+                rec = byid.get(t["id"])
+                if not rec:
+                    continue
+                if t["ip"] and not rec.get("ip"):
+                    rec["ip"], rec["net"] = t["ip"], ip_net(t["ip"])
+                c = geo.get(t["ip"])
+                if c and (ids is not None or not rec.get("country")):
+                    rec["country"] = c
+                    n += 1
+            POOL["geo_ts"] = int(time.time())
+            save_pool()
+        return n
+    finally:
+        GEO_FILL_LOCK.release()
+
+
+def op_pool_geo(body):
+    ids = body.get("ids")
+    ids = set(ids) if ids else None
+    with POOL_LOCK:
+        n = len([1 for it in POOL["items"] if (it["id"] in ids if ids is not None else not it.get("country"))])
+    if GEO_FILL_LOCK.locked():
+        return {"queued": 0, "busy": True}
+    threading.Thread(target=pool_geo_fill, args=(ids,), daemon=True).start()
+    return {"queued": n, "busy": False}
 
 
 def used_ports(data):
@@ -2804,7 +2876,10 @@ def op_pool_import(body):
                                   "added": int(time.time()), "check": None})
             added += 1
         save_pool()
-    return {"added": added, "dup": dup, "errors": errors}
+        missing = len([1 for it in POOL["items"] if not it.get("country")])
+    if missing:
+        threading.Thread(target=pool_geo_fill, daemon=True).start()
+    return {"added": added, "dup": dup, "errors": errors, "geo_missing": missing}
 
 
 def op_pool_update(body):
@@ -3032,6 +3107,11 @@ def pool_loop():
     while True:
         try:
             pool_once()
+        except Exception as e:
+            sys.stderr.write("pool: %s\n" % e)
+        try:   # 国家没识别出来的，每 30 分钟后台再补一次
+            if time.time() - (POOL.get("geo_ts") or 0) > 1800 and any(not it.get("country") for it in POOL["items"]):
+                threading.Thread(target=pool_geo_fill, daemon=True).start()
         except Exception as e:
             sys.stderr.write("pool: %s\n" % e)
         time.sleep(max(20, int(CFG.get("pool_interval_sec") or 60)))
@@ -3311,7 +3391,7 @@ OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kic
             "server_save": op_server_save, "server_del": op_server_del, "servers_overview": op_servers_overview,
             "local_token_reset": op_local_token_reset, "pool_list": op_pool_list, "pool_import": op_pool_import,
             "pool_update": op_pool_update, "pool_delete": op_pool_delete, "pool_check": op_pool_check,
-            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto})
+            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto, "pool_geo": op_pool_geo})
 
 
 # ------------------------------------------------------------- web server --

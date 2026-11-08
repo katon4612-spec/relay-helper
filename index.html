@@ -686,6 +686,7 @@ async function renderPool(){
    <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">有线路在用</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
    <button class="pri" id="pimp">导入落地</button></div>
   <div class="toolbar" id="pbulk"></div><div id="ptable"></div></div>
+  ${by["未知"]?`<div class="warnbox">有 ${by["未知"].n} 个落地国家还没识别出来：服务器每 30 分钟会在后台自动补一次；也可以点「未知」→「全选当前」→「重新识别国家」马上补。查不到的（比如 IP 太新、查询库里没有）用「编辑」手动填国家。</div>`:""}
   ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;
   document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;renderPool()}});
   $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
@@ -700,7 +701,7 @@ function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now
 function drawPool(){
   const list=poolFiltered(),sel=state.psel;[...sel].forEach(id=>{if(!state.pool.some(it=>it.id===id))sel.delete(id)});
   H("#pbulk",`<span class="muted">${list.length} 个${sel.size?`，已选 ${sel.size}`:""}</span><button class="sm" id="psall">全选当前</button>${sel.size?`<button class="sm" id="psnone">取消选择</button>
-   <button class="sm" id="pchk">检测</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
+   <button class="sm" id="pchk">检测</button><button class="sm" id="pgeo">重新识别国家</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
   H("#ptable",list.length?`<table><tr><th></th><th>国家</th><th>落地</th><th>网段</th><th>状态</th><th>检测</th><th>供应商 / 进价</th><th>落地到期</th><th>备注</th></tr>
   ${list.slice(0,500).map(it=>`<tr><td><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td>${esc(it.country||"未知")}</td>
    <td class="mono">${esc(it.host)}:${esc(it.port)} <span class="tag gray">${esc(protoName[it.type]||it.type)}</span></td><td class="mono">${esc(it.net||"-")}</td>
@@ -717,6 +718,8 @@ function drawPool(){
     for(let i=0;i<ids.length;i+=30){b.innerHTML=`<span class="spin"></span> ${done}/${ids.length}`;try{await api("pool_check",{ids:ids.slice(i,i+30)})}catch(e){toast(e.message)}done=Math.min(ids.length,i+30)}
     toast("检测完成");renderPool()};
   const upd=async f=>{try{await api("pool_update",Object.assign({ids},f));renderPool()}catch(e){toast(e.message)}};
+  $("#pgeo").onclick=async()=>{try{const x=await api("pool_geo",{ids});
+    toast(x.busy?"正在后台识别国家，稍等一两分钟再刷新":`已在后台识别 ${x.queued} 个落地的国家（IP 查询接口每分钟限量，量大要几分钟），稍后刷新本页`,7000)}catch(e){toast(e.message)}};
   $("#pdis").onclick=()=>upd({disabled:true});$("#pen").onclick=()=>upd({disabled:false});
   $("#pdel").onclick=async()=>{const used=state.pool.filter(it=>sel.has(it.id)&&it.used_by.length).length;
     if(!confirm(`从落地库删除 ${ids.length} 个落地？${used?`\n其中 ${used} 个正在被线路使用——只是从库里删掉记录，线路不受影响。`:""}`))return;
@@ -745,7 +748,7 @@ function poolImportDlg(){
       H("#imsg",`已导入 ${x.added} 个${x.dup?`，跳过重复 ${x.dup} 个`:""}${x.errors.length?`<div class="err">${x.errors.length} 行无法识别：${x.errors.slice(0,5).map(e=>esc(e.line)).join("；")}</div>`:""}`);
       if(x.added){b.innerHTML='<span class="spin"></span> 检测中';const l=await api("pool_list");const fresh=l.items.filter(it=>!it.check).map(it=>it.id);
         for(let i=0;i<fresh.length;i+=30)await api("pool_check",{ids:fresh.slice(i,i+30)});}
-      closeModal();toast(`已导入 ${x.added} 个落地`);renderPool()}catch(e){H("#imsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="导入并检测"}};
+      closeModal();toast(`已导入 ${x.added} 个落地${x.geo_missing?`，还有 ${x.geo_missing} 个的国家在后台识别（IP 查询接口每分钟限量），过几分钟刷新`:""}`,7000);renderPool()}catch(e){H("#imsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="导入并检测"}};
 }
 
 /* ---------------- 服务器 ---------------- */
