@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.14.3"
+VERSION = "1.15.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -933,7 +933,7 @@ def op_create(body):
     with LOCK:
         data = SUI.load_all()
         tls, taken_names, taken_ports = _prepare(data, protos)
-        results, new_outbounds, shared = [], [], []
+        results, new_outbounds, shared, to_pool = [], [], [], []
         for it in items:
             base = unique_name(it["name"], taken_names) if it["name"] in taken_names else it["name"]
             taken_names.add(base)
@@ -962,6 +962,9 @@ def op_create(body):
                 _rollback({}, base)  # 一个入站都没建成：落地出站也删掉
             else:
                 new_outbounds.append(base)
+                if it.get("raw") and it["outbound"].get("type") != "direct":
+                    to_pool.append({"raw": it["raw"], "ob": it["outbound"], "host": it.get("host") or it["outbound"].get("server", ""),
+                                    "ip": it.get("ip") or "", "country": it.get("country") or ""})
             results.extend(made)
         core = _apply_rules(results, new_outbounds)
         init_group_limits([o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)],
@@ -969,7 +972,13 @@ def op_create(body):
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
-    return {"results": results, "core": core}
+    pool_added = 0
+    if to_pool and body.get("to_pool", True):
+        try:
+            pool_added = _pool_add(to_pool)[0]
+        except Exception as e:
+            sys.stderr.write("pool add: %s\n" % e)
+    return {"results": results, "core": core, "pool_added": pool_added}
 
 
 def op_add_protocol(body):
@@ -1116,6 +1125,11 @@ def op_replace(body):
             ob = dict(body["outbound"])  # 落地库里已解析好的
         else:
             ob, host, remark = parse_landing(raw)
+            if ob.get("type") != "direct" and body.get("to_pool", True):
+                try:
+                    _pool_add([{"raw": raw.strip(), "ob": dict(ob), "host": host}])
+                except Exception as e:
+                    sys.stderr.write("pool add: %s\n" % e)
         ob["tag"] = row["outbound_tag"]
         ob["id"] = row["outbound_id"]
         SUI.save("outbounds", "edit", ob)
@@ -2842,44 +2856,77 @@ def op_pool_list(body):
     return {"items": items, "auto": [k for k, v in auto.items() if v and k in groups], "now": now}
 
 
-def op_pool_import(body):
-    lines = [l.strip() for l in (body.get("text") or "").splitlines() if l.strip()]
-    if not lines:
-        raise SuiError("没有内容")
-    parsed, errors = [], []
-    for ln in lines:
-        try:
-            ob, host, remark = parse_landing(ln)
-            if ob.get("type") == "direct":
-                raise ValueError("直连不能放进落地库")
-            parsed.append((ln, ob, host))
-        except Exception as e:
-            errors.append({"line": ln, "error": str(e)})
-    ips = {h: resolve(h) for _, _, h in parsed}
-    geo = geo_lookup([ip for ip in ips.values() if ip])
-    exp = int(body.get("expire") or 0)
+def _pool_add(entries, defaults=None):
+    """往落地库加落地。entries: [{raw, ob, host, ip?, country?, supplier?, cost?, expire?, note?}]，重复的（落地 key 相同）跳过。
+    返回 (added, dup)。国家没给的后台再识别。"""
+    d = defaults or {}
+    need_ip = [e for e in entries if not e.get("ip")]
+    for e in need_ip:
+        e["ip"] = resolve(e["host"]) or ""
+    geo = geo_lookup([e["ip"] for e in entries if e["ip"] and not (e.get("country") or d.get("country"))])
     added, dup = 0, 0
     with POOL_LOCK:
         have = {landing_key(it["ob"]) for it in POOL["items"]}
-        for ln, ob, host in parsed:
+        for e in entries:
+            ob = dict(e["ob"])
+            ob.pop("tag", None)
+            ob.pop("id", None)
             k = landing_key(ob)
             if k in have:
                 dup += 1
                 continue
             have.add(k)
-            ip = ips.get(host) or ""
-            POOL["items"].append({"id": secrets.token_hex(5), "raw": ln, "ob": ob, "host": host, "ip": ip,
+            g = lambda f: (str(e.get(f) or "").strip() or str(d.get(f) or "").strip())
+            POOL["items"].append({"id": secrets.token_hex(5), "raw": e["raw"], "ob": ob, "host": e["host"], "ip": e["ip"],
                                   "port": ob.get("server_port"), "type": ob.get("type"),
-                                  "country": (body.get("country") or "").strip() or geo.get(ip, ""), "net": ip_net(ip),
-                                  "supplier": (body.get("supplier") or "").strip(), "cost": (body.get("cost") or "").strip(),
-                                  "expire": exp, "note": (body.get("note") or "").strip(), "disabled": False,
-                                  "added": int(time.time()), "check": None})
+                                  "country": g("country") or geo.get(e["ip"], ""), "net": ip_net(e["ip"]),
+                                  "supplier": g("supplier"), "cost": g("cost"),
+                                  "expire": int(e.get("expire") or d.get("expire") or 0), "note": g("note"),
+                                  "disabled": bool(e.get("disabled")), "added": int(time.time()), "check": None})
             added += 1
-        save_pool()
-        missing = len([1 for it in POOL["items"] if not it.get("country")])
-    if missing:
+        if added:
+            save_pool()
+        missing = any(not it.get("country") for it in POOL["items"])
+    if added and missing and CFG.get("geo_lookup", True):
         threading.Thread(target=pool_geo_fill, daemon=True).start()
+    return added, dup
+
+
+def op_pool_import(body):
+    """text：每行一个落地；records：导出文件里的完整记录（带国家/供应商/进价/到期/备注）。"""
+    recs = []
+    for r in body.get("records") or []:
+        if isinstance(r, dict) and r.get("raw"):
+            recs.append(r)
+    for l in (body.get("text") or "").splitlines():
+        if l.strip():
+            recs.append({"raw": l.strip()})
+    if not recs:
+        raise SuiError("没有内容")
+    entries, errors = [], []
+    for r in recs:
+        ln = str(r["raw"]).strip()
+        try:
+            ob, host, remark = parse_landing(ln)
+            if ob.get("type") == "direct":
+                raise ValueError("直连不能放进落地库")
+            e = {k: r.get(k) for k in ("country", "supplier", "cost", "expire", "note", "disabled")}
+            e.update({"raw": ln, "ob": ob, "host": host})
+            entries.append(e)
+        except Exception as ex:
+            errors.append({"line": ln, "error": str(ex)})
+    added, dup = _pool_add(entries, {k: body.get(k) for k in ("country", "supplier", "cost", "expire", "note")})
+    with POOL_LOCK:
+        missing = len([1 for it in POOL["items"] if not it.get("country")])
     return {"added": added, "dup": dup, "errors": errors, "geo_missing": missing}
+
+
+def op_pool_export(body):
+    ids = set(body.get("ids") or [])
+    with POOL_LOCK:
+        recs = [{k: it.get(k) for k in ("raw", "country", "supplier", "cost", "expire", "note", "disabled")}
+                for it in POOL["items"] if not ids or it["id"] in ids]
+    return {"records": recs, "host": CFG.get("public_host", "")}
 
 
 def op_pool_update(body):
@@ -3391,7 +3438,7 @@ OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kic
             "server_save": op_server_save, "server_del": op_server_del, "servers_overview": op_servers_overview,
             "local_token_reset": op_local_token_reset, "pool_list": op_pool_list, "pool_import": op_pool_import,
             "pool_update": op_pool_update, "pool_delete": op_pool_delete, "pool_check": op_pool_check,
-            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto, "pool_geo": op_pool_geo})
+            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto, "pool_geo": op_pool_geo, "pool_export": op_pool_export})
 
 
 # ------------------------------------------------------------- web server --

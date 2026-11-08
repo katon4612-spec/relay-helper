@@ -149,7 +149,7 @@ const LS={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:
 let state={srv:LS.get("rh_srv")||"local",servers:[],tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
 
 async function api(a,body,opt){
-  const hd={"Content-Type":"application/json"};if(state.srv&&state.srv!=="local"&&!(opt&&opt.local))hd["X-RH-Server"]=state.srv;
+  const hd={"Content-Type":"application/json"};const sv=opt&&opt.srv?opt.srv:state.srv;if(sv&&sv!=="local"&&!(opt&&opt.local))hd["X-RH-Server"]=sv;
   const r=await fetch(BASE+"api/"+a,{method:"POST",headers:hd,body:JSON.stringify(body||{})});
   const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
   if(j.login){renderLogin();throw new Error("请先登录")}
@@ -231,13 +231,14 @@ IP:端口:账号:密码
 vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
 也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
   <p class="hint" id="relayhint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
-  <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button><button id="frompool">从落地库选</button></div></div>
+  <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button><button id="frompool">从落地库选</button>
+   <label class="ck" title="新建线路用到的落地，如果落地库里没有就自动加进去（重复的不加）"><input type="checkbox" id="topool" ${LS.get("rh_topool")==="0"?"":"checked"}>新落地自动加入落地库</label></div></div>
   <div id="pvbox"></div><div id="resbox"></div>`;
   $("#frompool").onclick=()=>poolPicker(raws=>{const t=$("#txt");t.value=(t.value.trim()?t.value.trim()+"\n":"")+raws.join("\n");toast(`已加入 ${raws.length} 条落地`)});
   const sp=saved.protos||[saved.proto||"vless"];document.querySelectorAll("#protos input").forEach(c=>c.checked=sp.includes(c.value));
   $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
-  $("#pv").onclick=doPreview;
+  $("#pv").onclick=doPreview;$("#topool").onchange=()=>LS.set("rh_topool",$("#topool").checked?"1":"0");
   const md=state.mode||saved.mode||"relay";document.querySelector(`#modes input[value=${md}]`).checked=true;
   const msync=()=>{const d=curMode()==="direct";state.mode=curMode();$("#txtbox").style.display=d?"none":"";$("#relayhint").style.display=d?"none":"";$("#dcnt").style.display=d?"flex":"none"};
   document.querySelectorAll("#modes input").forEach(r=>r.onchange=()=>{msync();state.preview=null;H("#pvbox","")});msync();
@@ -301,14 +302,14 @@ async function doCreate(){
   if(attach.length)lines.push(`给 ${attach.length} 条已有线路加上所选协议（已有的协议自动跳过）`);
   if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起处理。\n\n`:""}${lines.join("\n")}\n\n完成后会重启 s-ui 让路由生效，所有线路约断 3 秒。确定？`))return;
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 处理中…';
-  try{let results=[],core="ok";
-    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0});results=results.concat(r.results);core=r.core}
+  try{let results=[],core="ok",poolAdded=0;
+    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0"});results=results.concat(r.results);core=r.core;poolAdded=r.pool_added||0}
     let skipped=0;
     if(attach.length){const r=await api("add_protocol",{tags:attach,protocols:protos});skipped=r.results.filter(z=>z.skipped).length;results=results.concat(r.results.filter(z=>!z.skipped));if(r.core!=="ok")core=r.core}
     state.results=results;const ok=results.filter(x=>x.ok).length;
     if(!results.length&&skipped){toast(`原线路已经有所选的协议，没有新增节点（跳过 ${skipped} 个）`,6000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}return}
     state.preview=null;H("#pvbox","");state.text="";const tx=$("#txt");if(tx)tx.value="";  // 防止同一批重复创建
-    toast(`成功 ${ok} 个节点${ok<results.length?`，失败 ${results.length-ok} 个`:""}${skipped?`，原线路已有的协议跳过 ${skipped} 个`:""}${coreMsg(core)}`,5000);
+    toast(`成功 ${ok} 个节点${ok<results.length?`，失败 ${results.length-ok} 个`:""}${skipped?`，原线路已有的协议跳过 ${skipped} 个`:""}${poolAdded?`，${poolAdded} 个新落地已加入落地库`:""}${coreMsg(core)}`,6000);
     if(state.tab==="create")renderResults();else toast(`成功 ${ok} 个节点${coreMsg(core)}，回到「一键中转」查看链接`,6000)}
   catch(e){toast(e.message,5000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}}
 }
@@ -684,14 +685,14 @@ async function renderPool(){
   <div class="row" style="gap:6px;margin:10px 0"><button class="sm" data-pc="">全部（${items.length}）</button>${Object.entries(by).map(([c,v])=>`<button class="sm" data-pc="${esc(c)}">${esc(c)} ${v.n}<span class="muted">（空闲 ${v.idle}${v.bad?`，<span class="err">不通 ${v.bad}</span>`:""}）</span></button>`).join("")}</div>
   <div class="toolbar"><input id="pq" class="grow" placeholder="搜 IP / 网段 / 供应商 / 备注 / 使用的线路" value="${esc(state.pf.q)}">
    <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">有线路在用</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
-   <button class="pri" id="pimp">导入落地</button></div>
+   <button id="pexp">导出</button><button class="pri" id="pimp">导入落地</button></div>
   <div class="toolbar" id="pbulk"></div><div id="ptable"></div></div>
   ${by["未知"]?`<div class="warnbox">有 ${by["未知"].n} 个落地国家还没识别出来：服务器每 30 分钟会在后台自动补一次；也可以点「未知」→「全选当前」→「重新识别国家」马上补。查不到的（比如 IP 太新、查询库里没有）用「编辑」手动填国家。</div>`:""}
   ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;
   document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;renderPool()}});
   $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
   $("#pq").oninput=()=>{state.pf.q=$("#pq").value;drawPool()};
-  $("#pimp").onclick=poolImportDlg;
+  $("#pimp").onclick=poolImportDlg;$("#pexp").onclick=poolExportDlg;
   drawPool();
 }
 function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now()/1000;
@@ -733,17 +734,46 @@ function drawPool(){
       if($("#ecost").value.trim())f.cost=$("#ecost").value.trim();if($("#ee").value)f.expire=Math.floor(new Date($("#ee").value+"T23:59:59").getTime()/1000);if($("#en").value.trim())f.note=$("#en").value.trim();
       closeModal();await upd(f)}};
 }
+async function poolExportDlg(){
+  const sel=state.psel,useSel=sel.size>0,list=useSel?state.pool.filter(it=>sel.has(it.id)):poolFiltered();
+  if(!list.length)return toast("没有可导出的落地");
+  const f=state.pf,what=useSel?`已选的 ${list.length} 个`:(f.c||f.s||f.q.trim()?`当前筛选的 ${list.length} 个`:`全部 ${list.length} 个`);
+  const others=[{id:"local",name:"本机 · "+((state.local||{}).public_host||"")}].concat(state.servers||[]).filter(s=>s.id!==state.srv);
+  modal(`<h2 style="margin-top:0">导出落地（${esc(what)}）</h2>
+  <p class="hint">想只导出一部分：先关掉弹窗，按国家/状态筛选或勾选，再点「导出」。</p>
+  <div class="row" style="margin-top:8px"><button id="xcopy">复制落地（每行一个）</button><button id="xtxt">下载 .txt</button><button id="xjson">下载完整文件 .json</button></div>
+  <p class="hint">.txt / 复制：只有落地本身，任何中转机「导入落地」粘贴就能用。.json：还带国家、供应商、进价、到期、备注，在另一台的「导入落地」里选这个文件导入，信息原样带过去。</p>
+  ${others.length?`<div class="row" style="margin-top:12px"><label>直接复制到另一台中转<select id="xsrv">${others.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("")}</select></label><button class="pri" id="xpush">复制过去</button></div>
+  <p class="hint">连同国家、供应商、到期一起复制；对方库里已有的自动跳过。</p>`:'<p class="hint">在「服务器」页添加其他中转后，这里可以直接一键复制过去。</p>'}
+  <div class="row" style="margin-top:12px"><button id="xcl">关闭</button></div><p id="xmsg"></p>`);
+  $("#xcl").onclick=closeModal;
+  const getRecs=async()=>(await api("pool_export",{ids:list.map(it=>it.id)})).records;
+  const stamp=()=>{const d=new Date(),p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`};
+  const host=safeName((state.srv==="local"?(state.local||{}).public_host:(state.servers.find(s=>s.id===state.srv)||{}).name)||"落地库");
+  $("#xcopy").onclick=()=>copy(list.map(it=>it.raw).join("\n"));
+  $("#xtxt").onclick=()=>saveBlob(new Blob([list.map(it=>it.raw).join("\n")+"\n"],{type:"text/plain"}),`落地库_${host}_${stamp()}.txt`);
+  $("#xjson").onclick=async()=>{try{const recs=await getRecs();saveBlob(new Blob([JSON.stringify({type:"relay-helper-landings",version:1,records:recs},null,1)],{type:"application/json"}),`落地库_${host}_${stamp()}.json`)}catch(e){toast(e.message)}};
+  if($("#xpush"))$("#xpush").onclick=async()=>{const b=$("#xpush"),to=$("#xsrv").value;b.disabled=true;b.innerHTML='<span class="spin"></span> 复制中';
+    try{const recs=await getRecs();let added=0,dup=0,err=0;
+      for(let i=0;i<recs.length;i+=500){const x=await api("pool_import",{records:recs.slice(i,i+500)},{srv:to});added+=x.added;dup+=x.dup;err+=x.errors.length}
+      H("#xmsg",`<span class="ok">已复制到「${esc($("#xsrv").selectedOptions[0].textContent)}」：新增 ${added} 个${dup?`，对方已有跳过 ${dup} 个`:""}${err?`，${err} 个无法识别`:""}。</span>`)}
+    catch(e){H("#xmsg",`<span class="err">${esc(e.message)}</span>`)}b.disabled=false;b.textContent="复制过去"};
+}
 function poolImportDlg(){
   modal(`<h2 style="margin-top:0">导入落地</h2>
   <p class="hint">每行一条，格式和一键中转一样（IP:端口:账号:密码、socks5://…、vless://… 等）。国家和网段会自动识别；同一批可以统一填供应商、进价、到期。重复的会跳过。</p>
   <textarea id="it" style="min-height:180px" placeholder="1.2.3.4:1080:user:pass"></textarea>
+  <div class="row" style="margin-top:6px"><label>或选择导出的文件（.json / .txt）<input id="ifile" type="file" accept=".json,.txt,text/plain,application/json"></label><span class="muted" id="ifinfo"></span></div>
   <div class="row" style="margin-top:10px"><label>供应商<input id="isup" style="width:140px"></label><label>进价（每个）<input id="icost" style="width:100px"></label>
   <label>落地到期<input id="iexp" type="date"></label><label>国家（留空自动）<input id="icty" style="width:110px"></label></div>
   <div class="row" style="margin-top:10px"><label style="flex:1">备注<input id="inote" style="width:100%"></label></div>
   <div class="row" style="margin-top:12px"><button class="pri" id="iok">导入并检测</button><button id="icl">取消</button></div><p id="imsg"></p>`);
-  $("#icl").onclick=closeModal;
+  $("#icl").onclick=closeModal;let recs=null;
+  $("#ifile").onchange=async()=>{const f=$("#ifile").files[0];recs=null;if(!f)return H("#ifinfo","");const t=await f.text();
+    try{const j=JSON.parse(t);recs=Array.isArray(j)?j:j.records;if(!Array.isArray(recs))throw 0;H("#ifinfo",`文件里有 ${recs.length} 个落地（带国家/供应商/到期等信息）`)}
+    catch(e){recs=null;$("#it").value=t;H("#ifinfo","已把文件内容放进上面的输入框")}};
   $("#iok").onclick=async()=>{const b=$("#iok");b.disabled=true;b.innerHTML='<span class="spin"></span> 导入中';
-    try{const x=await api("pool_import",{text:$("#it").value,supplier:$("#isup").value,cost:$("#icost").value,country:$("#icty").value,note:$("#inote").value,
+    try{const x=await api("pool_import",{text:$("#it").value,records:recs||[],supplier:$("#isup").value,cost:$("#icost").value,country:$("#icty").value,note:$("#inote").value,
         expire:$("#iexp").value?Math.floor(new Date($("#iexp").value+"T23:59:59").getTime()/1000):0});
       H("#imsg",`已导入 ${x.added} 个${x.dup?`，跳过重复 ${x.dup} 个`:""}${x.errors.length?`<div class="err">${x.errors.length} 行无法识别：${x.errors.slice(0,5).map(e=>esc(e.line)).join("；")}</div>`:""}`);
       if(x.added){b.innerHTML='<span class="spin"></span> 检测中';const l=await api("pool_list");const fresh=l.items.filter(it=>!it.check).map(it=>it.id);
