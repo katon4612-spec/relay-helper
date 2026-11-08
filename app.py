@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.14.1"
+VERSION = "1.14.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2878,32 +2878,27 @@ def _current(okey, data):
 
 
 def _candidates(cur, use, country=None):
-    """同国家、没停用、没到期的落地（可以和别的线路共用），
-    排序：不同网段优先 → 最近没失败 → 所在网段最近没失败 → 检测能通 → 在用的线路少 → 延迟低。"""
-    country = cur["country"] if country is None else country
+    """只挑同国家、没停用、没到期的落地（可以和别的线路共用），
+    排序：同网段优先 → 最近没失败 → 检测能通 → 在用的线路少 → 延迟低。"""
+    country = cur.get("country") or ""
     now = time.time()
-    bad_nets = set()
     with POOL_LOCK:
         items = [dict(it) for it in POOL["items"]]
-    for it in items:  # 最近 10 分钟有落地检测失败的网段，往后排
-        c = it.get("check") or {}
-        if c and not c.get("ok") and now - (c.get("ts") or 0) < 600:
-            bad_nets.add(it.get("net"))
     out = []
     for it in items:
         if it.get("disabled") or (it.get("expire") and it["expire"] < now):
             continue
         if cur.get("ob") and landing_key(it["ob"]) == landing_key(cur["ob"]):
             continue  # 就是现在用的这个
-        if country and it.get("country") != country:
-            continue
+        if (it.get("country") or "") != country:
+            continue  # 只换同国家的（当前落地国家未知时，只在国家同样未知的里挑）
         if it.get("id") == cur.get("rec_id"):
             continue
         c = it.get("check") or {}
-        recent_fail = c and not c.get("ok") and now - (c.get("ts") or 0) < 600
+        recent_fail = bool(c) and not c.get("ok") and now - (c.get("ts") or 0) < 600
         same_net = bool(cur.get("net")) and it.get("net") == cur["net"]
         n_use = len([u for u in use.get(landing_key(it["ob"]), []) if not u.endswith("（备用）")])
-        score = (same_net, recent_fail, it.get("net") in bad_nets, not (c and c.get("ok")), n_use, c.get("delay") or 99999)
+        score = (not same_net, recent_fail, not c.get("ok"), n_use, c.get("delay") or 99999)
         out.append((score, it))
     out.sort(key=lambda x: x[0])
     return [it for _, it in out]

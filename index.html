@@ -642,12 +642,12 @@ async function poolSection(tag){
   box.innerHTML=`<b>从落地库换</b> <span class="hint">当前：${esc(c.addr)}　${esc(c.country||"国家未知")}　网段 ${esc(c.net||"-")}${c.in_pool?"":"（不在落地库里）"}</span>
   <div class="row" style="margin-top:8px;align-items:center"><button class="pri sm" id="pauto1">自动挑一个能通的换上</button>
   <label class="ck"><input type="checkbox" id="pautochk" ${x.auto?"checked":""} ${x.has_failover?"disabled":""}>落地不通时自动从库里换${x.has_failover?"（已设备用落地，由备用落地负责）":""}</label></div>
-  <p class="hint">优先挑同国家、<b>不同网段</b>、最近检测能通、在用线路少的落地（落地可以多条线路共用）；换之前会先检测。客户链接不变。</p>
+  <p class="hint">只在<b>同国家</b>的落地里挑，<b>同网段优先</b>，再看最近检测能通、在用线路少的（落地可以多条线路共用）；换之前会先检测，不通的会跳过。客户链接不变。</p>
   ${x.candidates.length?`<table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th><th></th></tr>${x.candidates.slice(0,8).map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
-    <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag warn">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
-    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有别的${esc(c.country||"")}落地，可以到「落地库」页导入。</p>`}
+    <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag ok">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
+    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有别的${esc(c.country||"国家未知的")}落地，可以到「落地库」页导入（国家识别不出来时可以在落地库里手动填）。</p>`}
   <p id="pmsg"></p>`;
-  const done=async(p)=>{const r=await p;state.checks[tag]=r.check;H("#pmsg",`<span class="tag ${r.check&&r.check.ok?"ok":"bad"}">已换成 ${esc(r.to)}（${esc(r.country||"")} ${esc(r.net||"")}）${r.check&&r.check.ok?"，连通 "+r.check.delay+"ms":"，但检测不通"}</span>${r.same_net?' <span class="tag warn">注意：和原来是同一网段</span>':""}`);await loadRelays();drawTable();setTimeout(()=>{if($("#poolbox"))replaceDlg(tag)},1800)};
+  const done=async(p)=>{const r=await p;state.checks[tag]=r.check;H("#pmsg",`<span class="tag ${r.check&&r.check.ok?"ok":"bad"}">已换成 ${esc(r.to)}（${esc(r.country||"")} ${esc(r.net||"")}）${r.check&&r.check.ok?"，连通 "+r.check.delay+"ms":"，但检测不通"}</span>${r.same_net?' <span class="tag ok">同网段</span>':""}`);await loadRelays();drawTable();setTimeout(()=>{if($("#poolbox"))replaceDlg(tag)},1800)};
   $("#pauto1").onclick=async()=>{const b=$("#pauto1");b.disabled=true;b.innerHTML='<span class="spin"></span> 检测并更换中…';try{await done(api("pool_switch",{tag}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="自动挑一个能通的换上"}};
   document.querySelectorAll("#poolbox [data-use]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';try{await done(api("pool_switch",{tag,id:b.dataset.use}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`)}});
   $("#pautochk").onchange=async()=>{try{await api("pool_auto",{tags:[tag],on:$("#pautochk").checked});toast($("#pautochk").checked?"已开启：落地不通时自动从落地库换":"已关闭自动换");await loadRelays();drawTable()}catch(e){toast(e.message)}};
@@ -680,7 +680,7 @@ async function renderPool(){
   const by={};items.forEach(it=>{const c=it.country||"未知";(by[c]=by[c]||{n:0,idle:0,bad:0}).n++;if(!it.used_by.length&&!it.disabled&&!it.expired)by[c].idle++;if(it.check&&!it.check.ok)by[c].bad++});
   const soon=items.filter(it=>it.expire&&it.expire>now&&it.expire<now+7*86400).length;
   m.innerHTML=`<div class="card"><h2>落地库</h2>
-  <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（优先同国家、不同网段），也可以给线路开「自动换」。一个落地可以多条线路共用，「状态」里标出有几条线路在用、是哪几条。</p>
+  <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（只换同国家的，同网段优先），也可以给线路开「自动换」。一个落地可以多条线路共用，「状态」里标出有几条线路在用、是哪几条。</p>
   <div class="row" style="gap:6px;margin:10px 0"><button class="sm" data-pc="">全部（${items.length}）</button>${Object.entries(by).map(([c,v])=>`<button class="sm" data-pc="${esc(c)}">${esc(c)} ${v.n}<span class="muted">（空闲 ${v.idle}${v.bad?`，<span class="err">不通 ${v.bad}</span>`:""}）</span></button>`).join("")}</div>
   <div class="toolbar"><input id="pq" class="grow" placeholder="搜 IP / 网段 / 供应商 / 备注 / 使用的线路" value="${esc(state.pf.q)}">
    <select id="pst"><option value="">全部状态</option><option value="idle">空闲</option><option value="used">有线路在用</option><option value="bad">检测不通</option><option value="exp">已到期 / 7 天内到期</option><option value="off">已停用</option></select>
