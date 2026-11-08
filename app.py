@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.15.3"
+VERSION = "1.15.4"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -3543,6 +3543,9 @@ def check_sui_login(user, pw):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # 长连接：浏览器复用同一条连接（HTTPS 不用每点一下都重新握手），跨境访问每次点击省几百毫秒
+    protocol_version = "HTTP/1.1"
+    timeout = 75   # 空闲连接 75 秒后关掉
     server_version = "relay-helper"
 
     def log_message(self, fmt, *args):
@@ -3557,8 +3560,12 @@ class Handler(BaseHTTPRequestHandler):
               and ctype.split("/")[0] in ("application", "text") and "zip" not in ctype and "octet" not in ctype)
         if gz:   # 落地库这种大列表压缩后小 5~10 倍，跨境访问快很多
             body = gzip.compress(body, 5)
+        if code >= 400:   # 出错时请求体可能没读完，不复用这条连接
+            self.close_connection = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if code >= 400:
+            self.send_header("Connection", "close")
         if gz:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
@@ -3619,6 +3626,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     sv = _server(sid)
                     with _remote(sv, "api/backup_download?full=%d" % full, timeout=600) as r:
+                        if not r.headers.get("Content-Length"):
+                            self.close_connection = True
                         self.send_response(200)
                         for hk in ("Content-Type", "Content-Length", "Content-Disposition"):
                             if r.headers.get(hk):

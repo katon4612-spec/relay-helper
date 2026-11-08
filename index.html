@@ -489,7 +489,7 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const r=await api("list");state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv=srv;state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
@@ -507,8 +507,9 @@ async function renderManage(){
   <button id="rf">刷新</button></div>
   <div class="toolbar" id="bulk"></div><div style="overflow:auto" id="tbl"><span class="spin"></span></div><div class="pager" id="pg"></div></div>`;
   $("#q").oninput=()=>{state.q=$("#q").value.trim();state.page=1;drawTable()};
-  $("#rf").onclick=async()=>{await loadRelays();drawTable()};
-  try{await loadRelays();drawTable()}catch(e){toast(e.message)}
+  $("#rf").onclick=async()=>{const b=$("#rf");b.disabled=true;try{await loadRelays();drawTable()}catch(e){toast(e.message)}b.disabled=false};
+  const srv=state.srv;if(state.relays&&state.relSrv===srv){drawSecure();drawTable()}   // 先用上次的数据马上显示，再后台刷新
+  try{await loadRelays();if(state.tab==="manage"&&state.srv===srv&&!document.querySelector("#modal.show"))drawTable()}catch(e){toast(e.message)}
 }
 /* 同一落地（同一个落地出站）的节点算一组：同一客户同一条线路的不同协议 */
 const PORD={vless:0,vless443:1,hysteria2:2,socks:3};
@@ -689,9 +690,16 @@ async function poolPicker(cb){
     cb(idle.filter(it=>ids.has(it.id)).map(it=>it.raw));closeModal()};
 }
 async function renderPool(){
-  const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
-  let x;try{x=await api("pool_list")}catch(e){return H("#main",`<div class="card err">${esc(e.message)}</div>`)}
-  if(state.tab!=="pool")return;
+  const srv=state.srv,cached=state.poolX&&state.poolXsrv===srv;
+  if(cached)paintPool(state.poolX);else $("#main").innerHTML='<div class="card"><span class="spin"></span> 正在读取落地库…</div>';
+  let x;try{x=await api("pool_list")}catch(e){if(!cached)H("#main",`<div class="card err">${esc(e.message)}</div>`);else toast(e.message);return}
+  if(state.tab!=="pool"||state.srv!==srv)return;
+  state.poolX=x;state.poolXsrv=srv;
+  if(cached&&document.querySelector("#modal.show"))return;   // 弹窗开着就先不重画
+  paintPool(x);
+}
+function paintPool(x){
+  const m=$("#main");
   state.pool=x.items;state.pf=state.pf||{c:"",s:"",q:""};state.psel=state.psel||new Set();
   const items=x.items,now=x.now;
   const by={};items.forEach(it=>{const c=it.country||"未知";(by[c]=by[c]||{n:0,idle:0,bad:0}).n++;if(!it.used_by.length&&!it.disabled&&!it.expired)by[c].idle++;if(it.check&&!it.check.ok)by[c].bad++});
@@ -706,9 +714,9 @@ async function renderPool(){
   ${by["未知"]?`<div class="warnbox">有 ${by["未知"].n} 个落地国家还没识别出来：服务器每 30 分钟会在后台自动补一次；也可以点「未知」→「全选当前」→「重新识别国家」马上补。查不到的（比如 IP 太新、查询库里没有）用「编辑」手动填国家。</div>`:""}
   ${x.bg_check&&x.bg_check.running?`<div class="warnbox"><span class="spin"></span> 正在后台检测新加进来的落地：${x.bg_check.done}/${x.bg_check.total}，页面每 20 秒自动刷新。</div>`:""}
   ${soon?`<div class="warnbox">有 ${soon} 个落地 7 天内到期，记得找供应商续费（状态选「已到期 / 7 天内到期」查看）。</div>`:""}`;
-  document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;renderPool()}});
+  document.querySelectorAll("[data-pc]").forEach(b=>{b.classList.toggle("pri",b.dataset.pc===state.pf.c);b.onclick=()=>{state.pf.c=b.dataset.pc;state.plim=200;paintPool(state.poolX)}});
   $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
-  $("#pq").oninput=()=>{state.pf.q=$("#pq").value;drawPool()};
+  $("#pq").oninput=()=>{state.pf.q=$("#pq").value;clearTimeout(state.pqT);state.pqT=setTimeout(()=>{state.plim=200;drawPool()},180)};
   $("#pimp").onclick=poolImportDlg;$("#pexp").onclick=poolExportDlg;
   drawPool();
   clearTimeout(state.poolT);if(x.bg_check&&x.bg_check.running)state.poolT=setTimeout(()=>{if(state.tab==="pool"&&!document.querySelector("#modal.show")&&!state.psel.size)renderPool()},20000);
@@ -718,20 +726,27 @@ function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now
     (!f.s||(f.s==="idle"&&!it.used_by.length&&!it.disabled&&!it.expired)||(f.s==="used"&&it.used_by.length)||(f.s==="bad"&&it.check&&!it.check.ok)||(f.s==="exp"&&it.expire&&it.expire<now+7*86400)||(f.s==="off"&&it.disabled))&&
     (!q||[it.host,it.net,it.supplier,it.note,it.used_by.join(" "),it.raw].join(" ").toLowerCase().includes(q)))}
 function drawPool(){
-  const list=poolFiltered(),sel=state.psel;[...sel].forEach(id=>{if(!state.pool.some(it=>it.id===id))sel.delete(id)});
-  H("#pbulk",`<span class="muted">${list.length} 个${sel.size?`，已选 ${sel.size}`:""}</span><button class="sm" id="psall">全选当前</button>${sel.size?`<button class="sm" id="psnone">取消选择</button>
-   <button class="sm" id="pchk">检测</button><button class="sm" id="pgeo">重新识别国家</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
+  const list=poolFiltered(),sel=state.psel,lim=state.plim||200;state.plist=list;
+  const ids=new Set(state.pool.map(it=>it.id));[...sel].forEach(id=>{if(!ids.has(id))sel.delete(id)});
   H("#ptable",list.length?`<table><tr><th></th><th>国家</th><th>落地</th><th>网段</th><th>状态</th><th>检测</th><th>供应商 / 进价</th><th>落地到期</th><th>备注</th></tr>
-  ${list.slice(0,500).map(it=>`<tr><td><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td>${esc(it.country||"未知")}</td>
+  ${list.slice(0,lim).map(it=>`<tr><td><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td>${esc(it.country||"未知")}</td>
    <td class="mono">${esc(it.host)}:${esc(it.port)} <span class="tag gray">${esc(protoName[it.type]||it.type)}</span></td><td class="mono">${esc(it.net||"-")}</td>
    <td>${poolStatus(it)}</td><td>${chkTag(it.check)}</td><td>${esc(it.supplier||"")}${it.cost?` <span class="muted">¥${esc(it.cost)}</span>`:""}</td>
-   <td>${it.expire?`<span class="${it.expired?"err":""}">${esc(fmtD(it.expire))}</span>`:'<span class="muted">-</span>'}</td><td class="muted">${esc(it.note||"")}</td></tr>`).join("")}</table>`:
+   <td>${it.expire?`<span class="${it.expired?"err":""}">${esc(fmtD(it.expire))}</span>`:'<span class="muted">-</span>'}</td><td class="muted">${esc(it.note||"")}</td></tr>`).join("")}</table>
+   ${list.length>lim?`<div class="row" style="margin-top:10px"><button class="sm" id="pmore">显示更多（还有 ${list.length-lim} 个）</button></div>`:""}`:
    `<p class="hint">${state.pool.length?"没有符合条件的落地":"落地库还是空的，点右上角「导入落地」把买来的落地粘贴进来。"}</p>`);
-  document.querySelectorAll("[data-ps]").forEach(c=>c.onchange=()=>{c.checked?sel.add(c.dataset.ps):sel.delete(c.dataset.ps);drawPool()});
-  $("#psall").onclick=()=>{list.forEach(it=>sel.add(it.id));drawPool()};
+  if($("#pmore"))$("#pmore").onclick=()=>{state.plim=lim+300;drawPool()};
+  document.querySelectorAll("[data-ps]").forEach(c=>c.onchange=()=>{c.checked?sel.add(c.dataset.ps):sel.delete(c.dataset.ps);drawPoolBulk()});
+  drawPoolBulk();
+}
+function drawPoolBulk(){
+  const list=state.plist||[],sel=state.psel;
+  H("#pbulk",`<span class="muted">${list.length} 个${sel.size?`，已选 ${sel.size}`:""}</span><button class="sm" id="psall">全选当前</button>${sel.size?`<button class="sm" id="psnone">取消选择</button>
+   <button class="sm" id="pchk">检测</button><button class="sm" id="pgeo">重新识别国家</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
+  $("#psall").onclick=()=>{list.forEach(it=>sel.add(it.id));document.querySelectorAll("[data-ps]").forEach(c=>c.checked=true);drawPoolBulk()};
   if(!sel.size)return;
   const ids=[...sel];
-  $("#psnone").onclick=()=>{sel.clear();drawPool()};
+  $("#psnone").onclick=()=>{sel.clear();document.querySelectorAll("[data-ps]").forEach(c=>c.checked=false);drawPoolBulk()};
   $("#pcopy").onclick=()=>copy(state.pool.filter(it=>sel.has(it.id)).map(it=>it.raw).join("\n"));
   $("#pchk").onclick=async()=>{const b=$("#pchk");b.disabled=true;let done=0;
     for(let i=0;i<ids.length;i+=30){b.innerHTML=`<span class="spin"></span> ${done}/${ids.length}`;try{await api("pool_check",{ids:ids.slice(i,i+30)})}catch(e){toast(e.message)}done=Math.min(ids.length,i+30)}
