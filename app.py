@@ -41,7 +41,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -933,7 +933,7 @@ def op_create(body):
     with LOCK:
         data = SUI.load_all()
         tls, taken_names, taken_ports = _prepare(data, protos)
-        results, new_outbounds, shared, to_pool = [], [], [], []
+        results, new_outbounds, shared, to_pool, direct_obs = [], [], [], [], set()
         for it in items:
             base = unique_name(it["name"], taken_names) if it["name"] in taken_names else it["name"]
             taken_names.add(base)
@@ -962,6 +962,8 @@ def op_create(body):
                 _rollback({}, base)  # 一个入站都没建成：落地出站也删掉
             else:
                 new_outbounds.append(base)
+                if it["outbound"].get("type") == "direct":
+                    direct_obs.add(base)
                 if it.get("raw") and it["outbound"].get("type") != "direct":
                     to_pool.append({"raw": it["raw"], "ob": it["outbound"], "host": it.get("host") or it["outbound"].get("server", ""),
                                     "ip": it.get("ip") or "", "country": it.get("country") or ""})
@@ -972,6 +974,13 @@ def op_create(body):
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
+    if body.get("auto_switch"):
+        made_obs = [o for o in new_outbounds if o not in direct_obs and any(r.get("ok") and r.get("outbound") == o for r in results)]
+        if made_obs:
+            with POOL_LOCK:
+                for o in made_obs:
+                    POOL["auto"][o] = True
+                save_pool()
     pool_added = 0
     if to_pool and body.get("to_pool", True):
         try:
@@ -1339,6 +1348,10 @@ def op_delete(body):
                         with SUBS_LOCK:
                             if SUBS.pop(ot, None):
                                 save_subs()
+                        with POOL_LOCK:   # 自动换开关也清掉，免得以后同名的新线路继承
+                            POOL_STATE.pop(ot, None)
+                            if POOL["auto"].pop(ot, None) is not None:
+                                save_pool()
                         with FO_LOCK:
                             f = FO.pop(ot, None)
                             FO_STATE.pop(ot, None)
@@ -3084,18 +3097,26 @@ def op_pool_auto(body):
     data = SUI.load_all()
     on = bool(body.get("on"))
     rows = {r["tag"]: r for r in build_relays(data)}
-    n = 0
+    done, skip, fo = set(), 0, 0
     with POOL_LOCK:
         for t in body.get("tags") or []:
             r = rows.get(t)
-            if r and r.get("outbound_tag") and r.get("landing_type") != "direct":
-                if on:
-                    POOL["auto"][r["outbound_tag"]] = True
-                else:
-                    POOL["auto"].pop(r["outbound_tag"], None)
-                n += 1
+            if not r or not r.get("outbound_tag") or r["outbound_tag"] in done:
+                continue
+            if r.get("landing_type") == "direct":
+                skip += 1
+                continue
+            k = r["outbound_tag"]
+            done.add(k)
+            if on:
+                POOL["auto"][k] = True
+            else:
+                POOL["auto"].pop(k, None)
         save_pool()
-    return {"updated": n}
+    if on:
+        with FO_LOCK:
+            fo = len([k for k in done if FO.get(k) and (FO[k].get("backup") or FO[k].get("primary"))])
+    return {"updated": len(done), "direct": skip, "failover": fo}
 
 
 def pool_once():

@@ -232,13 +232,14 @@ vless://…  hy2://…  ss://…  trojan://…  vmess://…  tuic://…
 也可以在前面加名字：  我的线路A socks5://账号:密码@IP:端口"></textarea></div>
   <p class="hint" id="relayhint">节点名自动生成为「落地国家 + 客户名 + 落地IP」，下一步可以改。多选协议时，同一落地会生成多个节点（第二个起名字后加 -HY2 / -S5），共用这个落地。</p>
   <div class="row" style="margin-top:10px"><button class="pri" id="pv">解析预览</button><button id="frompool">从落地库选</button>
-   <label class="ck" title="新建线路用到的落地，如果落地库里没有就自动加进去（重复的不加）"><input type="checkbox" id="topool" ${LS.get("rh_topool")==="0"?"":"checked"}>新落地自动加入落地库</label></div></div>
+   <label class="ck" title="新建线路用到的落地，如果落地库里没有就自动加进去（重复的不加）"><input type="checkbox" id="topool" ${LS.get("rh_topool")==="0"?"":"checked"}>新落地自动加入落地库</label>
+   <label class="ck" title="新线路的落地不通时，自动从落地库换同国家的落地（同网段优先），客户链接不变"><input type="checkbox" id="newauto" ${LS.get("rh_newauto")==="1"?"checked":""}>新线路开启自动换落地</label></div></div>
   <div id="pvbox"></div><div id="resbox"></div>`;
   $("#frompool").onclick=()=>poolPicker(raws=>{const t=$("#txt");t.value=(t.value.trim()?t.value.trim()+"\n":"")+raws.join("\n");toast(`已加入 ${raws.length} 条落地`)});
   const sp=saved.protos||[saved.proto||"vless"];document.querySelectorAll("#protos input").forEach(c=>c.checked=sp.includes(c.value));
   $("#days").value=saved.days||"30";
   const sync=()=>{$("#cdl").style.display=$("#days").value==="custom"?"flex":"none"};$("#days").onchange=sync;sync();
-  $("#pv").onclick=doPreview;$("#topool").onchange=()=>LS.set("rh_topool",$("#topool").checked?"1":"0");
+  $("#pv").onclick=doPreview;$("#topool").onchange=()=>LS.set("rh_topool",$("#topool").checked?"1":"0");$("#newauto").onchange=()=>LS.set("rh_newauto",$("#newauto").checked?"1":"0");
   const md=state.mode||saved.mode||"relay";document.querySelector(`#modes input[value=${md}]`).checked=true;
   const msync=()=>{const d=curMode()==="direct";state.mode=curMode();$("#txtbox").style.display=d?"none":"";$("#relayhint").style.display=d?"none":"";$("#dcnt").style.display=d?"flex":"none"};
   document.querySelectorAll("#modes input").forEach(r=>r.onchange=()=>{msync();state.preview=null;H("#pvbox","")});msync();
@@ -303,7 +304,7 @@ async function doCreate(){
   if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起处理。\n\n`:""}${lines.join("\n")}\n\n完成后会重启 s-ui 让路由生效，所有线路约断 3 秒。确定？`))return;
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 处理中…';
   try{let results=[],core="ok",poolAdded=0;
-    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0"});results=results.concat(r.results);core=r.core;poolAdded=r.pool_added||0}
+    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"});results=results.concat(r.results);core=r.core;poolAdded=r.pool_added||0}
     let skipped=0;
     if(attach.length){const r=await api("add_protocol",{tags:attach,protocols:protos});skipped=r.results.filter(z=>z.skipped).length;results=results.concat(r.results.filter(z=>!z.skipped));if(r.core!=="ok")core=r.core}
     state.results=results;const ok=results.filter(x=>x.ok).length;
@@ -544,7 +545,7 @@ function drawTable(){
    <button class="sm" id="seloff" ${offG.length?"":"disabled"} title="整条线路的客户端都已停用、但没过期（手动停用或流量用完）">选中已停用（${offG.length}）</button>
    <button class="sm" id="selexp" ${expG.length?"":"disabled"} title="整条线路的客户端都已过期">选中已过期（${expG.length}）</button>
    <button class="sm" id="selbad" ${badG.length?"":"disabled"} title="最近一次检测落地不通的线路（自动巡检或手动检测的结果）">选中落地不通（${badG.length}）</button>${nsel?`<button class="sm" id="selnone">取消选择</button>
-   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button>
+   <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button><button class="sm" id="bauto" title="落地不通时自动从落地库换同国家的落地">开自动换</button><button class="sm" id="bnoauto">关自动换</button>
    <button class="sm" id="bport">批量换端口</button><button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
   $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>流量</th><th>设备</th><th>检测</th><th>操作</th></tr>
@@ -579,6 +580,7 @@ function drawTable(){
   if(nsel){$("#selnone").onclick=()=>{state.sel.clear();drawTable()};
     const firsts=()=>all.filter(g=>g.some(r=>state.sel.has(r.tag))).map(g=>g[0].tag);
     $("#bchk").onclick=()=>checkTags(firsts());$("#bren").onclick=()=>renewDlg([...state.sel]);$("#baddp").onclick=()=>addProtoDlg(firsts());$("#blim").onclick=()=>limitDlg(firsts());
+    $("#bauto").onclick=()=>setAuto(firsts(),true);$("#bnoauto").onclick=()=>setAuto(firsts(),false);
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bport").onclick=()=>portDlg([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
   document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,sub:subDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
@@ -995,6 +997,10 @@ function renewDlg(tags){
       let fail=0;for(const[e,ids]of Object.entries(byExp)){const x=await api("update_clients",{client_ids:[...ids],expiry:parseInt(e),reset_traffic:$("#rrst").checked});fail+=x.results.filter(z=>!z.ok).length}
       closeModal();toast(fail?`${fail} 个失败`:`已续期 ${nn} 个节点`);await loadRelays();drawTable()}catch(e){toast(e.message)}};
 }
+async function setAuto(tags,on){
+  try{const x=await api("pool_auto",{tags,on});await loadRelays();drawTable();
+    toast(on?`已给 ${x.updated} 条线路开启自动换${x.failover?`（其中 ${x.failover} 条设了备用落地，会先切备用落地）`:""}${x.direct?`，${x.direct} 条直连线路跳过`:""}`:`已关闭 ${x.updated} 条线路的自动换`,6000)}
+  catch(e){toast(e.message)}}
 async function setEnable(tags,en){
   const ids=[...new Set(expand(tags).map(byTag).filter(r=>r&&r.client_id).map(r=>r.client_id))];
   if(!en&&!confirm(`停用 ${ids.length} 个节点（含同落地的其他协议）？停用后客户无法连接。`))return;
