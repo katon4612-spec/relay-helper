@@ -99,6 +99,7 @@ td.nm.p-vless{--c:var(--p-vless)}td.nm.p-vless443{--c:var(--p-vless443)}td.nm.p-
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .toolbar .grow{flex:1}
 
+#fab{display:none}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,8px);background:var(--ink);color:#FBF5EC;padding:11px 20px;border-radius:10px;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:90vw;z-index:9;box-shadow:0 8px 24px rgba(43,38,32,.22)}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 .modal{position:fixed;inset:0;background:rgba(43,38,32,.36);display:none;align-items:center;justify-content:center;z-index:8;padding:16px;backdrop-filter:blur(2px)}
@@ -133,7 +134,45 @@ input[type=checkbox],input[type=radio]{accent-color:var(--pri)}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid #E2D6C6;border-top-color:var(--pri);border-radius:50%;animation:s .8s linear infinite;vertical-align:-2px}
 @keyframes s{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}.spin{animation-duration:2s}}
-@media(max-width:720px){.hide-sm{display:none}header{flex-wrap:wrap;padding:10px 14px}header nav{margin-left:0;width:100%;overflow-x:auto}header .host{display:none}main{padding:0 10px}.card{padding:16px}}
+@media(max-width:720px){
+ .hide-sm{display:none}
+ header{flex-wrap:wrap;padding:8px 10px 6px;gap:8px}header .host{display:none}
+ header h1{font-size:16px}
+ #srvsel{flex:1;min-width:0;max-width:none;font-size:14px;padding:6px 8px}
+ header nav{margin-left:0;width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;flex-wrap:nowrap}
+ header nav::-webkit-scrollbar{display:none}
+ header nav button{white-space:nowrap;flex:none;padding:8px 13px;font-size:15px}
+ main{padding:0 8px;margin-top:10px}.card{padding:14px;border-radius:12px}
+ input,select,textarea{font-size:16px}          /* iPhone 输入框不自动放大 */
+ button{min-height:38px}button.sm{min-height:34px;padding:6px 11px}
+ .row{gap:8px}
+ /* 表格变卡片 */
+ table.rt,table.rt tbody,table.rt tr,table.rt td{display:block;width:auto}
+ table.rt th{display:none}table.rt tr:first-child:has(th){display:none}
+ table.rt td{border:0;padding:3px 0;min-width:0!important}
+ table.rt td[data-l]::before{content:attr(data-l);display:inline-block;width:3.6em;color:var(--muted);font-size:13px;font-family:var(--sans,inherit)}
+ table.mt tbody.grp{position:relative;border:1px solid var(--line);border-radius:12px;padding:10px 12px 8px;margin:0 0 12px;background:var(--card)}
+ table.mt tr{padding:0}table.mt tr.sub{border-top:1px dashed var(--line);margin-top:6px;padding-top:6px}
+ table.mt td.ckc{position:absolute;right:6px;top:4px;padding:6px;z-index:2}table.mt td.ckc input{width:22px;height:22px}
+ table.mt td.nm{font-size:16px;padding:0 34px 2px 22px!important}
+ table.mt td.nm::before{display:none}table.mt td.nm::after{left:0}
+ table.rt td.hide-sm{display:none}
+ table.mt td.lnl{display:inline-block;margin-right:14px;vertical-align:top}
+ table.mt td.lnl::before{display:block!important;width:auto!important}
+ table.mt td.actc{padding-top:6px}table.mt .acts{display:flex;flex-wrap:wrap;gap:6px}
+ table.mt .acts button{flex:1 0 calc(25% - 6px);min-height:36px;padding:6px 4px}
+ table.plt tr{position:relative;border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px;background:var(--card)}
+ table.plt td.ckc{position:absolute;right:6px;top:6px;padding:6px;z-index:2}table.plt td.ckc input{width:22px;height:22px}
+ table.plt td.pcn{font-weight:700;display:inline-block;margin-right:8px}table.plt td.pad{display:inline-block}
+ table.plt td.emp{display:none}
+ table.pvt tr{border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px}
+ table.pvt td:first-child{font-weight:700;color:var(--muted)}table.pvt input.nm{min-width:0!important}
+ table:not(.rt){display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+ .modal .box,#modal .box{width:calc(100vw - 16px)!important;max-width:none!important;max-height:calc(100vh - 24px);overflow:auto;padding:16px!important;border-radius:14px}
+ .modal{padding:8px}
+ #fab{display:block;position:fixed;left:50%;transform:translateX(-50%);bottom:calc(14px + env(safe-area-inset-bottom));z-index:6;background:var(--pri);color:#fff;border:0;border-radius:22px;padding:10px 20px;font-weight:700;box-shadow:0 6px 18px rgba(43,38,32,.28)}
+ .toast,#toast{left:8px!important;right:8px!important;transform:none!important;max-width:none!important;bottom:12px}
+}
 .twinbox{margin-top:12px;padding:10px 12px;border:1px dashed var(--line);border-radius:10px;font-size:14px}
 .twinbox.on{border:1px solid var(--pri);background:rgba(217,119,87,.06)}
 .twinbox label.ck{margin-left:10px}
@@ -157,10 +196,13 @@ async function api(a,body,opt){
   const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
   if(j.login){renderLogin();throw new Error("请先登录")}
   if(!j.ok)throw new Error(j.error||"操作失败");
-  if(j.twin){const t=j.twin;setTimeout(()=>toast(t.failed.length?`⚠ 双中转同步：${t.failed.map(f=>f.server+" 失败（"+(f.error||"")+"）").join("；")}。已记下，那台恢复后自动补上`:`双中转：已同步到 ${t.synced.join("、")}`,6000),1800)}
+  if(j.twin_sync){const t=j.twin_sync;setTimeout(()=>toast(t.failed.length?`⚠ 双中转同步：${t.failed.map(f=>f.server+" 失败（"+(f.error||"")+"）").join("；")}。已记下，那台恢复后自动补上`:`双中转：已同步到 ${t.synced.join("、")}`,6000),1800)}
   return j;
 }
 function toast(m,ms=2600){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),ms)}
+/* 手机上：勾选后底部出现一个按钮，点一下回到批量操作栏 */
+function fab(text,target){let b=$("#fab");if(!b){b=document.createElement("button");b.id="fab";document.body.appendChild(b)}
+  b.textContent=text;b.style.display=text?"":"none";b.onclick=()=>{const t=$(target);if(t)t.scrollIntoView({behavior:"smooth",block:"center"})}}
 function modal(html){$("#mbox").innerHTML=html;$("#modal").classList.add("show")}
 function closeModal(){$("#modal").classList.remove("show")}
 $("#modal").addEventListener("click",e=>{if(e.target.id==="modal")closeModal()});
@@ -189,6 +231,8 @@ function shell(){
 }
 function render(){
   document.querySelectorAll("header nav button[data-t]").forEach(b=>b.classList.toggle("on",b.dataset.t===state.tab));
+  if(typeof fab==="function")fab("");
+  const ob=document.querySelector("header nav button.on");if(ob&&ob.scrollIntoView&&innerWidth<720)ob.scrollIntoView({inline:"nearest",block:"nearest"});
   if(state.tab==="create")renderCreate();else if(state.tab==="backup")renderBackup();else if(state.tab==="settings")renderSettings();else if(state.tab==="servers")renderServers();else if(state.tab==="pool")renderPool();else renderManage();
 }
 async function loadServers(){
@@ -267,7 +311,7 @@ function renderPreview(){
   const cnt=m=>it.filter(x=>!x.error&&(m==="attach"?x.mode.startsWith("attach:"):x.mode===m)).length;
   const nNew=cnt("new"),nAtt=cnt("attach"),nDup=it.filter(x=>!x.error&&((x.dup||[]).length||x.dup_in_batch!==undefined)).length;
   $("#pvbox").innerHTML=`<div class="card"><h2>2. 确认线路（${good} 条可用${it.length-good?`，${it.length-good} 条有误`:""}${nDup?`，<span style="color:var(--warn)">${nDup} 条落地重复</span>`:""}）</h2>
-  <div style="overflow:auto"><table><tr><th>#</th><th>节点名（可改）</th><th>落地</th><th class="hide-sm">类型</th><th>检测</th></tr>
+  <div style="overflow:auto"><table class="rt pvt"><tr><th>#</th><th>节点名（可改）</th><th>落地</th><th class="hide-sm">类型</th><th>检测</th></tr>
   ${it.map((x,i)=>x.error?`<tr><td>${i+1}</td><td colspan="4"><span class="err">✗ ${esc(x.error)}</span> <span class="mono muted">${esc(x.raw)}</span></td></tr>`:
   `<tr><td>${i+1}</td><td><input data-i="${i}" class="nm" value="${esc(x.name)}" style="width:100%;min-width:180px" ${x.mode==="new"?"":"disabled"}>
    ${(x.dup||[]).length||x.dup_in_batch!==undefined?`<div class="dupbox">
@@ -278,8 +322,8 @@ function renderPreview(){
        <option value="new" ${x.mode==="new"?"selected":""}>新建独立线路（单独的出站和到期）</option>
        <option value="skip" ${x.mode==="skip"?"selected":""}>跳过这条</option>
      </select></div>`:""}</td>
-   <td class="mono">${x.direct?`本机直连 ${esc(x.ip)}`:`${esc(x.outbound.server)}:${esc(x.outbound.server_port)}`}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
-   <td class="hide-sm">${x.direct?"直连":esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
+   <td class="mono" data-l="落地">${x.direct?`本机直连 ${esc(x.ip)}`:`${esc(x.outbound.server)}:${esc(x.outbound.server_port)}`}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
+   <td class="hide-sm">${x.direct?"直连":esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}" data-l="检测">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
   </table></div>
   ${twinPick()}
   <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${nNew+nAtt?"":"disabled"}>${nNew?`新建 ${nNew} 条`:""}${nNew&&nAtt?" + ":""}${nAtt?`挂到原线路 ${nAtt} 条`:""}${!nNew&&!nAtt?"没有要处理的":""}</button>
@@ -578,6 +622,7 @@ function drawTable(){
   const nodes=all.reduce((s,g)=>s+g.length,0);
   const nsel=state.sel.size;const selG=all.filter(g=>g.some(r=>state.sel.has(r.tag))).length;
   const base=searched(),expG=base.filter(isExp),offG=base.filter(isOff),badG=base.filter(isBad);
+  fab(nsel?`已选 ${selG} 条 · 批量操作 ↑`:"","#bulk");
   $("#bulk").innerHTML=`<span class="muted">共 ${all.length} 条线路（${nodes} 个节点）${nsel?`，已选 ${selG} 条`:""}</span>
    <button class="sm" id="selall">全选当前搜索</button>
    ${state.only?`<span class="tag warn" style="padding:4px 10px">只显示${ONLY[state.only][0]}的线路</span><button class="sm" id="showall">显示全部</button>`:""}
@@ -587,17 +632,17 @@ function drawTable(){
    <button class="sm" id="bchk">批量检测</button><button class="sm" id="bren">批量续期</button><button class="sm" id="baddp">批量加协议</button><button class="sm" id="blim">批量限额</button><button class="sm" id="bdis">停用</button><button class="sm" id="ben">启用</button><button class="sm" id="bauto" title="落地不通时自动从落地库换同国家的落地">开自动换</button><button class="sm" id="bnoauto">关自动换</button>
    <button class="sm" id="bport">批量换端口</button><button class="sm" id="blinks">导出链接</button><button class="sm danger" id="bdel">批量删除</button>`:""}`;
   const exps=g=>new Set(g.map(r=>r.expiry||0)).size>1;
-  $("#tbl").innerHTML=`<table><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>流量</th><th>设备</th><th>检测</th><th>操作</th></tr>
+  $("#tbl").innerHTML=`<table class="rt mt"><tr><th></th><th>节点名</th><th>入站</th><th>落地</th><th>到期</th><th>流量</th><th>设备</th><th>检测</th><th>操作</th></tr>
   ${gs.map(g=>{const n=g.length,m=g[0],on=g.every(r=>state.sel.has(r.tag));
    return `<tbody class="grp">${g.map((r,i)=>`<tr class="${i?"sub":""}">
-  ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
+  ${i===0?`<td rowspan="${n}" class="ckc"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
   <td class="nm p-${esc(r.type)}" style="word-break:break-all;min-width:150px" title="${esc(protoName[r.type]||r.type)}">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
-  <td><span class="tag p-${esc(r.type)}">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
-  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}${twinCell(r)}</td>`:""}
-  <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
-  ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
-  ${i===0?`<td rowspan="${n}">${healthCell(g)}</td>`:""}
-  <td><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
+  <td data-l="入站"><span class="tag p-${esc(r.type)}">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
+  ${i===0?`<td class="mono" rowspan="${n}" data-l="落地">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}${twinCell(r)}</td>`:""}
+  <td title="${esc(fmtDate(r.expiry))}" data-l="到期">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
+  ${i===0?`<td rowspan="${n}" style="min-width:110px" data-l="流量" class="lnl">${trafficCell(g)}</td><td rowspan="${n}" data-l="设备" class="lnl">${deviceCell(g)}</td>`:""}
+  ${i===0?`<td rowspan="${n}" data-l="检测" class="lnl">${healthCell(g)}</td>`:""}
+  <td class="actc"><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
   ${i===0?`<button class="sm" data-a="chk" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>检测</button>
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
   ${i===0?`<button class="sm" data-a="sub" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"} title="这条线路所有协议节点的订阅链接，客户导入一次，以后刷新就自动更新">订阅</button>`:""}
@@ -766,11 +811,11 @@ function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now
 function drawPool(){
   const list=poolFiltered(),sel=state.psel,lim=state.plim||200;state.plist=list;
   const ids=new Set(state.pool.map(it=>it.id));[...sel].forEach(id=>{if(!ids.has(id))sel.delete(id)});
-  H("#ptable",list.length?`<table><tr><th></th><th>国家</th><th>落地</th><th>网段</th><th>状态</th><th>检测</th><th>供应商 / 进价</th><th>落地到期</th><th>备注</th></tr>
-  ${list.slice(0,lim).map(it=>`<tr><td><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td>${esc(it.country||"未知")}</td>
-   <td class="mono">${esc(it.host)}:${esc(it.port)} <span class="tag gray">${esc(protoName[it.type]||it.type)}</span></td><td class="mono">${esc(it.net||"-")}</td>
-   <td>${poolStatus(it)}</td><td>${chkTag(it.check)}</td><td>${esc(it.supplier||"")}${it.cost?` <span class="muted">¥${esc(it.cost)}</span>`:""}</td>
-   <td>${it.expire?`<span class="${it.expired?"err":""}">${esc(fmtD(it.expire))}</span>`:'<span class="muted">-</span>'}</td><td class="muted">${esc(it.note||"")}</td></tr>`).join("")}</table>
+  H("#ptable",list.length?`<table class="rt plt"><tr><th></th><th>国家</th><th>落地</th><th>网段</th><th>状态</th><th>检测</th><th>供应商 / 进价</th><th>落地到期</th><th>备注</th></tr>
+  ${list.slice(0,lim).map(it=>`<tr><td class="ckc"><input type="checkbox" data-ps="${esc(it.id)}" ${sel.has(it.id)?"checked":""}></td><td class="pcn">${esc(it.country||"未知")}</td>
+   <td class="mono pad">${esc(it.host)}:${esc(it.port)} <span class="tag gray">${esc(protoName[it.type]||it.type)}</span></td><td class="mono" data-l="网段">${esc(it.net||"-")}</td>
+   <td data-l="状态">${poolStatus(it)}</td><td data-l="检测">${chkTag(it.check)}</td><td data-l="供应商" class="${it.supplier||it.cost?"":"emp"}">${esc(it.supplier||"")}${it.cost?` <span class="muted">¥${esc(it.cost)}</span>`:""}</td>
+   <td data-l="到期" class="${it.expire?"":"emp"}">${it.expire?`<span class="${it.expired?"err":""}">${esc(fmtD(it.expire))}</span>`:'<span class="muted">-</span>'}</td><td class="muted ${it.note?"":"emp"}" data-l="备注">${esc(it.note||"")}</td></tr>`).join("")}</table>
    ${list.length>lim?`<div class="row" style="margin-top:10px"><button class="sm" id="pmore">显示更多（还有 ${list.length-lim} 个）</button></div>`:""}`:
    `<p class="hint">${state.pool.length?"没有符合条件的落地":"落地库还是空的，点右上角「导入落地」把买来的落地粘贴进来。"}</p>`);
   if($("#pmore"))$("#pmore").onclick=()=>{state.plim=lim+300;drawPool()};
@@ -779,6 +824,7 @@ function drawPool(){
 }
 function drawPoolBulk(){
   const list=state.plist||[],sel=state.psel;
+  fab(sel.size?`已选 ${sel.size} 个 · 批量操作 ↑`:"","#pbulk");
   H("#pbulk",`<span class="muted">${list.length} 个${sel.size?`，已选 ${sel.size}`:""}</span><button class="sm" id="psall">全选当前</button>${sel.size?`<button class="sm" id="psnone">取消选择</button>
    <button class="sm" id="pchk">检测</button><button class="sm" id="pgeo">重新识别国家</button><button class="sm" id="pedit">编辑</button><button class="sm" id="pcopy">复制</button><button class="sm" id="pdis">停用</button><button class="sm" id="pen">启用</button><button class="sm danger" id="pdel">删除</button>`:""}`);
   $("#psall").onclick=()=>{list.forEach(it=>sel.add(it.id));document.querySelectorAll("[data-ps]").forEach(c=>c.checked=true);drawPoolBulk()};

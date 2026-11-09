@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -4065,7 +4065,7 @@ def twin_post(ctx, res):
         else:
             twin_sync_links(gid)
     if synced or failed:
-        res["twin"] = {"synced": sorted(set(synced)), "failed": failed}
+        res["twin_sync"] = {"synced": sorted(set(synced)), "failed": failed}
 
 
 def twin_retry():
