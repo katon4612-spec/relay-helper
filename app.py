@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -1152,6 +1152,10 @@ def op_replace(body):
         ob["tag"] = row["outbound_tag"]
         ob["id"] = row["outbound_id"]
         SUI.save("outbounds", "edit", ob)
+        try:
+            twin_mark(row["outbound_tag"], ob)
+        except Exception as e:
+            sys.stderr.write("twin mark: %s\n" % e)
         with FO_LOCK:
             f = FO.get(row["outbound_tag"])
             if f:  # 有备用落地：换的是当前在用的那个
@@ -2186,6 +2190,10 @@ def _fo_swap(okey, to, reason):
         _write_ob(obs, f["standby"], f[other])  # 另一个放进待命出站，继续检测
         f["active"] = to
         f["switched"] = int(time.time())
+        try:
+            twin_mark(okey, f[to])
+        except Exception as e:
+            sys.stderr.write("twin mark: %s\n" % e)
         f.setdefault("log", []).insert(0, {"ts": f["switched"], "to": to, "reason": reason})
         del f["log"][20:]
         save_fo()
@@ -3594,11 +3602,27 @@ def check_sui_login(user, pw):
 # 每台服务器 twins.json 的 peers：这条线路在其他中转上的节点快照（出订阅用）。
 # 主控 twins.json 的 groups：哪几台上的哪几条线路是一组；pending：没同步成功、等重试的操作。
 TWIN_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "twins.json")
-TWIN = {"peers": {}, "groups": {}, "pending": []}
+TWIN = {"peers": {}, "groups": {}, "pending": [], "marks": {}}
 TWIN_LOCK = threading.RLock()
 TWIN_SYNC = {"update_clients", "delete", "set_limits", "reset_traffic", "pool_auto", "add_protocol",
-             "replace", "pool_switch", "change_port", "change_domain"}
-TWIN_LINE_OPS = {"set_limits", "reset_traffic", "pool_auto", "add_protocol", "replace"}
+             "replace", "pool_switch", "change_port", "change_domain", "failover_set", "failover_switch"}
+TWIN_LINE_OPS = {"set_limits", "reset_traffic", "pool_auto", "add_protocol", "replace", "failover_set", "failover_switch"}
+
+
+def twin_mark(k, ob, detect=False):
+    """记下这条线路的落地是什么时候换的（双中转靠它判断哪台是最新换的）。
+    detect=True：巡检时发现的（第一次见记 0，变了记现在）。"""
+    if k not in TWIN["peers"]:
+        return 0
+    lk = landing_key(ob or {})
+    with TWIN_LOCK:
+        cur = TWIN["marks"].get(k)
+        if cur and cur[0] == lk:
+            return cur[1]
+        ts = 0 if (detect and not cur) else int(time.time())
+        TWIN["marks"][k] = [lk, ts]
+        save_twins()
+        return ts
 
 
 def load_twins():
@@ -3606,9 +3630,10 @@ def load_twins():
     try:
         with open(TWIN_PATH, encoding="utf-8") as f:
             d = json.load(f)
-        TWIN = {"peers": d.get("peers") or {}, "groups": d.get("groups") or {}, "pending": d.get("pending") or []}
+        TWIN = {"peers": d.get("peers") or {}, "groups": d.get("groups") or {}, "pending": d.get("pending") or [],
+                "marks": d.get("marks") or {}}
     except Exception:
-        TWIN = {"peers": {}, "groups": {}, "pending": []}
+        TWIN = {"peers": {}, "groups": {}, "pending": [], "marks": {}}
 
 
 def save_twins():
@@ -3714,6 +3739,69 @@ def op_twin_apply(body):
     if bad and len(bad) == len(res.get("results") or []):
         raise SuiError(bad[0].get("error") or "失败")
     return {"result": res}
+
+
+def op_twin_state(body):
+    """这台上所有双中转线路现在用的落地、什么时候换的、备用落地在用哪边（主控每 20 秒来问一次）。"""
+    with TWIN_LOCK:
+        keys = list(TWIN["peers"].keys())
+    if not keys:
+        return {"lines": {}}
+    obs = {o.get("tag"): o for o in SUI.load_all().get("outbounds") or []}
+    out = {}
+    for k in keys:
+        o = obs.get(k)
+        if not o:
+            continue
+        ob = _ob_clean(o)
+        ts = twin_mark(k, ob, detect=True)
+        with FO_LOCK:
+            f = FO.get(k)
+            fo = {"active": f.get("active"), "p": landing_key(f["primary"]) if f.get("primary") else "",
+                  "b": landing_key(f["backup"]) if f.get("backup") else ""} if f else None
+        out[k] = {"lk": landing_key(ob), "ts": ts, "ob": ob, "fo": fo}
+    return {"lines": out}
+
+
+def twin_converge():
+    """主控：同一组里几台的落地不一样了（某台自动换了落地 / 备用落地切换了），把其他台跟上最新换的那台。"""
+    with TWIN_LOCK:
+        groups = json.loads(json.dumps(TWIN["groups"]))
+    if not groups:
+        return
+    srvs = {m["srv"] for g in groups.values() for m in g["members"]}
+    st = {}
+    for sv in srvs:
+        r = _call(sv, "twin_state", {}, timeout=30)
+        if r.get("ok"):
+            st[sv] = r.get("lines") or {}
+    for gid, g in groups.items():
+        ms = [(m, st.get(m["srv"], {}).get(m["okey"])) for m in g["members"]]
+        if any(x is None for _, x in ms):
+            continue   # 有一台连不上 / 线路没了：等它回来再对
+        if len({x["lk"] for _, x in ms}) == 1:
+            continue
+        src_m, src = max(ms, key=lambda t: t[1]["ts"])
+        for m, x in ms:
+            if x["lk"] == src["lk"]:
+                continue
+            f, sf = x.get("fo"), src.get("fo")
+            if f and sf and sf.get("active") != f.get("active") and (f.get("p") if sf["active"] == "primary" else f.get("b")) == src["lk"]:
+                call = {"okey": m["okey"], "op": "failover_switch", "types": None, "params": {"to": sf["active"]}}
+                what = "切到%s落地" % ("主" if sf["active"] == "primary" else "备用")
+            else:
+                call = {"okey": m["okey"], "op": "replace", "types": None, "params": {"outbound": src["ob"]}}
+                what = "换落地"
+            r = _call(m["srv"], "twin_apply", call)
+            name, sname = _srv_name(m["srv"]), _srv_name(src_m["srv"])
+            addr = _ob_addr(src["ob"])
+            if r.get("ok"):
+                tg_send("🔁 双中转同步：%s 上的「%s」落地换成了 %s，已把 %s 也%s。" % (sname, src_m["okey"], addr, name, what))
+            else:
+                with TWIN_LOCK:
+                    dup = any(p.get("call") == call for p in TWIN["pending"])
+                if not dup:
+                    _pend({"kind": "apply", "srv": m["srv"], "label": name, "gid": gid, "call": call, "what": "跟随" + what}, r.get("error"))
 
 
 def twin_sub_items(k):
@@ -3903,7 +3991,8 @@ def op_twin_pending(body):
 
 
 TWIN_WHAT = {"update_clients": "续期/停用/启用", "delete": "删除", "set_limits": "限额", "reset_traffic": "清零流量",
-             "pool_auto": "自动换开关", "add_protocol": "加协议", "replace": "换落地"}
+             "pool_auto": "自动换开关", "add_protocol": "加协议", "replace": "换落地",
+             "failover_set": "备用落地设置", "failover_switch": "主/备落地切换"}
 
 
 def twin_pre(srv, action, body):
@@ -3944,6 +4033,10 @@ def twin_post(ctx, res):
             params = {"on": body.get("on")}
         elif action == "add_protocol":
             params = {"protocols": body.get("protocols") or []}
+        elif action == "failover_set":
+            params = {x: body[x] for x in ("landing", "auto_back", "only_flag") if x in body}
+        elif action == "failover_switch":
+            params = {"to": body.get("to")}
         elif action in ("replace", "pool_switch"):
             src = _call(srv, "twin_links", {"okey": k})
             if not (src.get("ok") and src.get("outbound")):
@@ -4004,18 +4097,24 @@ def twin_retry():
 
 
 def twin_loop():
-    time.sleep(40)
+    time.sleep(30)
+    n = 0
     while True:
         try:
-            if TWIN["pending"]:
+            twin_converge()
+        except Exception as e:
+            sys.stderr.write("twin converge: %s\n" % e)
+        try:
+            if TWIN["pending"] and n % 3 == 0:
                 twin_retry()
         except Exception as e:
             sys.stderr.write("twin: %s\n" % e)
-        time.sleep(60)
+        n += 1
+        time.sleep(CFG.get("twin_interval_sec", 20))
 
 
 OPS.update({"twin_resolve": op_twin_resolve, "twin_links": op_twin_links, "twin_peer_set": op_twin_peer_set,
-            "twin_apply": op_twin_apply, "twin_create": op_twin_create, "twin_info": op_twin_info,
+            "twin_apply": op_twin_apply, "twin_state": op_twin_state, "twin_create": op_twin_create, "twin_info": op_twin_info,
             "twin_unlink": op_twin_unlink, "twin_pending": op_twin_pending})
 LOCAL_ONLY.update({"twin_create", "twin_info", "twin_unlink", "twin_pending"})
 
