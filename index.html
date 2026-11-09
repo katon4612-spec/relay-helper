@@ -907,6 +907,7 @@ async function subDlg(tag,reset){
   const row=byTag(tag);if(row&&row.outbound_tag&&(state.twin||{})[row.outbound_tag]&&!reset)return twinSubDlg(tag,row);
   let x;try{x=await api("sub_get",{tag,reset:!!reset})}catch(e){return toast(e.message)}
   modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2>
+  ${certWarn(x.cert,x.host)}
   <p class="hint">包含这条线路的全部 ${x.nodes} 个协议节点（已停用、已过期的不会出现在订阅里）。客户导入一次，以后你换端口、换落地、加协议，客户在软件里<b>更新订阅</b>就行，不用重新发链接。</p>
   <div style="display:flex;gap:16px;align-items:center;margin:12px 0">
     <div style="width:132px;height:132px;flex:none">${x.svg.replace("<svg",'<svg style="width:132px;height:132px;display:block"')}</div>
@@ -917,10 +918,18 @@ async function subDlg(tag,reset){
     </div></div>
   <p class="hint">Shadowrocket 可以直接扫左边二维码。链接泄露了就点「重置」，旧链接立刻失效，再把新链接发给客户。</p>
   <div class="row" style="margin-top:12px"><button class="danger" id="srs">重置订阅链接</button><button id="scl2">关闭</button></div>`);
-  $("#scp").onclick=()=>copy(x.url);$("#scl").onclick=()=>copy(x.clash);$("#scl2").onclick=closeModal;
+  bindFixCert();$("#scp").onclick=()=>copy(x.url);$("#scl").onclick=()=>copy(x.clash);$("#scl2").onclick=closeModal;
   $("#srs").onclick=()=>{if(confirm("重置后旧的订阅链接马上失效，客户需要重新导入新链接。确定重置？"))subDlg(tag,true)};
 }
 
+const FIXCERT="bash /opt/relay-helper/https.sh /opt/relay-helper force && systemctl restart relay-helper";
+function certWarn(c,name){if(!c)return "";const who=name?`「${esc(name)}」`:"这台服务器";
+  if(c.mode==="selfsigned"||c.mode==="expired")return `<div class="warnbox" style="margin:8px 0"><b>⚠ ${who}${c.mode==="expired"?"的证书已过期":"用的是自签名证书"}</b>：小火箭 / v2rayN / Clash 拉这个订阅会报「证书无效」，<b>先别发这个订阅地址</b>。
+   <div style="margin-top:4px">修复：确认域名解析到这台、云安全组放行 TCP 80，然后在这台服务器上运行：</div>
+   <div class="row" style="gap:8px;margin-top:4px"><code class="mono" style="word-break:break-all">${FIXCERT}</code><button class="sm" data-fixc>复制命令</button></div></div>`;
+  if(c.mode==="down")return `<div class="warnbox" style="margin:8px 0"><b>⚠ ${who}现在连不上</b>：${esc(c.error||"")}</div>`;
+  return ""}
+function bindFixCert(){document.querySelectorAll("[data-fixc]").forEach(b=>b.onclick=()=>copy(FIXCERT))}
 async function twinSubDlg(tag,row){
   let x;try{x=await api("twin_info",{srv:state.srv||"local",okey:row.outbound_tag},{local:true})}catch(e){return toast(e.message)}
   if(!x.twin){modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2><p class="hint">这条线路是双中转，但要在<b>主控</b>（当初建双中转的那台面板）里查看订阅和同步。</p><div class="row"><button id="tcl">关闭</button></div>`);$("#tcl").onclick=closeModal;return}
@@ -931,13 +940,16 @@ async function twinSubDlg(tag,row){
   <p class="hint">v2rayN / Shadowrocket：一个节点连不上就点另一台的同名节点（或测速后选能用的）。Clash：订阅里自带「自动切换」组，不通自动换。</p>
   ${ms.map((m,i)=>`<div style="display:flex;gap:14px;align-items:center;margin:12px 0;padding:10px;border:1px solid var(--line);border-radius:10px">
     <div style="width:110px;height:110px;flex:none">${m.svg?m.svg.replace("<svg",'<svg style="width:110px;height:110px;display:block"'):""}</div>
-    <div style="min-width:0;flex:1"><div><b>${esc(m.label)}</b> ${m.me?'<span class="tag gray">当前服务器</span>':""} <span class="muted">${m.nodes} 个节点</span></div>
+    <div style="min-width:0;flex:1"><div><b>${esc(m.label)}</b> ${m.me?'<span class="tag gray">当前服务器</span>':""} <span class="muted">${m.nodes} 个节点</span>${m.cert&&m.cert.mode==="ok"?' <span class="tag ok">证书正常</span>':""}</div>
+      ${certWarn(m.cert,m.label)}
       <p class="mono" style="word-break:break-all;margin:6px 0">${m.sub_url?esc(m.sub_url):'<span class="err">还没同步到，稍后再打开</span>'}</p>
       ${m.sub_url?`<div class="row" style="gap:8px"><button class="sm pri" data-tc="${i}">复制订阅链接</button><button class="sm" data-tk="${i}">复制 Clash 专用链接</button></div>`:""}</div></div>`).join("")}
+  ${(()=>{const good=ms.filter(m=>m.cert&&["ok","http"].includes(m.cert.mode)&&m.sub_url),bad=ms.filter(m=>m.cert&&!["ok","http"].includes(m.cert.mode));
+     return bad.length&&good.length?`<p class="hint"><b>建议先把「${esc(good[0].label)}」的订阅地址发给客户</b>，等「${bad.map(m=>esc(m.label)).join("、")}」的证书修好再说。</p>`:""})()}
   <div class="row" style="margin-top:12px"><button class="danger" id="tun">解除双中转</button><button id="tcl">关闭</button></div>
   <p class="hint">解除后两台上的线路都保留，但不再同步，订阅里也只剩各自的节点。</p>`);
   document.querySelectorAll("[data-tc]").forEach(b=>b.onclick=()=>copy(ms[b.dataset.tc].sub_url));
-  document.querySelectorAll("[data-tk]").forEach(b=>b.onclick=()=>copy(ms[b.dataset.tk].sub_url+"?format=clash"));
+  document.querySelectorAll("[data-tk]").forEach(b=>b.onclick=()=>copy(ms[b.dataset.tk].sub_url+"?format=clash"));bindFixCert();
   $("#tcl").onclick=closeModal;
   $("#tun").onclick=async()=>{if(!confirm("解除双中转？两台的线路都保留，以后续期、删除要分别操作。"))return;
     try{await api("twin_unlink",{srv:state.srv||"local",okey:row.outbound_tag},{local:true});closeModal();toast("已解除");await loadRelays();drawTable()}catch(e){toast(e.message)}};

@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2510,7 +2510,7 @@ def op_sub_get(body):
         tok = SUBS[k]
     n = len([r for r in rows.values() if okey_of(r) == k and r.get("client_id")])
     url = _sub_url(tok)
-    return {"url": url, "clash": url + "?format=clash", "nodes": n, "svg": qr_svg(url)}
+    return {"url": url, "clash": url + "?format=clash", "nodes": n, "svg": qr_svg(url), "cert": cert_status(), "host": CFG.get("public_host")}
 
 
 def _sub_links(k):
@@ -2736,8 +2736,26 @@ def _norm_url(u):
     return u.rstrip("/") + "/"
 
 
+def cert_status():
+    """订阅地址的证书情况：http / ok（正规证书）/ selfsigned（自签名，客户端拉订阅会报证书无效）/ expired"""
+    cf = CFG.get("cert_file")
+    if not cf:
+        return {"mode": "http"}
+    try:
+        info = ssl._ssl._test_decode_cert(cf)
+        exp = ssl.cert_time_to_seconds(info["notAfter"])
+        self_signed = info.get("issuer") == info.get("subject")
+    except Exception:
+        return {"mode": CFG.get("https_mode") or "unknown"}
+    if self_signed or CFG.get("https_mode") == "selfsigned":
+        return {"mode": "selfsigned", "expire": int(exp)}
+    if exp < time.time():
+        return {"mode": "expired", "expire": int(exp)}
+    return {"mode": "ok", "expire": int(exp)}
+
+
 def op_ping(body):
-    return {"version": VERSION, "public_host": CFG.get("public_host")}
+    return {"version": VERSION, "public_host": CFG.get("public_host"), "cert": cert_status()}
 
 
 def op_servers_list(body):
@@ -3850,9 +3868,11 @@ def op_twin_info(body):
     mem = [{"label": (snap.get(str(j)) or {}).get("label") or m.get("label") or _srv_name(m["srv"]), "server": _srv_name(m["srv"]),
             "sub_url": (snap.get(str(j)) or {}).get("sub_url") or "", "nodes": len((snap.get(str(j)) or {}).get("nodes") or []),
             "me": j == i} for j, m in enumerate(g["members"])]
-    for m in mem:
+    for j, m in enumerate(mem):
         if m["sub_url"]:
             m["svg"] = qr_svg(m["sub_url"])
+        r = _call(g["members"][j]["srv"], "ping", {}, timeout=15)
+        m["cert"] = r.get("cert") if r.get("ok") else {"mode": "down", "error": r.get("error")}
     return {"twin": True, "gid": gid, "members": mem}
 
 
