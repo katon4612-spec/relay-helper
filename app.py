@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.17.1"
+VERSION = "1.17.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -1055,7 +1055,9 @@ def client_links(cid):
 
 def _twin_list_info():
     with TWIN_LOCK:
-        return {k: {"peers": [p.get("label") for p in v.get("peers") or []]} for k, v in TWIN["peers"].items()}
+        return {k: {"peers": [p.get("label") for p in v.get("peers") or []],
+                    "main": (v.get("main") or {}).get("label") or "", "main_url": (v.get("main") or {}).get("url") or "",
+                    "is_main": bool((v.get("main") or {}).get("is_main"))} for k, v in TWIN["peers"].items()}
 
 
 def op_list(body):
@@ -3702,7 +3704,8 @@ def op_twin_peer_set(body):
     k = body.get("okey")
     with TWIN_LOCK:
         if body.get("peers"):
-            TWIN["peers"][k] = {"gid": body.get("gid"), "peers": body["peers"], "ts": int(time.time())}
+            TWIN["peers"][k] = {"gid": body.get("gid"), "peers": body["peers"], "ts": int(time.time()),
+                                "main": body.get("main") or {}}
         else:
             TWIN["peers"].pop(k, None)
         save_twins()
@@ -3857,9 +3860,13 @@ def _group_of(srv, okey):
 
 
 def _pend(item, err):
+    key = lambda p: (p.get("kind"), p.get("gid"), p.get("srv"), json.dumps(p.get("call"), sort_keys=True))
     with TWIN_LOCK:
-        item.update(err=err, ts=int(time.time()), tries=item.get("tries", 0) + 1)
-        if item not in TWIN["pending"]:
+        old = next((p for p in TWIN["pending"] if key(p) == key(item)), None)
+        if old:   # 同一件事只记一条
+            old.update(err=err, ts=int(time.time()), tries=old.get("tries", 0) + 1)
+        else:
+            item.update(err=err, ts=int(time.time()), tries=item.get("tries", 0) + 1)
             TWIN["pending"].append(item)
         save_twins()
 
@@ -3883,7 +3890,8 @@ def twin_sync_links(gid):
             snap.pop(str(i), None)   # 那台上这条线路没了
     for i, m in enumerate(members):
         peers = [{"label": v["label"], "nodes": v["nodes"]} for j, v in snap.items() if j != str(i)]
-        r = _call(m["srv"], "twin_peer_set", {"okey": m["okey"], "gid": gid, "token": token, "peers": peers})
+        r = _call(m["srv"], "twin_peer_set", {"okey": m["okey"], "gid": gid, "token": token, "peers": peers,
+                                              "main": {"label": server_label(), "url": base_url(), "id": INSTANCE, "is_main": m["srv"] == "local"}})
         if not r.get("ok"):
             errs.append({"server": _srv_name(m["srv"]), "error": r.get("error")})
             _pend({"kind": "sync", "gid": gid, "srv": m["srv"], "label": _srv_name(m["srv"])}, r.get("error"))
@@ -4104,6 +4112,14 @@ def twin_loop():
             twin_converge()
         except Exception as e:
             sys.stderr.write("twin converge: %s\n" % e)
+        try:
+            if n % 30 == 1:   # 每 10 分钟左右把每组的订阅节点、主控信息重新对一遍
+                with TWIN_LOCK:
+                    gids = list(TWIN["groups"].keys())
+                for gid in gids:
+                    twin_sync_links(gid)
+        except Exception as e:
+            sys.stderr.write("twin resync: %s\n" % e)
         try:
             if TWIN["pending"] and n % 3 == 0:
                 twin_retry()

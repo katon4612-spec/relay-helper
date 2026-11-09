@@ -100,6 +100,7 @@ td.nm.p-vless{--c:var(--p-vless)}td.nm.p-vless443{--c:var(--p-vless443)}td.nm.p-
 .toolbar .grow{flex:1}
 
 #fab{display:none}
+.warnbox a{color:var(--pri);font-weight:600}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,8px);background:var(--ink);color:#FBF5EC;padding:11px 20px;border-radius:10px;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:90vw;z-index:9;box-shadow:0 8px 24px rgba(43,38,32,.22)}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 .modal{position:fixed;inset:0;background:rgba(43,38,32,.36);display:none;align-items:center;justify-content:center;z-index:8;padding:16px;backdrop-filter:blur(2px)}
@@ -190,7 +191,17 @@ const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&
 const LS={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
 let state={srv:LS.get("rh_srv")||"local",servers:[],tab:"create",preview:null,results:null,relays:[],now:0,host:"",q:"",page:1,sel:new Set(),checks:{},busy:false};
 
+const TWIN_ACTS={update_clients:"续期/停用/启用",delete:"删除",set_limits:"改限额",reset_traffic:"清零流量",pool_auto:"开关自动换",add_protocol:"加协议",failover_set:"设置备用落地"};
+function twinRemote(r){const t=r&&r.outbound_tag&&(state.twin||{})[r.outbound_tag];return t&&t.main&&!t.is_main&&(state.srv||"local")==="local"?t:null}
+function twinGuard(a,body){
+  if(!TWIN_ACTS[a]||(state.srv||"local")!=="local")return true;
+  const tags=new Set([...(body.tags||[]),body.tag].filter(Boolean)),cids=new Set(body.client_ids||[]);
+  const hit=(state.relays||[]).filter(r=>(tags.has(r.tag)||cids.has(r.client_id))&&twinRemote(r));
+  if(!hit.length)return true;
+  const t=twinRemote(hit[0]);
+  return confirm(`⚠ 这是双中转线路，主控是「${t.main}」。\n\n在这台的后台直接${TWIN_ACTS[a]}，不会同步到另一台（${t.peers.join("、")}），两台会不一样。\n\n建议到主控「${t.main}」的面板操作（顶部下拉选这台服务器）：\n${t.main_url}\n\n仍然只改这台吗？`)}
 async function api(a,body,opt){
+  if(!twinGuard(a,body||{}))throw new Error("已取消：请到主控面板操作");
   const hd={"Content-Type":"application/json"};const sv=opt&&opt.srv?opt.srv:state.srv;if(sv&&sv!=="local"&&!(opt&&opt.local))hd["X-RH-Server"]=sv;
   const r=await fetch(BASE+"api/"+a,{method:"POST",headers:hd,body:JSON.stringify(body||{})});
   const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
@@ -564,7 +575,11 @@ async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv
 function drawSecure(){
   const n=(state.unprot||[]).length;
   const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
-  H("#secbox",fw+(n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
+  const tw=Object.values(state.twin||{}).filter(t=>t.main&&!t.is_main),local=(state.srv||"local")==="local";
+  const twb=tw.length&&local?`<div class="warnbox"><b>⚠ 这台有 ${tw.length} 条双中转线路，主控是「${esc(tw[0].main)}」</b>
+   <div>在这里直接续期、停用、删除、改限额等<b>不会同步</b>到另一台。请到主控面板操作（顶部下拉选这台服务器）：<a href="${esc(tw[0].main_url)}" target="_blank" rel="noopener">${esc(tw[0].main_url)}</a></div>
+   <div class="hint">换落地、落地自动切换在哪台做都会同步（主控约 20 秒内对齐）。主控连不上时才在这里应急操作，恢复后在主控上补一遍。</div></div>`:"";
+  H("#secbox",twb+fw+(n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
   <div>节点停用或过期后，SOCKS5 入站会变成免密码，任何人都能连上并从<b>中转机自己的 IP</b> 直接出网。补上规则后，停用/过期的节点会直接连不上。</div>
   <div class="hint" style="margin:6px 0">${(state.unprot||[]).slice(0,8).map(esc).join("、")}${n>8?` 等 ${n} 个`:""}</div>
   <button class="pri sm" id="secfix">一键修复（会重启 s-ui，约 3 秒断线）</button></div>`:""));
@@ -1035,7 +1050,8 @@ function portDlg(tags){
 /* ---------------- 备用落地 ---------------- */
 const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
 const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
-function twinCell(r){const t=r.outbound_tag&&(state.twin||{})[r.outbound_tag];return t?`<div class="sib"><span class="tag ok" title="同一个落地在这些中转上也有一组节点，客户订阅里都有；续期、停用、删除、换落地、限额会自动同步">双中转 · ${esc(t.peers.join("、"))}</span></div>`:""}
+function twinCell(r){const w=twinRemote(r);if(w)return `<div class="sib"><span class="tag warn" title="在这台后台直接续期、停用、删除等不会同步到另一台">双中转 · 请到主控「${esc(w.main)}」操作</span></div>`;
+  const t=r.outbound_tag&&(state.twin||{})[r.outbound_tag];return t?`<div class="sib"><span class="tag ok" title="同一个落地在这些中转上也有一组节点，客户订阅里都有；续期、停用、删除、换落地、限额会自动同步">双中转 · ${esc(t.peers.join("、"))}</span></div>`:""}
 function foCell(r){const f=foOf(r);const pa=state.pauto&&r.outbound_tag&&state.pauto.has(r.outbound_tag)?`<div class="sib"><span class="tag p-vless443" title="落地连续不通时，自动从落地库换一个同国家的">自动换</span></div>`:"";if(!f)return pa;
   return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}${f.primary.country?` ${esc(f.primary.country)}`:""}</div>`
     :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}${f.backup.country?` ${esc(f.backup.country)}`:""}</div>`}
