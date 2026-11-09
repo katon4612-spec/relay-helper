@@ -134,6 +134,9 @@ input[type=checkbox],input[type=radio]{accent-color:var(--pri)}
 @keyframes s{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}.spin{animation-duration:2s}}
 @media(max-width:720px){.hide-sm{display:none}header{flex-wrap:wrap;padding:10px 14px}header nav{margin-left:0;width:100%;overflow-x:auto}header .host{display:none}main{padding:0 10px}.card{padding:16px}}
+.twinbox{margin-top:12px;padding:10px 12px;border:1px dashed var(--line);border-radius:10px;font-size:14px}
+.twinbox.on{border:1px solid var(--pri);background:rgba(217,119,87,.06)}
+.twinbox label.ck{margin-left:10px}
 </style>
 </head>
 <body>
@@ -154,6 +157,7 @@ async function api(a,body,opt){
   const j=await r.json().catch(()=>({ok:false,error:"服务器无响应"}));
   if(j.login){renderLogin();throw new Error("请先登录")}
   if(!j.ok)throw new Error(j.error||"操作失败");
+  if(j.twin){const t=j.twin;setTimeout(()=>toast(t.failed.length?`⚠ 双中转同步：${t.failed.map(f=>f.server+" 失败（"+(f.error||"")+"）").join("；")}。已记下，那台恢复后自动补上`:`双中转：已同步到 ${t.synced.join("、")}`,6000),1800)}
   return j;
 }
 function toast(m,ms=2600){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),ms)}
@@ -277,11 +281,13 @@ function renderPreview(){
    <td class="mono">${x.direct?`本机直连 ${esc(x.ip)}`:`${esc(x.outbound.server)}:${esc(x.outbound.server_port)}`}${x.country?` <span class="tag">${esc(x.country)}</span>`:""}</td>
    <td class="hide-sm">${x.direct?"直连":esc(protoName[x.outbound.type]||x.outbound.type)}</td><td id="pc${i}">${pcHtml(state.pvcheck&&state.pvcheck[i])}</td></tr>`).join("")}
   </table></div>
+  ${twinPick()}
   <div class="row" style="margin-top:12px"><button id="pchk">检测落地</button><button class="pri" id="mk" ${nNew+nAtt?"":"disabled"}>${nNew?`新建 ${nNew} 条`:""}${nNew&&nAtt?" + ":""}${nAtt?`挂到原线路 ${nAtt} 条`:""}${!nNew&&!nAtt?"没有要处理的":""}</button>
   <span class="hint">完成后会自动重启 s-ui 让路由生效，所有线路约断 3 秒。</span></div></div>`;
   document.querySelectorAll(".nm").forEach(n=>n.oninput=()=>{state.preview[n.dataset.i].name=n.value.trim()});
   document.querySelectorAll("[data-m]").forEach(s=>s.onchange=()=>{state.preview[s.dataset.m].mode=s.value;renderPreview()});
   $("#pchk").onclick=preCheck;$("#mk").onclick=doCreate;
+  document.querySelectorAll("[data-tw]").forEach(c=>c.onchange=()=>{c.checked?state.twinSel.add(c.dataset.tw):state.twinSel.delete(c.dataset.tw);renderPreview()});
 }
 function pcHtml(c){if(!c)return '<span class="muted">-</span>';if(c==="..")return '<span class="spin"></span>';return c.ok?`<span class="tag ok">通 ${c.delay}ms</span>`:`<span class="tag bad" title="${esc(c.error)}">不通</span>`}
 async function preCheck(){
@@ -291,7 +297,14 @@ async function preCheck(){
     const bad=r.results.filter(c=>!c.ok).length;toast(bad?`${bad} 条落地不通，鼠标悬停看原因`:"全部落地连通")}
   catch(e){toast(e.message)}
 }
+function twinOthers(){const all=[{id:"local",name:(state.local||{}).public_host||"本机"}].concat(state.servers||[]);return all.filter(s=>s.id!==(state.srv||"local"))}
+function twinPick(){const o=twinOthers();if(!o.length)return "";state.twinSel=state.twinSel||new Set();[...state.twinSel].forEach(id=>{if(!o.some(s=>s.id===id))state.twinSel.delete(id)});
+  const on=state.twinSel.size>0;
+  return `<div class="twinbox ${on?"on":""}"><b>双中转（可选）</b>：同时在这些中转上也建一组，客户订阅里会有两台的节点，一台挂了用另一台：
+   ${o.map(s=>`<label class="ck"><input type="checkbox" data-tw="${esc(s.id)}" ${state.twinSel.has(s.id)?"checked":""}>${esc(s.name)}</label>`).join("")}
+   ${on?`<div class="hint" style="margin-top:4px">会在 当前服务器 + ${[...state.twinSel].map(id=>esc((o.find(s=>s.id===id)||{}).name||id)).join(" + ")} 上各建一组（每台各自重启一次 s-ui）。建好后<b>把订阅链接发给客户</b>，订阅里两台的节点都有，名字后面带中转名。</div>`:""}</div>`}
 async function doCreate(){
+  if(state.twinSel&&state.twinSel.size&&twinOthers().length)return doTwinCreate();
   let expiry;try{expiry=expiryTs()}catch(e){return toast(e.message)}
   const valid=state.preview.filter(x=>!x.error&&x.name);
   const items=valid.filter(x=>x.mode==="new");
@@ -314,14 +327,28 @@ async function doCreate(){
     if(state.tab==="create")renderResults();else toast(`成功 ${ok} 个节点${coreMsg(core)}，回到「一键中转」查看链接`,6000)}
   catch(e){toast(e.message,5000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}}
 }
+async function doTwinCreate(){
+  let expiry;try{expiry=expiryTs()}catch(e){return toast(e.message)}
+  const items=state.preview.filter(x=>!x.error&&x.name&&x.mode!=="skip").map(x=>Object.assign({},x,{mode:"new"}));
+  const protos=selProtos();if(!protos.length)return toast("请至少勾选一个入站协议");if(!items.length)return toast("没有要处理的线路");
+  const srvs=[state.srv||"local",...state.twinSel],names=srvs.map(id=>id==="local"?((state.local||{}).public_host||"本机"):((state.servers.find(s=>s.id===id)||{}).name||id));
+  if(!confirm(`双中转：在 ${names.join("、")} 上各新建 ${items.length} 条线路 × ${protos.length} 种协议。\n（已有线路的落地也会新建，不会挂到原线路上）\n\n每台完成后会重启 s-ui，约断 3 秒。确定？`))return;
+  const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 正在几台服务器上创建…';
+  try{const r=await api("twin_create",{servers:srvs,items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"},{local:true});
+    state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
+    state.preview=null;H("#pvbox","");state.text="";const tx=$("#txt");if(tx)tx.value="";
+    toast(`成功 ${ok} 个节点，组成 ${r.groups} 条双中转线路${ok<r.results.length?`，失败 ${r.results.length-ok} 个`:""}${coreMsg(r.core)}。去「线路管理」点「订阅」把订阅链接发给客户`,8000);
+    if(state.tab==="create")renderResults()}
+  catch(e){toast(e.message,6000);const bb=$("#mk");if(bb){bb.disabled=false;bb.textContent="重试"}}
+}
 async function renderResults(){
   const rs=state.results||[];const ok=rs.filter(x=>x.ok);
   if(!$("#resbox"))return;
   $("#resbox").innerHTML=`<div class="card"><h2>3. 客户链接（${ok.length} 条）</h2>
   <div class="toolbar"><button class="pri" id="cpall">复制全部链接</button><button id="dlall">下载全部二维码（压缩包）</button>
   ${ok.some(x=>!x.firewall)?'<span class="hint">提醒：确认服务器防火墙 / 云安全组已放行这些端口</span>':""}</div>
-  ${rs.filter(x=>!x.ok).map(x=>`<p class="err">✗ ${esc(x.name)}：${esc(x.error)}</p>`).join("")}
-  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
+  ${rs.filter(x=>!x.ok).map(x=>`<p class="err">✗ ${esc(x.name)}${x.server?` · ${esc(x.server)}`:""}：${esc(x.error)}</p>`).join("")}
+  <div class="results">${ok.map((x,i)=>`<div class="res"><div class="name">${esc(x.name)}${x.server?` <span class="tag p-vless443">${esc(x.server)}</span>`:""}</div><div class="muted">${esc(protoName[x.protocol]||"")} · 端口 ${x.port}</div>
   <div class="qr" id="rq${i}"><span class="spin"></span></div><div class="link mono">${esc((x.links||[])[0]||"")}</div>
   <div class="acts" style="justify-content:center"><button class="sm" data-cp="${i}">复制链接</button><button class="sm" data-dl="${i}">下载二维码</button></div></div>`).join("")}</div></div>`;
   $("#cpall").onclick=()=>copy(ok.map(x=>(x.links||[])[0]).filter(Boolean).join("\n"));
@@ -489,7 +516,7 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv=srv;state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv=srv;state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.twin=r.twin||{};state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
@@ -501,14 +528,25 @@ function drawSecure(){
     const b=$("#secfix");b.disabled=true;b.innerHTML='<span class="spin"></span> 修复中…';
     try{const x=await api("secure",{});toast(`已修复 ${x.fixed} 个节点${coreMsg(x.core)}`,5000);await loadRelays();drawTable()}catch(e){toast(e.message,5000);if(b.isConnected){b.disabled=false;b.textContent="一键修复"}}};
 }
+async function twinPendingBox(){
+  let x;try{x=await api("twin_pending",{},{local:true})}catch(e){return}
+  const box=$("#twinpend");if(!box)return;
+  if(!x.pending.length){box.innerHTML="";return}
+  box.innerHTML=`<div class="warnbox"><b>⚠ 双中转有 ${x.pending.length} 个操作还没同步到另一台</b>（那台服务器暂时连不上），每分钟自动重试：
+   <div class="hint" style="margin:6px 0">${x.pending.slice(0,6).map(p=>`${esc(p.label)}：${esc(p.what||"")}（${esc(p.err||"")}）`).join("<br>")}${x.pending.length>6?"<br>…":""}</div>
+   <div class="row" style="gap:8px"><button class="sm" id="tpr">立即重试</button><button class="sm danger" id="tpd">放弃这些同步</button></div></div>`;
+  $("#tpr").onclick=async()=>{$("#tpr").disabled=true;try{await api("twin_pending",{action:"retry"},{local:true})}catch(e){toast(e.message)}twinPendingBox()};
+  $("#tpd").onclick=async()=>{if(!confirm("放弃后这些操作不会再同步到那台服务器，要你自己去那台上手动处理。确定？"))return;await api("twin_pending",{action:"drop"},{local:true});twinPendingBox()};
+}
 async function renderManage(){
   const m=$("#main");
-  m.innerHTML=`<div id="secbox"></div><div class="card"><div class="toolbar"><input id="q" class="grow" placeholder="搜索：客户名 / 节点名 / 落地 IP / 端口" value="${esc(state.q)}">
+  m.innerHTML=`<div id="secbox"></div><div id="twinpend"></div><div class="card"><div class="toolbar"><input id="q" class="grow" placeholder="搜索：客户名 / 节点名 / 落地 IP / 端口" value="${esc(state.q)}">
   <button id="rf">刷新</button></div>
   <div class="toolbar" id="bulk"></div><div style="overflow:auto" id="tbl"><span class="spin"></span></div><div class="pager" id="pg"></div></div>`;
   $("#q").oninput=()=>{state.q=$("#q").value.trim();state.page=1;drawTable()};
   $("#rf").onclick=async()=>{const b=$("#rf");b.disabled=true;try{await loadRelays();drawTable()}catch(e){toast(e.message)}b.disabled=false};
-  const srv=state.srv;if(state.relays&&state.relSrv===srv){drawSecure();drawTable()}   // 先用上次的数据马上显示，再后台刷新
+  const srv=state.srv;if(state.relays&&state.relSrv===srv){drawSecure();drawTable()}
+  if((state.servers||[]).length)twinPendingBox();   // 先用上次的数据马上显示，再后台刷新
   try{await loadRelays();if(state.tab==="manage"&&state.srv===srv&&!document.querySelector("#modal.show"))drawTable()}catch(e){toast(e.message)}
 }
 /* 同一落地（同一个落地出站）的节点算一组：同一客户同一条线路的不同协议 */
@@ -555,7 +593,7 @@ function drawTable(){
   ${i===0?`<td rowspan="${n}"><input type="checkbox" data-g="${esc(m.tag)}" ${on?"checked":""}></td>`:""}
   <td class="nm p-${esc(r.type)}" style="word-break:break-all;min-width:150px" title="${esc(protoName[r.type]||r.type)}">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
   <td><span class="tag p-${esc(r.type)}">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
-  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}</td>`:""}
+  ${i===0?`<td class="mono" rowspan="${n}">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}${twinCell(r)}</td>`:""}
   <td title="${esc(fmtDate(r.expiry))}">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
   ${i===0?`<td rowspan="${n}" style="min-width:110px">${trafficCell(g)}</td><td rowspan="${n}">${deviceCell(g)}</td>`:""}
   ${i===0?`<td rowspan="${n}">${healthCell(g)}</td>`:""}
@@ -866,6 +904,7 @@ async function renderServers(){
 
 /* ---------------- 订阅 ---------------- */
 async function subDlg(tag,reset){
+  const row=byTag(tag);if(row&&row.outbound_tag&&(state.twin||{})[row.outbound_tag]&&!reset)return twinSubDlg(tag,row);
   let x;try{x=await api("sub_get",{tag,reset:!!reset})}catch(e){return toast(e.message)}
   modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2>
   <p class="hint">包含这条线路的全部 ${x.nodes} 个协议节点（已停用、已过期的不会出现在订阅里）。客户导入一次，以后你换端口、换落地、加协议，客户在软件里<b>更新订阅</b>就行，不用重新发链接。</p>
@@ -882,6 +921,27 @@ async function subDlg(tag,reset){
   $("#srs").onclick=()=>{if(confirm("重置后旧的订阅链接马上失效，客户需要重新导入新链接。确定重置？"))subDlg(tag,true)};
 }
 
+async function twinSubDlg(tag,row){
+  let x;try{x=await api("twin_info",{srv:state.srv||"local",okey:row.outbound_tag},{local:true})}catch(e){return toast(e.message)}
+  if(!x.twin){modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2><p class="hint">这条线路是双中转，但要在<b>主控</b>（当初建双中转的那台面板）里查看订阅和同步。</p><div class="row"><button id="tcl">关闭</button></div>`);$("#tcl").onclick=closeModal;return}
+  const ms=x.members;
+  modal(`<h2 style="margin-top:0">双中转订阅：${esc(tag)}</h2>
+  <p class="hint">这条线路在 <b>${ms.map(m=>esc(m.label)).join(" + ")}</b> 上各有一组节点。下面几个订阅地址<b>内容一样</b>，都包含所有中转的节点（名字后面带中转名）。
+  <b>发给客户一个就行</b>，另一个留着：哪台服务器挂了，客户那台的订阅更新不了，但已导入的另一台的节点照样能用，换成另一个订阅地址即可。</p>
+  <p class="hint">v2rayN / Shadowrocket：一个节点连不上就点另一台的同名节点（或测速后选能用的）。Clash：订阅里自带「自动切换」组，不通自动换。</p>
+  ${ms.map((m,i)=>`<div style="display:flex;gap:14px;align-items:center;margin:12px 0;padding:10px;border:1px solid var(--line);border-radius:10px">
+    <div style="width:110px;height:110px;flex:none">${m.svg?m.svg.replace("<svg",'<svg style="width:110px;height:110px;display:block"'):""}</div>
+    <div style="min-width:0;flex:1"><div><b>${esc(m.label)}</b> ${m.me?'<span class="tag gray">当前服务器</span>':""} <span class="muted">${m.nodes} 个节点</span></div>
+      <p class="mono" style="word-break:break-all;margin:6px 0">${m.sub_url?esc(m.sub_url):'<span class="err">还没同步到，稍后再打开</span>'}</p>
+      ${m.sub_url?`<div class="row" style="gap:8px"><button class="sm pri" data-tc="${i}">复制订阅链接</button><button class="sm" data-tk="${i}">复制 Clash 专用链接</button></div>`:""}</div></div>`).join("")}
+  <div class="row" style="margin-top:12px"><button class="danger" id="tun">解除双中转</button><button id="tcl">关闭</button></div>
+  <p class="hint">解除后两台上的线路都保留，但不再同步，订阅里也只剩各自的节点。</p>`);
+  document.querySelectorAll("[data-tc]").forEach(b=>b.onclick=()=>copy(ms[b.dataset.tc].sub_url));
+  document.querySelectorAll("[data-tk]").forEach(b=>b.onclick=()=>copy(ms[b.dataset.tk].sub_url+"?format=clash"));
+  $("#tcl").onclick=closeModal;
+  $("#tun").onclick=async()=>{if(!confirm("解除双中转？两台的线路都保留，以后续期、删除要分别操作。"))return;
+    try{await api("twin_unlink",{srv:state.srv||"local",okey:row.outbound_tag},{local:true});closeModal();toast("已解除");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+}
 /* ---------------- 换端口 ---------------- */
 function portDlg(tags){
   const rs=tags.map(byTag).filter(r=>r&&!r.shared);if(!rs.length)return toast("443 共用节点不能单独换端口");
@@ -917,6 +977,7 @@ function portDlg(tags){
 /* ---------------- 备用落地 ---------------- */
 const foOf=r=>r&&r.outbound_tag?(state.fo||{})[r.outbound_tag]:null;
 const addr=L=>L&&L.server?`${L.server}:${L.port}`:"";
+function twinCell(r){const t=r.outbound_tag&&(state.twin||{})[r.outbound_tag];return t?`<div class="sib"><span class="tag ok" title="同一个落地在这些中转上也有一组节点，客户订阅里都有；续期、停用、删除、换落地、限额会自动同步">双中转 · ${esc(t.peers.join("、"))}</span></div>`:""}
 function foCell(r){const f=foOf(r);const pa=state.pauto&&r.outbound_tag&&state.pauto.has(r.outbound_tag)?`<div class="sib"><span class="tag p-vless443" title="落地连续不通时，自动从落地库换一个同国家的">自动换</span></div>`:"";if(!f)return pa;
   return f.active==="backup"?`<div class="sib"><span class="tag warn" title="主落地 ${esc(addr(f.primary))} 不通，正在走备用">备用中</span> 主 ${esc(addr(f.primary))}${f.primary.country?` ${esc(f.primary.country)}`:""}</div>`
     :`<div class="sib"><span class="tag ok" title="主落地挂了会自动切到备用，客户链接不变">主备</span> 备 ${esc(addr(f.backup))}${f.backup.country?` ${esc(f.backup.country)}`:""}</div>`}
@@ -1039,7 +1100,8 @@ async function setEnable(tags,en){
 }
 async function delTags(tags){
   const set=new Set(tags);const left=[...new Set(tags.flatMap(t=>groupOf(t).filter(x=>!set.has(x.tag)).map(x=>x.tag)))];
-  if(!confirm(`确定删除 ${tags.length} 个节点？${left.length?`\n同落地的这些节点会保留：${left.join("、")}`:"\n落地出站没有其他节点使用时会一起删除。"}\n删除后会重启 s-ui（约 3 秒断线），不可恢复。`))return;
+  const tw=tags.some(t=>{const r=byTag(t);return r&&r.outbound_tag&&(state.twin||{})[r.outbound_tag]});
+  if(!confirm(`确定删除 ${tags.length} 个节点？${tw?"\n其中有双中转线路：另一台中转上的同一条线路（同样的协议）也会一起删除。":""}${left.length?`\n同落地的这些节点会保留：${left.join("、")}`:"\n落地出站没有其他节点使用时会一起删除。"}\n删除后会重启 s-ui（约 3 秒断线），不可恢复。`))return;
   toast("删除中…",15000);
   try{const x=await api("delete",{tags});const bad=x.results.filter(r=>!r.ok);
     tags.forEach(t=>state.sel.delete(t));toast((bad.length?`${bad.length} 条失败：${bad.map(b=>b.error).join("；")}`:"已删除")+coreMsg(x.core),5000);

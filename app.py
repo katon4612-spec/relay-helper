@@ -42,7 +42,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.15.4"
+VERSION = "1.16.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -935,7 +935,7 @@ def op_create(body):
         data = SUI.load_all()
         tls, taken_names, taken_ports = _prepare(data, protos)
         results, new_outbounds, shared, to_pool, direct_obs = [], [], [], [], set()
-        for it in items:
+        for idx, it in enumerate(items):
             base = unique_name(it["name"], taken_names) if it["name"] in taken_names else it["name"]
             taken_names.add(base)
             ob = dict(it["outbound"])
@@ -943,7 +943,7 @@ def op_create(body):
             try:
                 SUI.save("outbounds", "new", ob)
             except Exception as e:
-                results.append({"name": base, "ok": False, "error": "落地出站创建失败：%s" % e})
+                results.append({"name": base, "ok": False, "error": "落地出站创建失败：%s" % e, "item": idx})
                 continue
             made = []
             for i, proto in enumerate(protos):
@@ -968,6 +968,8 @@ def op_create(body):
                 if it.get("raw") and it["outbound"].get("type") != "direct":
                     to_pool.append({"raw": it["raw"], "ob": it["outbound"], "host": it.get("host") or it["outbound"].get("server", ""),
                                     "ip": it.get("ip") or "", "country": it.get("country") or ""})
+            for m in made:
+                m["item"] = idx
             results.extend(made)
         core = _apply_rules(results, new_outbounds)
         init_group_limits([o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)],
@@ -1051,6 +1053,11 @@ def client_links(cid):
     return [l.get("uri") for l in links if l.get("uri")]
 
 
+def _twin_list_info():
+    with TWIN_LOCK:
+        return {k: {"peers": [p.get("label") for p in v.get("peers") or []]} for k, v in TWIN["peers"].items()}
+
+
 def op_list(body):
     data = SUI.load_all()
     with LIM_LOCK:
@@ -1058,7 +1065,7 @@ def op_list(body):
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
             "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary(),
-            "fw_error": FW_STATE["error"], "version": VERSION, "pool_auto": [k for k, v in (POOL.get("auto") or {}).items() if v]}
+            "fw_error": FW_STATE["error"], "version": VERSION, "pool_auto": [k for k, v in (POOL.get("auto") or {}).items() if v], "twin": _twin_list_info()}
 
 
 def op_links(body):
@@ -1351,6 +1358,9 @@ def op_delete(body):
                         with SUBS_LOCK:
                             if SUBS.pop(ot, None):
                                 save_subs()
+                        with TWIN_LOCK:
+                            if TWIN["peers"].pop(ot, None):
+                                save_twins()
                         with POOL_LOCK:   # 自动换开关也清掉，免得以后同名的新线路继承
                             POOL_STATE.pop(ot, None)
                             if POOL["auto"].pop(ot, None) is not None:
@@ -2590,7 +2600,7 @@ def _yaml_item(d, ind):
     return out
 
 
-def clash_yaml(links, title):
+def clash_yaml(links, title, fallback=False):
     proxies = [x for x in (_clash_proxy(u) for u in links) if x]
     names = [dict(x)["name"] for x in proxies]
     lines = ["# %s（由中转助手生成）" % title, "mixed-port: 7890", "allow-lan: false", "mode: rule", "log-level: info", "", "proxies:"]
@@ -2599,7 +2609,12 @@ def clash_yaml(links, title):
     if not proxies:
         lines[-1] = "proxies: []"
     lines += ["", "proxy-groups:", "  - name: %s" % _yq("节点选择"), "    type: select", "    proxies:"]
+    if fallback and names:   # 双中转：默认走「自动切换」，第一个不通自动用下一个
+        lines += ["      - %s" % _yq("自动切换")]
     lines += ["      - %s" % _yq(n) for n in names] + ["      - DIRECT"]
+    if fallback and names:
+        lines += ["  - name: %s" % _yq("自动切换"), "    type: fallback", "    url: %s" % _yq("http://www.gstatic.com/generate_204"),
+                  "    interval: 120", "    proxies:"] + ["      - %s" % _yq(n) for n in names]
     lines += ["", "rules:", "  - %s" % _yq("MATCH,节点选择"), ""]
     return "\n".join(lines)
 
@@ -2611,6 +2626,7 @@ def serve_sub(handler, token, query):
         return handler._send(404, "订阅不存在或已重置", "text/plain; charset=utf-8")
     try:
         links, info, name = _sub_links(k)
+        twin = twin_sub_items(k)
     except Exception as e:
         return handler._send(503, "暂时无法获取节点：%s" % e, "text/plain; charset=utf-8")
     ua = (handler.headers.get("User-Agent") or "").lower()
@@ -2622,8 +2638,14 @@ def serve_sub(handler, token, query):
            "Content-Disposition": "attachment; filename*=UTF-8''%s" % urllib.parse.quote(name),
            "Profile-Title": "base64:" + base64.b64encode(name.encode()).decode()}
     if fmt == "clash":
-        body = clash_yaml(links, name)
+        if twin is not None:
+            body = clash_yaml([_rename_link(u, n) for n, u in twin], name, fallback=True)
+        else:
+            body = clash_yaml(links, name)
         return handler._send(200, body, "text/yaml; charset=utf-8", headers=hdr)
+    if twin is not None:
+        body = base64.b64encode("\n".join(_rename_link(_v2rayn_link(u), n) for n, u in twin).encode()).decode()
+        return handler._send(200, body, "text/plain; charset=utf-8", headers=hdr)
     body = base64.b64encode("\n".join(_v2rayn_link(u) for u in links).encode()).decode()
     return handler._send(200, body, "text/plain; charset=utf-8", headers=hdr)
 
@@ -3309,6 +3331,8 @@ def make_backup(full=False, out=None):
                 tar.add(SERVERS_PATH, "servers.json")
             if os.path.exists(POOL_PATH):
                 tar.add(POOL_PATH, "landings.json")
+            if os.path.exists(TWIN_PATH):
+                tar.add(TWIN_PATH, "twins.json")
             for fp in files:
                 tar.add(fp, "files" + fp)
     os.chmod(out, 0o600)
@@ -3356,7 +3380,7 @@ def restore_file(path):
                         nm = m.name
                         if not m.isfile() or ".." in nm.split("/") or nm.startswith("/"):
                             continue
-                        if nm in ("s-ui.db", "limits.json", "failover.json", "subs.json", "servers.json", "landings.json", "relay-helper-settings.json", "backup-info.json") or \
+                        if nm in ("s-ui.db", "limits.json", "failover.json", "subs.json", "servers.json", "landings.json", "twins.json", "relay-helper-settings.json", "backup-info.json") or \
                                 (nm.startswith("files/") and m.size < 1024 * 1024):
                             dest = os.path.join(td, "x", nm)
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -3451,6 +3475,11 @@ def restore_file(path):
                 shutil.copyfile(lp, POOL_PATH)
                 with POOL_LOCK:
                     load_pool()
+            tw = os.path.join(td, "x", "twins.json")
+            if os.path.exists(tw):
+                shutil.copyfile(tw, TWIN_PATH)
+                with TWIN_LOCK:
+                    load_twins()
             sv = os.path.join(td, "x", "servers.json")
             if os.path.exists(sv):
                 shutil.copyfile(sv, SERVERS_PATH)
@@ -3540,6 +3569,435 @@ def check_sui_login(user, pw):
         except Exception as e:
             sys.stderr.write("update sui creds: %s\n" % e)
     return True
+
+
+# ------------------------------------------------------------ 双中转 --
+# 同一个落地在两台（或多台）中转上各建一组节点，客户的订阅里同时有这几台的节点：一台挂了用另一台。
+# 每台服务器 twins.json 的 peers：这条线路在其他中转上的节点快照（出订阅用）。
+# 主控 twins.json 的 groups：哪几台上的哪几条线路是一组；pending：没同步成功、等重试的操作。
+TWIN_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "twins.json")
+TWIN = {"peers": {}, "groups": {}, "pending": []}
+TWIN_LOCK = threading.RLock()
+TWIN_SYNC = {"update_clients", "delete", "set_limits", "reset_traffic", "pool_auto", "add_protocol",
+             "replace", "pool_switch", "change_port", "change_domain"}
+TWIN_LINE_OPS = {"set_limits", "reset_traffic", "pool_auto", "add_protocol", "replace"}
+
+
+def load_twins():
+    global TWIN
+    try:
+        with open(TWIN_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        TWIN = {"peers": d.get("peers") or {}, "groups": d.get("groups") or {}, "pending": d.get("pending") or []}
+    except Exception:
+        TWIN = {"peers": {}, "groups": {}, "pending": []}
+
+
+def save_twins():
+    tmp = TWIN_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(TWIN, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TWIN_PATH)
+
+
+def server_label():
+    l = (CFG.get("label") or "").strip()
+    if l:
+        return l
+    h = (CFG.get("public_host") or "").strip()
+    if re.fullmatch(r"[\d.]+|[0-9a-fA-F:]+", h):
+        return h
+    return h.split(".")[0] or h
+
+
+# ---- 每台服务器上的（主控通过连接密钥调用）
+def op_twin_resolve(body):
+    """页面操作涉及哪些线路：{okey: {types: [这次操作的协议], all: 是不是整条线路}}"""
+    rows = build_relays(SUI.load_all())
+    tags = set(body.get("tags") or [])
+    if body.get("tag"):
+        tags.add(body["tag"])
+    cids = set(body.get("client_ids") or [])
+    g = group_rows(rows)
+    lines = {}
+    for r in rows:
+        if r["tag"] in tags or (r.get("client_id") and r["client_id"] in cids):
+            L = lines.setdefault(okey_of(r), {"types": [], "all": False})
+            if r["type"] not in L["types"]:
+                L["types"].append(r["type"])
+    for k, L in lines.items():
+        L["all"] = set(L["types"]) >= {x["type"] for x in g.get(k, [])}
+    return {"lines": lines}
+
+
+def op_twin_links(body):
+    k = body.get("okey")
+    data = SUI.load_all()
+    rs = group_rows(build_relays(data)).get(k) or []
+    if not rs:
+        return {"exists": False, "label": server_label()}
+    nodes = []
+    for r in rs:
+        if not r.get("client_id"):
+            continue
+        try:
+            ls = client_links(r["client_id"])
+        except Exception:
+            ls = []
+        if ls:
+            nodes.append({"name": r["tag"], "type": r["type"], "links": ls, "enable": bool(r.get("enable")), "expiry": r.get("expiry") or 0})
+    ob = next((o for o in data.get("outbounds") or [] if o.get("tag") == k), None)
+    if ob:
+        ob = {kk: v for kk, v in ob.items() if kk not in ("id", "tag")}
+    with SUBS_LOCK:
+        tok = SUBS.get(k)
+    return {"exists": True, "label": server_label(), "nodes": nodes, "outbound": ob, "sub_url": _sub_url(tok) if tok else ""}
+
+
+def op_twin_peer_set(body):
+    k = body.get("okey")
+    with TWIN_LOCK:
+        if body.get("peers"):
+            TWIN["peers"][k] = {"gid": body.get("gid"), "peers": body["peers"], "ts": int(time.time())}
+        else:
+            TWIN["peers"].pop(k, None)
+        save_twins()
+    if body.get("token"):
+        with SUBS_LOCK:
+            if SUBS.get(k) != body["token"]:
+                SUBS[k] = body["token"]
+                save_subs()
+    with SUBS_LOCK:
+        tok = SUBS.get(k)
+    return {"sub_url": _sub_url(tok) if tok else ""}
+
+
+def op_twin_apply(body):
+    """把另一台上做的操作在这台的同一条线路上照做。"""
+    k, op = body.get("okey"), body.get("op")
+    if op not in TWIN_SYNC or op not in OPS:
+        raise SuiError("不支持同步这个操作：%s" % op)
+    rs = group_rows(build_relays(SUI.load_all())).get(k) or []
+    if not rs:
+        return {"missing": True}   # 这台上这条线路已经没有了（比如之前已删掉）
+    types = body.get("types")
+    sel = [r for r in rs if not types or r["type"] in types]
+    if not sel:
+        return {"skipped": True}
+    p = dict(body.get("params") or {})
+    p["tags"] = [sel[0]["tag"]] if op in TWIN_LINE_OPS else [r["tag"] for r in sel]
+    p["tag"] = sel[0]["tag"]
+    p["client_ids"] = [r["client_id"] for r in sel if r.get("client_id")]
+    if op == "replace":
+        p["to_pool"] = False
+    res = OPS[op](p)
+    bad = [x for x in (res.get("results") or []) if isinstance(x, dict) and x.get("ok") is False]
+    if bad and len(bad) == len(res.get("results") or []):
+        raise SuiError(bad[0].get("error") or "失败")
+    return {"result": res}
+
+
+def twin_sub_items(k):
+    """这条线路是双中转时，订阅里的 (名字, 链接)：本机的在前，其他中转的在后。名字后面加「·中转名」。"""
+    with TWIN_LOCK:
+        tp = TWIN["peers"].get(k)
+        tp = json.loads(json.dumps(tp)) if tp else None
+    if not tp:
+        return None
+    own = op_twin_links({"okey": k})
+    now = time.time()
+    out = []
+    for label, nodes in [(own.get("label"), own.get("nodes") or [])] + [(p.get("label"), p.get("nodes") or []) for p in tp["peers"]]:
+        for n in nodes:
+            if not n.get("enable") or (n.get("expiry") and n["expiry"] < now):
+                continue
+            for l in n.get("links") or []:
+                out.append(("%s·%s" % (n["name"], label), l))
+    return out
+
+
+def _rename_link(u, name):
+    return u.split("#", 1)[0] + "#" + urllib.parse.quote(name)
+
+
+# ---- 主控上的
+def _call(srv, action, body, timeout=180):
+    if not srv or srv == "local":
+        try:
+            r = OPS[action](body)
+            r["ok"] = r.get("ok", True)
+            return r
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    return proxy_json(srv, action, body, timeout)
+
+
+def _srv_name(srv):
+    if not srv or srv == "local":
+        return server_label()
+    with SRV_LOCK:
+        sv = next((x for x in SERVERS if x.get("id") == srv), None)
+    return (sv or {}).get("name") or srv
+
+
+def _group_of(srv, okey):
+    with TWIN_LOCK:
+        for gid, g in TWIN["groups"].items():
+            for i, m in enumerate(g["members"]):
+                if m["srv"] == srv and m["okey"] == okey:
+                    return gid, g, i
+    return None, None, None
+
+
+def _pend(item, err):
+    with TWIN_LOCK:
+        item.update(err=err, ts=int(time.time()), tries=item.get("tries", 0) + 1)
+        if item not in TWIN["pending"]:
+            TWIN["pending"].append(item)
+        save_twins()
+
+
+def twin_sync_links(gid):
+    """把每台的节点快照发给同组的其他几台（订阅里要用），顺便统一订阅令牌。"""
+    with TWIN_LOCK:
+        g = TWIN["groups"].get(gid)
+        if not g:
+            return []
+        members = [dict(m) for m in g["members"]]
+        snap = dict(g.get("snap") or {})
+        token = g["token"]
+    errs = []
+    for i, m in enumerate(members):
+        r = _call(m["srv"], "twin_links", {"okey": m["okey"]})
+        if r.get("ok") and r.get("exists"):
+            snap[str(i)] = {"label": r["label"], "nodes": r["nodes"], "sub_url": r.get("sub_url") or ""}
+            m["label"] = r["label"]
+        elif r.get("ok"):
+            snap.pop(str(i), None)   # 那台上这条线路没了
+    for i, m in enumerate(members):
+        peers = [{"label": v["label"], "nodes": v["nodes"]} for j, v in snap.items() if j != str(i)]
+        r = _call(m["srv"], "twin_peer_set", {"okey": m["okey"], "gid": gid, "token": token, "peers": peers})
+        if not r.get("ok"):
+            errs.append({"server": _srv_name(m["srv"]), "error": r.get("error")})
+            _pend({"kind": "sync", "gid": gid, "srv": m["srv"], "label": _srv_name(m["srv"])}, r.get("error"))
+        elif str(i) in snap and r.get("sub_url"):
+            snap[str(i)]["sub_url"] = r["sub_url"]   # 同一个令牌，每台的地址都能出完整订阅
+    with TWIN_LOCK:
+        g = TWIN["groups"].get(gid)
+        if g:
+            g["snap"] = snap
+            for i, m in enumerate(members):
+                if i < len(g["members"]) and m.get("label"):
+                    g["members"][i]["label"] = m["label"]
+            save_twins()
+    return errs
+
+
+def op_twin_create(body):
+    srvs = list(dict.fromkeys(body.get("servers") or []))
+    if len(srvs) < 2:
+        raise SuiError("双中转至少要选两台中转服务器")
+    for s in srvs:
+        if s != "local":
+            _server(s)
+    base = {k: v for k, v in body.items() if k != "servers"}
+    per = {}
+
+    def run(s):
+        per[s] = _call(s, "create", base, timeout=600)
+    ths = [threading.Thread(target=run, args=(s,)) for s in srvs]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    results, cores = [], []
+    for s in srvs:
+        r = per.get(s) or {"ok": False, "error": "没有返回"}
+        name = _srv_name(s)
+        if not r.get("ok"):
+            results.append({"name": "（%s）" % name, "ok": False, "error": r.get("error") or "创建失败", "server": name})
+            continue
+        cores.append(r.get("core") or "ok")
+        for x in r.get("results") or []:
+            x["server"] = name
+            x["srv"] = s
+            results.append(x)
+    groups = 0
+    n_items = len([it for it in body.get("items") or [] if not it.get("error") and it.get("name")])
+    for idx in range(n_items):
+        members = []
+        for s in srvs:
+            ob = next((x.get("outbound") for x in results if x.get("srv") == s and x.get("item") == idx and x.get("ok") and x.get("outbound")), None)
+            if ob:
+                members.append({"srv": s, "okey": ob, "label": _srv_name(s)})
+        if len(members) < 2:
+            continue
+        gid = secrets.token_hex(5)
+        with TWIN_LOCK:
+            TWIN["groups"][gid] = {"customer": body.get("customer") or "", "members": members,
+                                   "token": secrets.token_urlsafe(18), "created": int(time.time()), "snap": {}}
+            save_twins()
+        twin_sync_links(gid)
+        groups += 1
+    core = next((c for c in cores if c != "ok"), "ok")
+    return {"results": results, "core": core, "groups": groups}
+
+
+def op_twin_info(body):
+    gid, g, i = _group_of(body.get("srv") or "local", body.get("okey"))
+    if not g:
+        return {"twin": False}
+    snap = g.get("snap") or {}
+    mem = [{"label": (snap.get(str(j)) or {}).get("label") or m.get("label") or _srv_name(m["srv"]), "server": _srv_name(m["srv"]),
+            "sub_url": (snap.get(str(j)) or {}).get("sub_url") or "", "nodes": len((snap.get(str(j)) or {}).get("nodes") or []),
+            "me": j == i} for j, m in enumerate(g["members"])]
+    for m in mem:
+        if m["sub_url"]:
+            m["svg"] = qr_svg(m["sub_url"])
+    return {"twin": True, "gid": gid, "members": mem}
+
+
+def op_twin_unlink(body):
+    gid, g, i = _group_of(body.get("srv") or "local", body.get("okey"))
+    if not g:
+        return {}
+    with TWIN_LOCK:
+        TWIN["groups"].pop(gid, None)
+        save_twins()
+    for m in g["members"]:
+        _call(m["srv"], "twin_peer_set", {"okey": m["okey"], "peers": []})
+    return {}
+
+
+def op_twin_pending(body):
+    act = body.get("action")
+    if act == "drop":
+        with TWIN_LOCK:
+            TWIN["pending"] = []
+            save_twins()
+    elif act == "retry":
+        twin_retry()
+    with TWIN_LOCK:
+        return {"pending": [{"label": p.get("label"), "what": p.get("what") or ("同步订阅节点" if p.get("kind") == "sync" else p.get("op")),
+                             "err": p.get("err"), "tries": p.get("tries"), "ts": p.get("ts")} for p in TWIN["pending"]],
+                "groups": len(TWIN["groups"])}
+
+
+TWIN_WHAT = {"update_clients": "续期/停用/启用", "delete": "删除", "set_limits": "限额", "reset_traffic": "清零流量",
+             "pool_auto": "自动换开关", "add_protocol": "加协议", "replace": "换落地"}
+
+
+def twin_pre(srv, action, body):
+    """页面操作前：看看涉及的线路有没有双中转（删除之后就查不到了，所以要先查）。"""
+    if action not in TWIN_SYNC:
+        return None
+    with TWIN_LOCK:
+        if not TWIN["groups"] or not any(m["srv"] == srv for g in TWIN["groups"].values() for m in g["members"]):
+            return None
+    if action == "change_domain":
+        return {"srv": srv, "action": action, "body": body, "lines": {}}
+    r = _call(srv, "twin_resolve", {"tags": body.get("tags") or [], "tag": body.get("tag"), "client_ids": body.get("client_ids") or []})
+    if not r.get("ok"):
+        return None
+    lines = {k: v for k, v in (r.get("lines") or {}).items() if _group_of(srv, k)[0]}
+    return {"srv": srv, "action": action, "body": body, "lines": lines} if lines else None
+
+
+def twin_post(ctx, res):
+    srv, action, body = ctx["srv"], ctx["action"], ctx["body"]
+    synced, failed, gids, drop = [], [], set(), set()
+    if action == "change_domain":
+        with TWIN_LOCK:
+            gids = {gid for gid, g in TWIN["groups"].items() if any(m["srv"] == srv for m in g["members"])}
+    for k, L in ctx["lines"].items():
+        gid, g, me = _group_of(srv, k)
+        if not g:
+            continue
+        gids.add(gid)
+        if action == "change_port":
+            continue   # 端口每台各管各的，只要更新订阅里的节点
+        op, params = action, {}
+        if action == "update_clients":
+            params = {x: body[x] for x in ("expiry", "enable", "reset_traffic") if x in body}
+        elif action == "set_limits":
+            params = {x: body[x] for x in ("quota_gb", "devices") if x in body}
+        elif action == "pool_auto":
+            params = {"on": body.get("on")}
+        elif action == "add_protocol":
+            params = {"protocols": body.get("protocols") or []}
+        elif action in ("replace", "pool_switch"):
+            src = _call(srv, "twin_links", {"okey": k})
+            if not (src.get("ok") and src.get("outbound")):
+                failed.append({"server": "?", "error": "读取新落地失败"})
+                continue
+            op, params = "replace", {"outbound": src["outbound"]}
+        types = None if (L.get("all") or op in TWIN_LINE_OPS) else L.get("types")
+        for j, m in enumerate(g["members"]):
+            if j == me:
+                continue
+            call = {"okey": m["okey"], "op": op, "types": types, "params": params}
+            r = _call(m["srv"], "twin_apply", call)
+            name = _srv_name(m["srv"])
+            if r.get("ok"):
+                synced.append(name)
+            else:
+                failed.append({"server": name, "error": r.get("error")})
+                _pend({"kind": "apply", "srv": m["srv"], "label": name, "gid": gid, "call": call, "what": TWIN_WHAT.get(op, op)}, r.get("error"))
+        if action == "delete" and L.get("all"):
+            drop.add(gid)
+    for gid in gids:
+        if gid in drop:
+            with TWIN_LOCK:
+                TWIN["groups"].pop(gid, None)
+                save_twins()
+        else:
+            twin_sync_links(gid)
+    if synced or failed:
+        res["twin"] = {"synced": sorted(set(synced)), "failed": failed}
+
+
+def twin_retry():
+    with TWIN_LOCK:
+        items = list(TWIN["pending"])
+    resync = set()
+    for p in items:
+        if p.get("kind") == "apply":
+            r = _call(p["srv"], "twin_apply", p["call"])
+            ok = r.get("ok")
+            err = r.get("error")
+            if ok and p.get("gid"):
+                resync.add(p["gid"])
+        else:
+            ok, err = True, None
+            resync.add(p.get("gid"))
+        with TWIN_LOCK:
+            if ok:
+                if p in TWIN["pending"]:
+                    TWIN["pending"].remove(p)
+            else:
+                p.update(err=err, tries=p.get("tries", 0) + 1, ts=int(time.time()))
+            save_twins()
+    for gid in resync:
+        if gid:
+            with TWIN_LOCK:
+                TWIN["pending"] = [x for x in TWIN["pending"] if not (x.get("kind") == "sync" and x.get("gid") == gid)]
+            twin_sync_links(gid)
+
+
+def twin_loop():
+    time.sleep(40)
+    while True:
+        try:
+            if TWIN["pending"]:
+                twin_retry()
+        except Exception as e:
+            sys.stderr.write("twin: %s\n" % e)
+        time.sleep(60)
+
+
+OPS.update({"twin_resolve": op_twin_resolve, "twin_links": op_twin_links, "twin_peer_set": op_twin_peer_set,
+            "twin_apply": op_twin_apply, "twin_create": op_twin_create, "twin_info": op_twin_info,
+            "twin_unlink": op_twin_unlink, "twin_pending": op_twin_pending})
+LOCAL_ONLY.update({"twin_create", "twin_info", "twin_unlink", "twin_pending"})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3764,8 +4222,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, {"ok": False, "error": "请先登录", "login": True})
         sid = self._remote_sid()
+        tctx = None
+        if self._session() and action not in LOCAL_ONLY:
+            try:
+                tctx = twin_pre(sid or "local", action, body)
+            except Exception as e:
+                sys.stderr.write("twin pre: %s\n" % e)
         if sid and action not in LOCAL_ONLY:
-            return self._send(200, proxy_json(sid, action, body))
+            res = proxy_json(sid, action, body)
+            if tctx and isinstance(res, dict) and res.get("ok"):
+                try:
+                    twin_post(tctx, res)
+                except Exception as e:
+                    sys.stderr.write("twin post: %s\n" % e)
+            return self._send(200, res)
         fn = OPS.get(action)
         if not fn:
             return self._send(404, {"ok": False, "error": "unknown action"})
@@ -3773,6 +4243,11 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             res = fn(body)
             res["ok"] = res.get("ok", True)
+            if tctx and res["ok"]:
+                try:
+                    twin_post(tctx, res)
+                except Exception as e:
+                    sys.stderr.write("twin post: %s\n" % e)
             if time.time() - t0 > 3:
                 sys.stderr.write("slow op %s: %.1fs\n" % (action, time.time() - t0))
             return self._send(200, res)
@@ -3802,7 +4277,9 @@ def main():
     load_subs()
     load_servers()
     load_pool()
+    load_twins()
     threading.Thread(target=pool_loop, daemon=True).start()
+    threading.Thread(target=twin_loop, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()
