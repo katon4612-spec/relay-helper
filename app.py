@@ -12,6 +12,7 @@
 import base64
 import gzip
 import hashlib
+import io
 import hmac
 import http.cookiejar
 import ipaddress
@@ -27,6 +28,8 @@ import socket
 import string
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import traceback
@@ -42,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.17.2"
+VERSION = "1.18.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -3560,6 +3563,34 @@ OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kic
 SESSIONS = {}
 FAILS = {}
 SESSION_AGE = 7 * 86400
+SESS_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "sessions.json")
+SESS_LOCK = threading.Lock()
+
+
+def load_sessions():
+    """登录状态存到文件：在线更新 / 重启后不用重新登录。"""
+    try:
+        with open(SESS_PATH) as f:
+            d = json.load(f)
+        now = time.time()
+        SESSIONS.update({k: v for k, v in d.items() if isinstance(v, (int, float)) and v > now})
+    except Exception:
+        pass
+
+
+def save_sessions():
+    with SESS_LOCK:
+        now = time.time()
+        for k in [k for k, v in SESSIONS.items() if v < now]:
+            SESSIONS.pop(k, None)
+        try:
+            tmp = SESS_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(SESSIONS, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, SESS_PATH)
+        except Exception as e:
+            sys.stderr.write("save sessions: %s\n" % e)
 
 
 def check_password(p):
@@ -4135,6 +4166,146 @@ OPS.update({"twin_resolve": op_twin_resolve, "twin_links": op_twin_links, "twin_
 LOCAL_ONLY.update({"twin_create", "twin_info", "twin_unlink", "twin_pending"})
 
 
+# ------------------------------------------------------------ 在线更新 --
+# 「设置」页 / 「服务器」页一点就更新：从 GitHub 下载最新版，替换程序文件（配置、数据都不动），原地重启。
+UPDATE_REPO = "katon4612-spec/relay-helper"
+UPDATE_FILES = ["app.py", "qrencoder.py", "index.html", "configure.py", "https.sh", "install.sh"]
+UPD_LOCK = threading.Lock()
+
+
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def _fetch(url, timeout=30, limit=20 << 20):
+    req = urllib.request.Request(url, headers={"User-Agent": "relay-helper/" + VERSION, "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise SuiError("下载内容过大")
+    return data
+
+
+def _upd_urls():
+    base = CFG.get("update_base") or "https://raw.githubusercontent.com/%s/main/" % UPDATE_REPO
+    tar = CFG.get("update_tarball") or "https://codeload.github.com/%s/tar.gz/refs/heads/main" % UPDATE_REPO
+    return base, tar
+
+
+def _can_self_update():
+    return all(os.access(os.path.join(HERE, f), os.W_OK) for f in ("app.py", "index.html")) and os.access(HERE, os.W_OK)
+
+
+def op_update_check(body):
+    base, _ = _upd_urls()
+    latest, notes = "", []
+    try:
+        j = json.loads(_fetch(base + "version.json?t=%d" % time.time(), 15).decode("utf-8"))
+        latest = j.get("version") or ""
+        notes = [n for n in j.get("changes") or [] if _vtuple(n.get("version")) > _vtuple(VERSION)][:15]
+    except Exception:
+        pass
+    if not latest:
+        try:
+            m = re.search(r'^VERSION = "([^"]+)"', _fetch(base + "app.py?t=%d" % time.time(), 20).decode("utf-8", "replace"), re.M)
+            latest = m.group(1) if m else ""
+        except Exception as e:
+            raise SuiError("连不上 GitHub，检查不了更新：%s" % e)
+    prev = ""
+    try:
+        with open(os.path.join(HERE, ".prev", "VERSION")) as f:
+            prev = f.read().strip()
+    except Exception:
+        pass
+    return {"current": VERSION, "latest": latest, "has_update": _vtuple(latest) > _vtuple(VERSION), "notes": notes,
+            "can_update": _can_self_update(), "prev": prev}
+
+
+def _restart_self(delay=1.5):
+    """回完这次请求后原地重启（进程号不变，systemd 照常管理）。"""
+    def go():
+        time.sleep(delay)
+        cmd = CFG.get("self_restart_cmd")
+        if cmd:
+            subprocess.Popen(cmd, shell=True, start_new_session=True)
+            return
+        sys.stderr.write("中转助手：更新完成，重启中…\n")
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def op_update_run(body):
+    if not _can_self_update():
+        raise SuiError("程序目录 %s 没有写权限，只能登服务器运行安装命令更新" % HERE)
+    if not UPD_LOCK.acquire(blocking=False):
+        raise SuiError("正在更新，稍等")
+    try:
+        _, tar = _upd_urls()
+        try:
+            data = _fetch(tar + ("&" if "?" in tar else "?") + "t=%d" % time.time(), 90)
+        except Exception as e:
+            raise SuiError("下载更新失败：%s" % e)
+        got = {}
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                parts = m.name.split("/")
+                name = parts[-1] if len(parts) <= 2 else ""
+                if name in UPDATE_FILES:
+                    got[name] = tf.extractfile(m).read()
+        miss = [f for f in ("app.py", "index.html", "qrencoder.py") if f not in got]
+        if miss:
+            raise SuiError("更新包不完整（缺 %s）" % "、".join(miss))
+        src = got["app.py"].decode("utf-8", "replace")
+        m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+        newv = m.group(1) if m else "?"
+        if not body.get("force") and _vtuple(newv) <= _vtuple(VERSION):
+            return {"updated": False, "version": VERSION, "msg": "已经是最新版本"}
+        try:
+            compile(src, "app.py", "exec")   # 新版本连语法都不对就不换
+        except SyntaxError as e:
+            raise SuiError("新版本程序有错误，没有更新：%s" % e)
+        prev = os.path.join(HERE, ".prev")
+        os.makedirs(prev, exist_ok=True)
+        for f in UPDATE_FILES:
+            p = os.path.join(HERE, f)
+            if os.path.exists(p):
+                shutil.copy2(p, os.path.join(prev, f))
+        with open(os.path.join(prev, "VERSION"), "w") as fh:
+            fh.write(VERSION)
+        for f, b in got.items():
+            dst = os.path.join(HERE, f)
+            tmp = dst + ".new"
+            with open(tmp, "wb") as fh:
+                fh.write(b)
+            os.chmod(tmp, 0o755 if f.endswith(".sh") else 0o644)
+            os.replace(tmp, dst)
+        sys.stderr.write("在线更新：%s -> %s\n" % (VERSION, newv))
+        _restart_self()
+        return {"updated": True, "from": VERSION, "version": newv}
+    finally:
+        UPD_LOCK.release()
+
+
+def op_update_rollback(body):
+    prev = os.path.join(HERE, ".prev")
+    if not os.path.exists(os.path.join(prev, "app.py")):
+        raise SuiError("没有可以回退的旧版本")
+    with open(os.path.join(prev, "VERSION")) as f:
+        pv = f.read().strip()
+    for f in UPDATE_FILES:
+        p = os.path.join(prev, f)
+        if os.path.exists(p):
+            shutil.copy2(p, os.path.join(HERE, f))
+    _restart_self()
+    return {"version": pv}
+
+
+OPS.update({"update_check": op_update_check, "update_run": op_update_run, "update_rollback": op_update_rollback})
+
+
 class Handler(BaseHTTPRequestHandler):
     # 长连接：浏览器复用同一条连接（HTTPS 不用每点一下都重新握手），跨境访问每次点击省几百毫秒
     protocol_version = "HTTP/1.1"
@@ -4349,10 +4520,14 @@ class Handler(BaseHTTPRequestHandler):
                                         if sui_down else "账号或密码错误（和 s-ui 面板的一样）"})
             sid = secrets.token_urlsafe(32)
             SESSIONS[sid] = time.time() + SESSION_AGE
+            save_sessions()
             secure = "; Secure" if CFG.get("cert_file") else ""
             return self._send(200, {"ok": True}, headers={
                 "Set-Cookie": "rh_sess=%s; Path=%s; Max-Age=%d; HttpOnly; SameSite=Strict%s" % (sid, p, SESSION_AGE, secure)})
         if action == "logout":
+            m = re.search(r"rh_sess=([A-Za-z0-9_\-]+)", self.headers.get("Cookie") or "")
+            if m and SESSIONS.pop(m.group(1), None):
+                save_sessions()
             return self._send(200, {"ok": True}, headers={"Set-Cookie": "rh_sess=; Path=%s; Max-Age=0" % p})
         if not self._authed():
             return self._send(401, {"ok": False, "error": "请先登录", "login": True})
@@ -4413,6 +4588,7 @@ def main():
     load_servers()
     load_pool()
     load_twins()
+    load_sessions()
     threading.Thread(target=pool_loop, daemon=True).start()
     threading.Thread(target=twin_loop, daemon=True).start()
     if not CFG.get("api_token"):

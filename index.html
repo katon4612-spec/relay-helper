@@ -100,6 +100,7 @@ td.nm.p-vless{--c:var(--p-vless)}td.nm.p-vless443{--c:var(--p-vless443)}td.nm.p-
 .toolbar .grow{flex:1}
 
 #fab{display:none}
+header nav button.dot{position:relative}header nav button.dot::after{content:"";position:absolute;top:5px;right:6px;width:7px;height:7px;border-radius:50%;background:var(--pri)}
 .warnbox a{color:var(--pri);font-weight:600}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,8px);background:var(--ink);color:#FBF5EC;padding:11px 20px;border-radius:10px;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:90vw;z-index:9;box-shadow:0 8px 24px rgba(43,38,32,.22)}
 #toast.show{opacity:1;transform:translate(-50%,0)}
@@ -503,11 +504,46 @@ function healthCell(g){const m=g[0];const c=state.checks[m.tag];if(c)return pcHt
   return `${h.ok?`<span class="tag ok">通 ${h.delay}ms</span>`:`<span class="tag bad" title="${esc(h.error)}">不通${h.fails>1?` ×${h.fails}`:""}</span>`}<div class="sib">自动 ${agoText(h.ts)}</div>`}
 
 /* ---------------- 设置 ---------------- */
+/* ---------------- 在线更新 ---------------- */
+function vcmp(a,b){const x=String(a||"").split(".").map(Number),y=String(b||"").split(".").map(Number);for(let i=0;i<3;i++){const d=(x[i]||0)-(y[i]||0);if(d)return d}return 0}
+async function checkUpdate(force){   // 本机（主控）去 GitHub 看最新版本，12 小时缓存
+  try{const c=JSON.parse(LS.get("rh_upd")||"null");if(!force&&c&&Date.now()-c.t<12*3600e3&&c.cur===state.ver)return c.x}catch(e){}
+  const x=await api("update_check",{},{local:true});state.ver=x.current;LS.set("rh_upd",JSON.stringify({t:Date.now(),x,cur:x.current}));return x}
+function updDot(x){const b=document.querySelector('header nav button[data-t="settings"]');if(b)b.classList.toggle("dot",!!(x&&x.has_update))}
+async function doUpdate(srv,latest,name,onDone){
+  if(!confirm(`把「${name}」更新到 v${latest}？\n\n只替换程序文件，线路、落地库、配置都不动；更新完自动重启中转助手（几秒，客户节点不受影响）。`))return false;
+  let r;try{r=await api("update_run",{},{srv})}catch(e){toast(e.message,8000);return false}
+  if(!r.updated){toast(r.msg||"已经是最新版本");return false}
+  toast(`「${name}」正在更新到 v${r.version}，重启中…`,8000);
+  for(let i=0;i<45;i++){await new Promise(z=>setTimeout(z,2000));
+    try{const p=await api("ping",{},{srv});if(p.version===r.version){toast(`「${name}」已更新到 v${r.version}`,6000);if(onDone)onDone(r.version);return true}}catch(e){}}
+  toast(`「${name}」90 秒内没恢复，请登服务器看看：journalctl -u relay-helper -n 50`,12000);return false}
+async function drawUpd(force){
+  const srv=state.srv||"local",name=srv==="local"?((state.local||{}).public_host||"本机"):((state.servers.find(x=>x.id===srv)||{}).name||srv);
+  let x;try{x=srv==="local"?await checkUpdate(force):await api("update_check")}catch(e){return H("#updbox",`<p class="err">${esc(e.message)}</p><button class="sm" id="updre">重新检查</button>`),$("#updre").onclick=()=>drawUpd(true)}
+  if(srv==="local")updDot(x);
+  if(!$("#updbox"))return;
+  H("#updbox",`<p>当前版本 <b>v${esc(x.current)}</b>，GitHub 最新 <b>v${esc(x.latest)}</b>
+   ${x.has_update?'<span class="tag warn">有新版本</span>':'<span class="tag ok">已是最新</span>'}</p>
+   ${x.notes&&x.notes.length?`<ul class="hint" style="margin:6px 0 10px;padding-left:20px">${x.notes.map(n=>`<li><b>v${esc(n.version)}</b>：${esc(n.notes)}</li>`).join("")}</ul>`:""}
+   <div class="row">${x.has_update&&x.can_update?`<button class="pri" id="updgo">立即更新到 v${esc(x.latest)}</button>`:""}<button id="updre">重新检查</button>
+   ${x.prev&&x.prev!==x.current?`<button class="sm" id="updrb" title="新版本有问题时用">回退到 v${esc(x.prev)}</button>`:""}</div>
+   ${x.has_update&&!x.can_update?'<p class="hint">这台程序目录没有写权限，只能登服务器运行安装命令更新。</p>':""}
+   <p class="hint">更新只替换程序文件，线路、落地库、订阅、配置都不动；完成后中转助手自动重启几秒（客户节点由 s-ui 提供，不受影响）。多台服务器可以在「服务器」页一起更新。</p>`);
+  $("#updre").onclick=()=>{H("#updbox",'<span class="spin"></span> 正在检查…');drawUpd(true)};
+  if($("#updgo"))$("#updgo").onclick=async()=>{const b=$("#updgo");b.disabled=true;b.innerHTML='<span class="spin"></span> 更新中…';
+    const ok=await doUpdate(srv,x.latest,name,v=>{LS.set("rh_upd","");if(srv==="local"){try{sessionStorage.setItem("rh_after_upd",v+"|settings")}catch(e){}setTimeout(()=>location.reload(),800)}else drawUpd(true)});if(!ok&&$("#updgo")){b.disabled=false;b.textContent="立即更新到 v"+x.latest}};
+  if($("#updrb"))$("#updrb").onclick=async()=>{if(!confirm(`回退到 v${x.prev}？会自动重启中转助手。`))return;
+    try{await api("update_rollback",{});toast("正在回退，重启中…",6000);
+      for(let i=0;i<30;i++){await new Promise(z=>setTimeout(z,2000));try{const p=await api("ping");if(p.version===x.prev){LS.set("rh_upd","");if(srv==="local")location.reload();else drawUpd(true);return}}catch(e){}}}catch(e){toast(e.message)}};
+}
 async function renderSettings(){
   const m=$("#main");m.innerHTML='<div class="card"><span class="spin"></span></div>';
   let s;try{s=(await api("get_settings")).settings}catch(e){return toast(e.message)}
   if(!$("#main"))return;
-  m.innerHTML=`<div class="card"><h2>Telegram 通知</h2>
+  setTimeout(()=>drawUpd(false),0);
+  m.innerHTML=`<div class="card"><h2>版本更新</h2><div id="updbox"><span class="spin"></span> 正在检查…</div></div>
+  <div class="card"><h2>Telegram 通知</h2>
   <p class="hint">用于落地不通告警和恢复通知。获取方法：在 Telegram 里找 <b>@BotFather</b> 发 /newbot 创建机器人，拿到 Token；然后给你的机器人发一条消息，再找 <b>@userinfobot</b> 获取你的 Chat ID（数字）。</p>
   <div class="row"><label>Bot Token<input id="tgt" style="width:360px" placeholder="123456:ABC-DEF…" value="${esc(s.tg_token)}"></label>
   <label>Chat ID<input id="tgc" style="width:180px" placeholder="如 123456789" value="${esc(s.tg_chat)}"></label>
@@ -920,13 +956,16 @@ async function renderServers(){
   let ov;try{ov=(await api("servers_overview",{},{local:true})).servers}catch(e){return H("#main",`<div class="card err">${esc(e.message)}</div>`)}
   if(!$("#main")||state.tab!=="servers")return;
   const L=state.local||{};
+  let latest="";try{latest=(await checkUpdate(false)).latest}catch(e){}
+  const old=ov.filter(s=>s.ok&&latest&&vcmp(s.version,latest)<0);
   const cell=(v,cls)=>v?`<span class="tag ${cls}">${v}</span>`:'<span class="muted">0</span>';
   m.innerHTML=`<div class="card"><h2>所有服务器</h2>
   <table><tr><th>服务器</th><th>地址</th><th>状态</th><th>线路</th><th>7 天内到期</th><th>已过期</th><th>落地不通</th><th></th></tr>
   ${ov.map(s=>`<tr><td><b>${esc(s.name)}</b>${s.id===state.srv?' <span class="tag ok">正在管理</span>':""}</td><td class="mono">${esc(s.public_host||s.url)}</td>
-    <td>${s.ok?`<span class="tag ok">在线</span> <span class="muted" style="font-size:12px">v${esc(s.version||"?")}</span>`:`<span class="tag bad" title="${esc(s.error)}">连不上</span><div class="sib" style="max-width:260px">${esc(s.error)}</div>`}</td>
+    <td>${s.ok?`<span class="tag ok">在线</span> <span class="muted" style="font-size:12px">v${esc(s.version||"?")}</span>${latest&&vcmp(s.version,latest)<0?` <button class="sm pri" data-up="${esc(s.id)}" data-nm="${esc(s.name)}">更新到 v${esc(latest)}</button>`:""}`:`<span class="tag bad" title="${esc(s.error)}">连不上</span><div class="sib" style="max-width:260px">${esc(s.error)}</div>`}</td>
     <td>${s.ok?`${s.lines} <span class="muted">（${s.nodes} 节点）</span>`:"-"}</td><td>${s.ok?cell(s.soon,"warn"):"-"}</td><td>${s.ok?cell(s.expired,"bad"):"-"}</td><td>${s.ok?cell(s.bad,"bad"):"-"}</td>
     <td><div class="acts"><button class="sm" data-go="${esc(s.id)}">管理</button>${s.id!=="local"?`<button class="sm" data-ed="${esc(s.id)}">编辑</button><button class="sm danger" data-rm="${esc(s.id)}">移除</button>`:""}</div></td></tr>`).join("")}</table>
+  ${old.length>1?`<div class="row" style="margin-top:10px"><button class="pri" id="upall">全部更新到 v${esc(latest)}（${old.length} 台）</button><span class="hint">主控最后更新</span></div>`:""}
   <div class="row" style="margin-top:14px"><label style="flex:1">在所有服务器里找客户 / 节点 / 落地 IP<input id="gq" placeholder="如：见山 或 216.36" style="width:100%"></label></div>
   <div id="gres"></div></div>
   <div class="card"><h2 id="sfh">添加服务器</h2>
@@ -947,6 +986,13 @@ async function renderServers(){
     H("#gres",hit.length?`<table style="margin-top:8px"><tr><th>服务器</th><th>节点</th><th>落地</th><th>到期</th><th></th></tr>${hit.map(r=>`<tr><td>${esc(r.sname)}</td><td>${esc(r.tag)}</td><td class="mono">${esc(r.landing)}</td><td>${expTag(r)}</td><td><button class="sm" data-find="${esc(r.srv)}" data-q="${esc(r.tag)}">去管理</button></td></tr>`).join("")}</table>`:'<p class="hint">没有找到</p>');
     document.querySelectorAll("[data-find]").forEach(b=>b.onclick=()=>{switchSrv(b.dataset.find,"manage");state.q=b.dataset.q;setTimeout(()=>{if($("#q")){$("#q").value=b.dataset.q;$("#q").dispatchEvent(new Event("input"))}},400)})};
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>switchSrv(b.dataset.go,"manage"));
+  document.querySelectorAll("[data-up]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';
+    const ok=await doUpdate(b.dataset.up,latest,b.dataset.nm,v=>{if(b.dataset.up==="local"){LS.set("rh_upd","");try{sessionStorage.setItem("rh_after_upd",v+"|servers")}catch(e){}setTimeout(()=>location.reload(),800)}else renderServers()});if(!ok){b.disabled=false;b.textContent="更新到 v"+latest}});
+  if($("#upall"))$("#upall").onclick=async()=>{if(!confirm(`把 ${old.length} 台服务器都更新到 v${latest}？一台一台来，每台重启几秒，客户节点不受影响。`))return;
+    const b=$("#upall");b.disabled=true;const list=[...old.filter(s=>s.id!=="local"),...old.filter(s=>s.id==="local")];
+    for(const s of list){b.innerHTML=`<span class="spin"></span> 正在更新「${esc(s.name)}」…`;
+      try{const r=await api("update_run",{},{srv:s.id});if(r.updated)for(let i=0;i<45;i++){await new Promise(z=>setTimeout(z,2000));try{if((await api("ping",{},{srv:s.id})).version===r.version)break}catch(e){}}}catch(e){toast(`「${s.name}」更新失败：${e.message}`,8000)}}
+    LS.set("rh_upd","");try{sessionStorage.setItem("rh_after_upd",latest+"|servers")}catch(e){}setTimeout(()=>location.reload(),1200)};
   let editing=null;
   document.querySelectorAll("[data-ed]").forEach(b=>b.onclick=()=>{const s=state.servers.find(x=>x.id===b.dataset.ed);editing=s.id;
     $("#sfh").textContent="编辑服务器："+s.name;$("#sname").value=s.name;$("#surl").value=s.url;$("#stok").value="";$("#stok").placeholder="不改密钥就留空";$("#sins").checked=s.insecure;$("#ssv").textContent="保存并测试连接";$("#scn").style.display="";$("#sname").scrollIntoView({behavior:"smooth",block:"center"})});
@@ -1184,10 +1230,13 @@ async function delTags(tags){
 
 async function init(){
   shell();await loadServers();
-  try{const s=await api("status");state.host=s.public_host;$("#hostinfo").textContent=s.public_host;
+  try{const s=await api("status");state.host=s.public_host;state.ver=s.version;$("#hostinfo").textContent=s.public_host;
     if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000);
     if((s.unprotected||[]).length){state.tab="manage";setTimeout(()=>toast(`⚠ ${s.unprotected.length} 个节点有安全风险，见页面顶部提醒`,6000),300)}}catch(e){return}
+  let au="";try{au=sessionStorage.getItem("rh_after_upd")||"";sessionStorage.removeItem("rh_after_upd")}catch(e){}
+  if(au){const[v,t]=au.split("|");state.tab=t||"settings";setTimeout(()=>toast(`已更新到 v${v}`,5000),300)}
   render();
+  checkUpdate(false).then(updDot).catch(()=>{});
 }
 init();
 </script>
