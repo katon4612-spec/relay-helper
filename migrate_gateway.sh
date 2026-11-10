@@ -127,6 +127,10 @@ PY
 
 # ---------------------------------------------------------------- 6 完成
 step "6/6 完成"
+if python3 -c "import json,sys;sys.exit(0 if json.load(open('$RH/config.json')).get('https_mode')=='selfsigned' else 1)" 2>/dev/null; then
+  echo "证书刚才没申请下来，再试一次…"
+  bash "$RH/https.sh" "$RH" force </dev/null && systemctl restart relay-helper
+fi
 PORT=$(python3 -c "import json;print(json.load(open('$RH/config.json'))['port'])")
 MODE=$(python3 -c "import json;print(json.load(open('$RH/config.json')).get('https_mode','http'))")
 SCH=https; [ "$MODE" = "http" ] && SCH=http
