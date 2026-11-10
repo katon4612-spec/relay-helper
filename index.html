@@ -128,6 +128,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--pri)}
 .bar{height:5px;background:#EDE5D9;border-radius:3px;overflow:hidden;margin:4px 0;width:100px}.bar i{display:block;height:100%;border-radius:3px}
 .dupbox{margin-top:6px;font-size:12px;color:#7A4E0F;background:#FAF2E2;border:1px solid #E9D3A6;border-radius:8px;padding:6px 8px}.dupbox select{margin-top:4px;width:100%;font-size:12px;padding:4px 6px}
 .warnbox{background:#FAF2E2;border:1px solid #E5CC97;border-left:4px solid var(--warn);color:#5E4310;border-radius:10px;padding:14px 18px;margin-bottom:16px;line-height:1.75}
+.okbox{background:#F3F7EF;border:1px solid #CFE0C3;border-left:4px solid #5C8A4A;border-radius:10px;padding:12px 16px;margin:10px 0 0;line-height:1.75}
 .kv{display:grid;grid-template-columns:70px 1fr auto;gap:6px 8px;align-items:center;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0}
 .kv b{font-weight:500;color:var(--muted);font-size:12px}.kv span{font-family:var(--mono);font-size:12px;word-break:break-all}
 .muted{color:var(--muted)}
@@ -588,7 +589,37 @@ function renderBackup(){
   <li>新服务器装好 s-ui，再执行中转助手的安装命令。</li>
   <li>打开新服务器的中转助手，点「恢复备份」，选刚才下载的文件。</li>
   <li>到云服务商安全组放行节点端口（和旧服务器一样）。</li></ol>
-  <p class="hint">恢复后 s-ui 的面板端口、路径、登录账号会变成旧服务器的。恢复前的状态会自动存一份在服务器 <span class="mono">/opt/relay-helper/before-restore.tar.gz</span>，恢复错了可以用它再恢复回去。</p></div>`;
+  <p class="hint">恢复后 s-ui 的面板端口、路径、登录账号会变成旧服务器的。恢复前的状态会自动存一份在服务器 <span class="mono">/opt/relay-helper/before-restore.tar.gz</span>，恢复错了可以用它再恢复回去。</p></div>
+  <div class="card"><h2>从旧网关迁移</h2>
+  <p class="hint">把以前的「限时代理网关」（Docker + PostgreSQL 那套）的客户搬过来：<b>原端口、原账号密码 / UUID、原 Reality 密钥</b>，客户手里的 SOCKS5 / VLESS / Hysteria2 链接不用换。先在旧网关上运行导出命令得到 <span class="mono">/root/gateway-export.json</span>，停掉旧网关后在这里导入。</p>
+  <div class="row"><label style="flex:1">服务器上的导出文件<input id="gwpath" value="/root/gateway-export.json"></label>
+   <label>或从电脑选文件<input type="file" id="gwfile" accept=".json"></label></div>
+  <div class="row" style="margin-top:10px"><button id="gwchk">检查</button></div>
+  <div id="gwbox"></div></div>`;
+  let gwBundle=null;
+  $("#gwfile").onchange=async()=>{const f=$("#gwfile").files[0];gwBundle=null;if(!f)return;try{gwBundle=JSON.parse(await f.text())}catch(e){toast("文件不是 JSON")}};
+  const gwSrc=()=>gwBundle?{bundle:gwBundle}:{path:$("#gwpath").value.trim()};
+  const gwPoll=async()=>{let x;try{x=await api("gateway_status")}catch(e){return setTimeout(gwPoll,3000)}
+    if(!$("#gwbox"))return;
+    if(x.running){H("#gwbox",`<p><span class="spin"></span> 正在导入 ${x.done}/${x.total}…（导完会重启一次 s-ui）</p>`);return setTimeout(gwPoll,2000)}
+    H("#gwbox",x.error?`<p class="err">导入出错：${esc(x.error)}</p>`:`<div class="${x.failed.length?"warnbox":"okbox"}"><b>导入完成：成功 ${x.imported} 个${x.failed.length?`，失败 ${x.failed.length} 个`:""}</b>${coreMsg(x.core)}
+      ${x.failed.length?`<div class="hint" style="margin-top:6px">${x.failed.map(f=>`${esc(f.username)}（${esc(f.protocol)} ${f.port}）：${esc(f.error||"")}`).join("<br>")}</div>`:""}
+      <div class="hint" style="margin-top:6px">落地已加入落地库并在后台检测。到「线路管理」看看，再拿一个客户的旧链接实际连一下确认。导出文件里有密码，确认没问题后在服务器上删除：<span class="mono">rm /root/gateway-export.json</span></div></div>`)};
+  $("#gwchk").onclick=async()=>{const b=$("#gwchk");b.disabled=true;H("#gwbox",'<p><span class="spin"></span> 检查中…</p>');
+    let x;try{x=await api("gateway_check",gwSrc())}catch(e){b.disabled=false;return H("#gwbox",`<p class="err">${esc(e.message)}</p>`)}
+    b.disabled=false;if(x.running)return gwPoll();
+    const hostWarn=x.public_host&&x.my_host&&x.public_host!==x.my_host;
+    H("#gwbox",`<div class="okbox" style="margin-top:10px">
+      <p>要导入 <b>${x.total}</b> 个正在使用的客户（${Object.entries(x.by).map(([k,v])=>`${esc(protoName[k]||k)} ${v}`).join("，")}），${x.landings} 个落地；已停用 / 已到期的 ${x.skipped} 个不导入。</p>
+      ${x.n_conflicts?`<p class="err">⚠ ${x.n_conflicts} 个端口现在被占用（多半是旧网关还在运行）：${x.conflicts.slice(0,8).map(c=>`${esc(c.username)} ${c.port}`).join("、")}${x.n_conflicts>8?"…":""}<br>先在旧服务器上停掉旧网关：<span class="mono">cd /opt/socks-gateway && docker compose down</span>，再点「检查」。</p>`:'<p class="ok">✓ 端口都空着</p>'}
+      ${hostWarn?`<p class="err">⚠ 旧客户链接里的域名是 <b>${esc(x.public_host)}</b>，这台中转助手的域名是 <b>${esc(x.my_host)}</b>。客户的旧链接照样能连（只要这个域名解析到本机），但中转助手新生成的链接会用 ${esc(x.my_host)}。想保持一致可以在「设置」里把链接域名改成 ${esc(x.public_host)}。</p>`:""}
+      ${x.renamed?`<p class="hint">有 ${x.renamed} 个客户名和这台已有的节点重名，会自动加后缀（不影响客户链接）。</p>`:""}
+      ${x.need_cert&&!x.have_cert?'<p class="hint">这台 s-ui 还没有证书配置，会自动给 Hysteria2 生成一个（旧链接带 insecure=1，不影响）。</p>':""}
+      ${x.has_reality?'<p class="hint">VLESS 会沿用旧网关的 Reality 密钥。</p>':""}
+      <div class="row" style="margin-top:8px"><button class="pri" id="gwgo" ${x.total?"":"disabled"}>开始导入 ${x.total} 个客户</button></div></div>`);
+    if($("#gwgo"))$("#gwgo").onclick=async()=>{if(x.n_conflicts&&!confirm(`还有 ${x.n_conflicts} 个端口被占用，这些客户会导入失败。仍然继续？`))return;
+      if(!confirm(`开始导入 ${x.total} 个客户？导完会重启 s-ui，现有线路断几秒。`))return;
+      try{await api("gateway_import",gwSrc());gwPoll()}catch(e){toast(e.message,8000)}}};
   $("#bdl").onclick=()=>{location.href=`${BASE}api/backup_download?full=${$("#bfull").checked?1:0}&srv=${encodeURIComponent(state.srv)}&t=${Date.now()}`;toast("正在生成备份…",3000)};
   $("#brs").onclick=()=>{$("#bfile").value="";$("#bfile").click()};
   $("#bfile").onchange=async()=>{

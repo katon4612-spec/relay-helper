@@ -102,6 +102,16 @@ s-ui 在用户停用或过期后会清空入站用户，SOCKS5 入站此时会�
 | `geo_lookup` | 是否自动查落地国家 |
 | `auto_firewall` | 是否自动在 ufw/firewalld 放行新端口 |
 
+## 从旧的限时代理网关迁移
+
+以前的「限时代理网关」（Docker + PostgreSQL + sing-box，部署在 /opt/socks-gateway）可以把正在使用的客户原样搬过来，客户链接不用换：
+
+1. 旧服务器上导出（网关要还在运行）：`curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/main/gateway_export.py -o /root/gateway_export.py && python3 /root/gateway_export.py`
+2. 停掉旧网关：`cd /opt/socks-gateway && docker compose down`（数据卷保留，需要时 `docker compose up -d` 就能回去）
+3. 装 s-ui 和中转助手（域名填旧网关的代理域名）
+4. 中转助手「备份」页 →「从旧网关迁移」→ 检查 → 开始导入
+5. 确认没问题后删除导出文件：`rm /root/gateway-export.json`
+
 ## 在线更新
 
 「设置」页顶部的「版本更新」：检查 GitHub 上的最新版本，有新版本时点「立即更新」，自动下载、替换程序文件（线路、落地库、订阅、配置都不动）并重启中转助手，不用登服务器。主控的「服务器」页可以给每台服务器单独更新或「全部更新」。有问题可以「回退到上一版本」。重启后不用重新登录。

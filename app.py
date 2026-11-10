@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -4304,6 +4304,248 @@ def op_update_rollback(body):
 
 
 OPS.update({"update_check": op_update_check, "update_run": op_update_run, "update_rollback": op_update_rollback})
+
+
+# ------------------------------------------------------------ 从旧网关迁移 --
+# 旧的「限时代理网关」(socks-gateway) 用 gateway_export.py 导出，这里按原端口、原账号密码 / UUID、原 Reality 密钥
+# 在 s-ui 里重建：客户手里的链接不用换。
+GW = {"running": False, "done": 0, "total": 0, "results": [], "error": "", "finished": 0, "core": ""}
+
+
+def x25519_pub(priv):
+    """Reality 私钥算公钥（纯 Python，不依赖额外的库）。"""
+    k = bytearray(base64.urlsafe_b64decode(priv + "=" * (-len(priv) % 4)))
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    n = int.from_bytes(k, "little")
+    p, a24 = 2 ** 255 - 19, 121665
+    x1, x2, z2, x3, z3, swap = 9, 1, 0, 9, 1, 0
+    for t in reversed(range(255)):
+        kt = (n >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = kt
+        A = (x2 + z2) % p
+        AA = A * A % p
+        B = (x2 - z2) % p
+        BB = B * B % p
+        E = (AA - BB) % p
+        C = (x3 + z3) % p
+        D = (x3 - z3) % p
+        DA = D * A % p
+        CB = C * B % p
+        x3 = (DA + CB) ** 2 % p
+        z3 = x1 * (DA - CB) ** 2 % p
+        x2 = AA * BB % p
+        z2 = E * (AA + a24 * E) % p
+    if swap:
+        x2, x3, z2, z3 = x3, x2, z3, z2
+    return base64.urlsafe_b64encode((x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")).rstrip(b"=").decode()
+
+
+def _gw_bundle(body):
+    b = body.get("bundle")
+    if not b and body.get("path"):
+        path = body["path"].strip()
+        if not path.endswith(".json"):
+            raise SuiError("文件要是 gateway_export.py 导出的 .json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                b = json.load(f)
+        except FileNotFoundError:
+            raise SuiError("服务器上没有这个文件：%s（先在旧网关上运行导出命令）" % path)
+        except ValueError:
+            raise SuiError("文件内容不对，不是导出文件")
+    if not isinstance(b, dict) or b.get("type") != "socks-gateway-export":
+        raise SuiError("这不是旧网关的导出文件（gateway_export.py 生成的 gateway-export.json）")
+    cs = []
+    for c in b.get("customers") or []:
+        if c.get("protocol") in ("socks", "vless", "hysteria2") and c.get("secret") and c.get("port") and c.get("username"):
+            cs.append(c)
+    return b, cs
+
+
+def _gw_line_names(data):
+    return {i.get("tag") for i in data.get("inbounds") or []} | {o.get("tag") for o in data.get("outbounds") or []} | {c.get("name") for c in data.get("clients") or []}
+
+
+def op_gateway_check(body):
+    b, cs = _gw_bundle(body)
+    data = SUI.load_all()
+    used = used_ports(data)
+    names = _gw_line_names(data)
+    conflicts, renamed = [], 0
+    for c in cs:
+        p = int(c["port"])
+        if p in used or not port_free(p, c["protocol"] == "hysteria2"):
+            conflicts.append({"username": c["username"], "protocol": c["protocol"], "port": p})
+        if c["username"] in names:
+            renamed += 1
+    by = {}
+    for c in cs:
+        by[c["protocol"]] = by.get(c["protocol"], 0) + 1
+    need_cert = any(c["protocol"] == "hysteria2" for c in cs)
+    return {"total": len(cs), "by": by, "skipped": len(b.get("skipped") or []), "conflicts": conflicts[:50],
+            "n_conflicts": len(conflicts), "renamed": renamed, "public_host": b.get("public_host") or "",
+            "my_host": CFG.get("public_host") or "", "has_reality": bool((b.get("reality") or {}).get("private_key")),
+            "need_cert": need_cert, "have_cert": bool(find_tls(data, "cert")),
+            "landings": len({(c["upstream"]["host"], c["upstream"]["port"], c["upstream"].get("username")) for c in cs}),
+            "running": GW["running"]}
+
+
+def _gw_reality_tls(data, r):
+    """用旧网关的 Reality 密钥建（或找到已有的）s-ui TLS 配置，返回 id。"""
+    pk = r.get("private_key")
+    for t in data.get("tls") or []:
+        srv = t.get("server") or {}
+        if isinstance(srv, str):
+            try:
+                srv = json.loads(srv)
+            except ValueError:
+                srv = {}
+        if (srv.get("reality") or {}).get("private_key") == pk:
+            return t["id"]
+    sid = r.get("short_id") or ""
+    tls = {"name": "旧网关-reality",
+           "server": {"enabled": True, "server_name": r.get("server_name") or "www.apple.com",
+                      "reality": {"enabled": True, "handshake": {"server": r.get("handshake") or r.get("server_name") or "www.apple.com", "server_port": 443},
+                                  "private_key": pk, "short_id": [sid] if sid else [""]}},
+           "client": {"reality": {"public_key": x25519_pub(pk)}, "utls": {"enabled": True, "fingerprint": "chrome"}}}
+    res = SUI.save("tls", "new", tls)
+    tid = next((t["id"] for t in (res or {}).get("tls") or [] if t.get("name") == "旧网关-reality"), None)
+    if not tid:
+        tid = next((t["id"] for t in SUI.load_all().get("tls") or [] if t.get("name") == "旧网关-reality"), None)
+    if not tid:
+        raise SuiError("创建 Reality 配置失败")
+    return tid
+
+
+def _gw_cert_tls(data, host):
+    tid = find_tls(data, "cert")
+    if tid:
+        return tid
+    td = tempfile.mkdtemp(prefix="rh-gw-")
+    try:
+        k, c = os.path.join(td, "k.pem"), os.path.join(td, "c.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", "/CN=" + (host or "localhost"),
+                        "-keyout", k, "-out", c], capture_output=True, timeout=60, check=True)
+        key = open(k).read().strip().splitlines()
+        cert = open(c).read().strip().splitlines()
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    tls = {"name": "旧网关-hy2证书", "server": {"enabled": True, "certificate": cert, "key": key}, "client": {"insecure": True}}
+    res = SUI.save("tls", "new", tls)
+    tid = next((t["id"] for t in (res or {}).get("tls") or [] if t.get("name") == "旧网关-hy2证书"), None)
+    if not tid:
+        tid = next((t["id"] for t in SUI.load_all().get("tls") or [] if t.get("name") == "旧网关-hy2证书"), None)
+    if not tid:
+        raise SuiError("创建 Hysteria2 证书配置失败")
+    return tid
+
+
+def _gw_run(b, cs):
+    try:
+        GW.update(running=True, done=0, total=len(cs), results=[], error="", finished=0, core="")
+        with LOCK:
+            data = SUI.load_all()
+            reality_id = _gw_reality_tls(data, b.get("reality") or {}) if any(c["protocol"] == "vless" for c in cs) else 0
+            cert_id = _gw_cert_tls(data, b.get("public_host") or CFG.get("public_host")) if any(c["protocol"] == "hysteria2" for c in cs) else 0
+            data = SUI.load_all()
+            names = _gw_line_names(data)
+            used = used_ports(data)
+            results, new_obs, to_pool = [], [], []
+            for c in cs:
+                proto, port, up = c["protocol"], int(c["port"]), c["upstream"]
+                r = {"username": c["username"], "protocol": proto, "port": port, "ok": False}
+                try:
+                    if port in used or not port_free(port, proto == "hysteria2"):
+                        raise SuiError("端口 %d 被占用（旧网关还没停？）" % port)
+                    base = unique_name(c["username"], names) if c["username"] in names else c["username"]
+                    names.add(base)
+                    ob = {"type": "socks", "tag": base, "server": up["host"], "server_port": int(up["port"]), "version": "5"}
+                    if up.get("username"):
+                        ob["username"] = up["username"]
+                        ob["password"] = up.get("password") or ""
+                    SUI.save("outbounds", "new", ob)
+                    made_inb = False
+                    try:
+                        inb = {"type": proto, "tag": base, "listen": "::", "listen_port": port, "addrs": [], "out_json": {},
+                               "tls_id": reality_id if proto == "vless" else (cert_id if proto == "hysteria2" else 0)}
+                        if proto == "hysteria2":
+                            inb["ignore_client_bandwidth"] = True
+                        if proto == "vless":
+                            inb["transport"] = {}
+                        res = SUI.save("inbounds", "new", inb, init_users="")
+                        iid = next((i["id"] for i in (res or {}).get("inbounds") or [] if i.get("tag") == base), None)
+                        if not iid:
+                            raise SuiError("入站创建后未找到 id")
+                        made_inb = True
+                        cfg = client_config(base)
+                        auth = base
+                        if proto == "socks":
+                            su = c.get("socks_user") or c["username"]
+                            for kk in ("socks", "mixed", "http"):
+                                cfg[kk] = {"username": su, "password": c["secret"]}
+                            auth = su
+                        elif proto == "vless":
+                            cfg["vless"] = {"name": base, "uuid": c["secret"], "flow": "xtls-rprx-vision"}
+                        else:
+                            cfg["hysteria2"] = {"name": base, "password": c["secret"]}
+                        client = {"enable": True, "name": base, "config": cfg, "inbounds": [iid], "links": [], "volume": 0,
+                                  "expiry": int(c.get("expires") or 0), "up": 0, "down": 0, "desc": "从旧网关迁移",
+                                  "group": c["username"]}
+                        res = SUI.save("clients", "new", client)
+                        cid = next((x["id"] for x in (res or {}).get("clients") or [] if x.get("name") == base), None)
+                        used.add(port)
+                        open_firewall(port, proto == "hysteria2")
+                        r.update(ok=True, name=base, client_id=cid, outbound=base,
+                                 rules=[{"inbound": [base], "auth_user": [auth], "action": "route", "outbound": base},
+                                        {"inbound": [base], "action": "reject"}])
+                        new_obs.append(base)
+                        raw = "%s:%s" % (up["host"], up["port"]) + ((":%s:%s" % (up["username"], up.get("password") or "")) if up.get("username") else "")
+                        to_pool.append({"raw": raw, "ob": {k: v for k, v in ob.items() if k != "tag"}, "host": up["host"], "note": up.get("name") or ""})
+                    except Exception:
+                        _rollback({"name": base if made_inb else None}, base)
+                        raise
+                except Exception as e:
+                    r["error"] = str(e)
+                results.append(r)
+                GW["done"] += 1
+            GW["results"] = results
+            GW["core"] = _apply_rules(results, new_obs)
+        try:
+            if to_pool:
+                _pool_add(to_pool)
+                threading.Thread(target=pool_bg_check, daemon=True).start()
+        except Exception as e:
+            sys.stderr.write("gw pool: %s\n" % e)
+        GW["results"] = [{k: v for k, v in r.items() if k != "rules"} for r in results]
+    except Exception as e:
+        GW["error"] = str(e)
+    finally:
+        GW.update(running=False, finished=int(time.time()))
+
+
+def op_gateway_import(body):
+    if GW["running"]:
+        raise SuiError("正在导入，稍等")
+    b, cs = _gw_bundle(body)
+    if not cs:
+        raise SuiError("导出文件里没有可导入的客户")
+    threading.Thread(target=_gw_run, args=(b, cs), daemon=True).start()
+    return {"total": len(cs)}
+
+
+def op_gateway_status(body):
+    ok = [r for r in GW["results"] if r.get("ok")]
+    return {"running": GW["running"], "done": GW["done"], "total": GW["total"], "finished": GW["finished"],
+            "error": GW["error"], "core": GW["core"], "imported": len(ok),
+            "failed": [r for r in GW["results"] if not r.get("ok")][:100]}
+
+
+OPS.update({"gateway_check": op_gateway_check, "gateway_import": op_gateway_import, "gateway_status": op_gateway_status})
 
 
 class Handler(BaseHTTPRequestHandler):
