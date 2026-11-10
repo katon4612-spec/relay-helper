@@ -73,6 +73,10 @@ def main():
             return bool(_re.fullmatch(r"([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}", h))
     default_host = next((h for h in (old.get("public_host"), web_domain, st.get("subDomain")) if valid_host(h)), "")
     public_host = ""
+    env_host = (os.environ.get("RH_PUBLIC_HOST") or "").strip()
+    if env_host and valid_host(env_host):
+        public_host = env_host   # 一键迁移脚本传进来的，不再问
+        print("中转机域名/IP：%s" % public_host)
     while not public_host:
         public_host = ask("中转机域名/IP", default_host)
         if public_host and not valid_host(public_host):

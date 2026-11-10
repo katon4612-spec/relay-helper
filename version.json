@@ -1,6 +1,10 @@
 {
- "version": "1.19.0",
+ "version": "1.19.1",
  "changes": [
+  {
+   "version": "1.19.1",
+   "notes": "旧网关一键迁移脚本 migrate_gateway.sh：导出、停旧网关、装 s-ui 和中转助手、导入客户一条命令完成"
+  },
   {
    "version": "1.19.0",
    "notes": "「备份」页新增「从旧网关迁移」：把以前 Docker 版限时代理网关的客户按原端口、原密码、原 Reality 密钥搬过来，客户链接不用换"

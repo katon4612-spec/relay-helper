@@ -106,6 +106,10 @@ s-ui 在用户停用或过期后会清空入站用户，SOCKS5 入站此时会�
 
 以前的「限时代理网关」（Docker + PostgreSQL + sing-box，部署在 /opt/socks-gateway）可以把正在使用的客户原样搬过来，客户链接不用换：
 
+**一条命令全自动**（在旧网关服务器上用 root 运行）：`bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/main/migrate_gateway.sh)`
+
+也可以按下面的步骤手动来：
+
 1. 旧服务器上导出（网关要还在运行）：`curl -fsSL https://raw.githubusercontent.com/katon4612-spec/relay-helper/main/gateway_export.py -o /root/gateway_export.py && python3 /root/gateway_export.py`
 2. 停掉旧网关：`cd /opt/socks-gateway && docker compose down`（数据卷保留，需要时 `docker compose up -d` 就能回去）
 3. 装 s-ui 和中转助手（域名填旧网关的代理域名）
