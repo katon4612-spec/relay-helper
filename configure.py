@@ -43,9 +43,20 @@ def main():
     db = next((d for d in DB_CANDIDATES if d and os.path.exists(d)), None)
     st, users = {}, []
     if db:
-        c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
-        st = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in c.execute("select key, value from settings")}
-        users = list(c.execute("select username, password from users order by id"))
+        import time as _t
+        for _i in range(12):   # s-ui 正在写数据库时会锁一下，等一等再读
+            try:
+                c = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+                st = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in c.execute("select key, value from settings")}
+                users = list(c.execute("select username, password from users order by id"))
+                c.close()
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) or _i == 11:
+                    print("✗ 读取 s-ui 数据库失败：%s\n  先运行 systemctl restart s-ui，再重新运行安装命令" % e)
+                    sys.exit(1)
+                print("s-ui 数据库正忙，等一下再读（%d/12）…" % (_i + 1))
+                _t.sleep(5)
         print("已读取 s-ui 配置：", db)
     else:
         print("没找到 s-ui 数据库（/usr/local/s-ui/db/s-ui.db），下面需要手动填写。")
