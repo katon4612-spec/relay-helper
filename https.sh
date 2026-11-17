@@ -35,6 +35,27 @@ is_ip() { python3 -c "import ipaddress,sys;ipaddress.ip_address(sys.argv[1].stri
 
 issue_le() {
   is_ip "$HOST" && { echo "地址是 IP，Let's Encrypt 不签发，改用自签名证书"; return 1; }
+  # 域名托管在 Cloudflare 时可以走 DNS 验证（不需要 80 端口，适合 IX / 端口映射的机器）：
+  #   CF_Token=你的CloudflareAPI令牌 bash https.sh /opt/relay-helper force
+  if [ -n "${CF_Token:-}" ]; then
+    if [ ! -x "$ACME" ]; then
+      echo "安装 acme.sh ..."
+      curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1 || wget -qO- https://get.acme.sh | sh >/dev/null 2>&1
+    fi
+    [ -x "$ACME" ] || { echo "acme.sh 安装失败"; return 1; }
+    echo "通过 Cloudflare DNS 验证申请 $HOST 的证书（不需要 80 端口）..."
+    CF_Token="$CF_Token" "$ACME" --issue -d "$HOST" --dns dns_cf --server letsencrypt --keylength ec-256 >/tmp/relay-helper-acme.log 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && [ $rc -ne 2 ]; then
+      echo "申请失败（详细日志 /tmp/relay-helper-acme.log，检查 Cloudflare 令牌是否有该域名的 DNS 编辑权限），改用自签名证书"; return 1
+    fi
+    "$ACME" --install-cert -d "$HOST" --ecc --key-file "$CERT_DIR/key.pem" --fullchain-file "$CERT_DIR/cert.pem" \
+      --reloadcmd "systemctl restart relay-helper" >/dev/null 2>&1 || return 1
+    [ -s "$CERT_DIR/cert.pem" ] && [ -s "$CERT_DIR/key.pem" ] || return 1
+    cfg_set "cert_file=$CERT_DIR/cert.pem" "key_file=$CERT_DIR/key.pem" https_mode=letsencrypt https_declined=false
+    echo "✓ 已申请 Let's Encrypt 证书（DNS 验证），到期前会自动续签"
+    return 0
+  fi
   if command -v ss >/dev/null 2>&1 && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)80$'; then
     echo "80 端口已被占用，无法自动申请证书，改用自签名证书"; return 1
   fi
