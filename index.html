@@ -543,7 +543,10 @@ async function renderSettings(){
   let s;try{s=(await api("get_settings")).settings}catch(e){return toast(e.message)}
   if(!$("#main"))return;
   setTimeout(()=>drawUpd(false),0);
+  if($("#pathsave"))$("#pathsave").onclick=async()=>{try{const x=await api("set_path",{path:$("#pathin").value});if(!x.changed)return toast("路径没变");toast("已改成 "+x.path+"，正在跳转…");setTimeout(()=>location.href=x.path,800)}catch(e){toast(e.message)}};
   m.innerHTML=`<div class="card"><h2>版本更新</h2><div id="updbox"><span class="spin"></span> 正在检查…</div></div>
+  ${(state.srv||"local")==="local"?`<div class="card"><h2>访问路径</h2><div class="row"><label style="flex:1">中转助手的访问路径（地址最后那段，例如 kaide）<input id="pathin" value="${esc(BASE.replace(/^\/|\/$/g,""))}"></label><button id="pathsave">保存</button></div>
+   <p class="hint">改完后旧地址照样能打开（会自动对应到新路径），客户的订阅链接也不受影响。多台服务器想一起改，用「服务器」页的「统一用 /kaide/ 路径」。</p></div>`:""}
   <div class="card"><h2>Telegram 通知</h2>
   <p class="hint">用于落地不通告警和恢复通知。获取方法：在 Telegram 里找 <b>@BotFather</b> 发 /newbot 创建机器人，拿到 Token；然后给你的机器人发一条消息，再找 <b>@userinfobot</b> 获取你的 Chat ID（数字）。</p>
   <div class="row"><label>Bot Token<input id="tgt" style="width:360px" placeholder="123456:ABC-DEF…" value="${esc(s.tg_token)}"></label>
@@ -996,6 +999,7 @@ async function renderServers(){
     <td>${s.ok?`<span class="tag ok">在线</span> <span class="muted" style="font-size:12px">v${esc(s.version||"?")}</span>${latest&&vcmp(s.version,latest)<0?` <button class="sm pri" data-up="${esc(s.id)}" data-nm="${esc(s.name)}">更新到 v${esc(latest)}</button>`:""}`:`<span class="tag bad" title="${esc(s.error)}">连不上</span><div class="sib" style="max-width:260px">${esc(s.error)}</div>`}</td>
     <td>${s.ok?`${s.lines} <span class="muted">（${s.nodes} 节点）</span>`:"-"}</td><td>${s.ok?cell(s.soon,"warn"):"-"}</td><td>${s.ok?cell(s.expired,"bad"):"-"}</td><td>${s.ok?cell(s.bad,"bad"):"-"}</td>
     <td><div class="acts"><button class="sm" data-go="${esc(s.id)}">管理</button>${s.id!=="local"?`<button class="sm" data-ed="${esc(s.id)}">编辑</button><button class="sm danger" data-rm="${esc(s.id)}">移除</button>`:""}</div></td></tr>`).join("")}</table>
+  ${ov.length?`<div class="row" style="margin-top:10px"><button class="sm" id="unipath">所有服务器统一用 /kaide/ 路径</button><span class="hint">改完旧地址照样能打开，客户订阅不受影响</span></div>`:""}
   ${old.length>1?`<div class="row" style="margin-top:10px"><button class="pri" id="upall">全部更新到 v${esc(latest)}（${old.length} 台）</button><span class="hint">主控最后更新</span></div>`:""}
   <div class="row" style="margin-top:14px"><label style="flex:1">在所有服务器里找客户 / 节点 / 落地 IP<input id="gq" placeholder="如：见山 或 216.36" style="width:100%"></label></div>
   <div id="gres"></div></div>
@@ -1019,6 +1023,13 @@ async function renderServers(){
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>switchSrv(b.dataset.go,"manage"));
   document.querySelectorAll("[data-up]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';
     const ok=await doUpdate(b.dataset.up,latest,b.dataset.nm,v=>{if(b.dataset.up==="local"){LS.set("rh_upd","");try{sessionStorage.setItem("rh_after_upd",v+"|servers")}catch(e){}setTimeout(()=>location.reload(),800)}else renderServers()});if(!ok){b.disabled=false;b.textContent="更新到 v"+latest}});
+  if($("#unipath"))$("#unipath").onclick=async()=>{if(!confirm("把本机和所有已添加的服务器的中转助手访问路径都改成 /kaide/？\n\n旧地址会继续可用（自动跳到新路径），客户订阅链接不受影响。"))return;
+    const b=$("#unipath");b.disabled=true;b.innerHTML='<span class="spin"></span> 修改中…';
+    try{const x=await api("servers_unify_path",{path:"kaide"},{local:true});
+      const bad=x.results.filter(r=>!r.ok);
+      alert(x.results.map(r=>`${r.ok?"✓":"✗"} ${r.name}${r.ok?(r.changed?"：已改成 /kaide/":"：本来就是 /kaide/"):"："+r.error}`).join("\n")+(bad.length?"\n\n失败的那几台先在本页更新到最新版，再点一次。":""));
+      if(BASE!==x.path)location.href=x.path;else renderServers()}
+    catch(e){toast(e.message,8000);b.disabled=false;b.textContent="所有服务器统一用 /kaide/ 路径"}};
   if($("#upall"))$("#upall").onclick=async()=>{if(!confirm(`把 ${old.length} 台服务器都更新到 v${latest}？一台一台来，每台重启几秒，客户节点不受影响。`))return;
     const b=$("#upall");b.disabled=true;const list=[...old.filter(s=>s.id!=="local"),...old.filter(s=>s.id==="local")];
     for(const s of list){b.innerHTML=`<span class="spin"></span> 正在更新「${esc(s.name)}」…`;

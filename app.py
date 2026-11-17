@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.19.2"
+VERSION = "1.19.3"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2777,6 +2777,53 @@ def op_servers_list(body):
     return {"servers": lst, "local": {"public_host": CFG.get("public_host"), "url": base_url(), "token": CFG.get("api_token", "")}}
 
 
+def _valid_path(v):
+    v = "/" + (v or "").strip().strip("/") + "/"
+    if not re.fullmatch(r"/[A-Za-z0-9_\-]{1,32}/", v):
+        raise SuiError("访问路径只能用字母、数字、- 和 _（例如 kaide）")
+    return v
+
+
+def op_set_path(body):
+    """改中转助手的访问路径；旧路径记成别名，照样能打开。"""
+    new = _valid_path(body.get("path"))
+    old = CFG["path"]
+    if new == old:
+        return {"path": new, "changed": False}
+    aliases = [a for a in (CFG.get("path_aliases") or []) if a != new]
+    if old not in aliases:
+        aliases.append(old)
+    save_config({"path": new, "path_aliases": aliases[-10:]})
+    return {"path": new, "changed": True, "url": base_url()}
+
+
+def op_servers_unify_path(body):
+    """主控：所有服务器（含本机）统一改成同一个访问路径，并更新主控里保存的地址。"""
+    new = _valid_path(body.get("path") or "kaide")
+    out = []
+    with SRV_LOCK:
+        svs = [dict(x) for x in SERVERS]
+    for sv in svs:
+        r = proxy_json(sv["id"], "set_path", {"path": new}, timeout=30)
+        if r.get("ok"):
+            parts = urllib.parse.urlsplit(sv["url"])
+            url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, new, "", ""))
+            with SRV_LOCK:
+                for x in SERVERS:
+                    if x.get("id") == sv["id"]:
+                        x["url"] = url
+                save_servers()
+            out.append({"name": sv.get("name"), "ok": True, "changed": r.get("changed")})
+        else:
+            err = r.get("error") or ""
+            if "unknown action" in err:
+                err = "那台版本太旧，先在本页把它更新到最新版"
+            out.append({"name": sv.get("name"), "ok": False, "error": err})
+    r = op_set_path({"path": new})
+    out.insert(0, {"name": server_label() + "（本机）", "ok": True, "changed": r["changed"]})
+    return {"results": out, "path": new, "url": base_url()}
+
+
 def op_server_save(body):
     url = _norm_url(body.get("url"))
     sid = body.get("id") or secrets.token_hex(4)
@@ -4303,6 +4350,8 @@ def op_update_rollback(body):
     return {"version": pv}
 
 
+OPS.update({"set_path": op_set_path, "servers_unify_path": op_servers_unify_path})
+LOCAL_ONLY.add("servers_unify_path")
 OPS.update({"update_check": op_update_check, "update_run": op_update_run, "update_rollback": op_update_rollback})
 
 
@@ -4615,7 +4664,16 @@ class Handler(BaseHTTPRequestHandler):
             self.request.settimeout(None)
         super().setup()
 
+    def _alias(self):
+        """改过访问路径后，旧路径照样能用（书签、主控里填的旧地址、订阅链接都不会失效）。"""
+        p = CFG["path"]
+        for a in CFG.get("path_aliases") or []:
+            if a and a != p and self.path.startswith(a):
+                self.path = p + self.path[len(a):]
+                break
+
     def do_GET(self):
+        self._alias()
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
         if path.startswith(p + "sub/"):  # 客户订阅，不需要登录，靠链接里的随机令牌
@@ -4734,6 +4792,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        self._alias()
         p = CFG["path"]
         path = self.path.split("?", 1)[0]
         if not path.startswith(p + "api/"):
@@ -4768,12 +4827,12 @@ class Handler(BaseHTTPRequestHandler):
             save_sessions()
             secure = "; Secure" if CFG.get("cert_file") else ""
             return self._send(200, {"ok": True}, headers={
-                "Set-Cookie": "rh_sess=%s; Path=%s; Max-Age=%d; HttpOnly; SameSite=Strict%s" % (sid, p, SESSION_AGE, secure)})
+                "Set-Cookie": "rh_sess=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict%s" % (sid, SESSION_AGE, secure)})
         if action == "logout":
             m = re.search(r"rh_sess=([A-Za-z0-9_\-]+)", self.headers.get("Cookie") or "")
             if m and SESSIONS.pop(m.group(1), None):
                 save_sessions()
-            return self._send(200, {"ok": True}, headers={"Set-Cookie": "rh_sess=; Path=%s; Max-Age=0" % p})
+            return self._send(200, {"ok": True}, headers={"Set-Cookie": "rh_sess=; Path=/; Max-Age=0"})
         if not self._authed():
             return self._send(401, {"ok": False, "error": "请先登录", "login": True})
         sid = self._remote_sid()
