@@ -1041,11 +1041,13 @@ async function renderServers(){
 }
 
 /* ---------------- 订阅 ---------------- */
-async function subDlg(tag,reset){
-  const row=byTag(tag);if(row&&row.outbound_tag&&(state.twin||{})[row.outbound_tag]&&!reset)return twinSubDlg(tag,row);
+async function subDlg(tag,reset,twinLocal){
+  const row=byTag(tag);if(row&&row.outbound_tag&&(state.twin||{})[row.outbound_tag]&&!reset&&!twinLocal)return twinSubDlg(tag,row);
+  const tw=twinLocal&&row&&(state.twin||{})[row.outbound_tag];
   let x;try{x=await api("sub_get",{tag,reset:!!reset})}catch(e){return toast(e.message)}
   modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2>
   ${certWarn(x.cert,x.host)}
+  ${tw?`<div class="warnbox" style="margin:8px 0"><b>这是双中转线路</b>（另一台：${esc((tw.peers||[]).join("、"))}）。这里显示的是<b>本机的订阅地址</b>：内容和主控${tw.main?"「"+esc(tw.main)+"」":""}那边的订阅一样，也包含所有中转的节点。主控那台被墙 / 宕机、它的订阅更新不了时，把这个地址发给客户替换就行。</div>`:""}
   <p class="hint">包含这条线路的全部 ${x.nodes} 个协议节点（已停用、已过期的不会出现在订阅里）。客户导入一次，以后你换端口、换落地、加协议，客户在软件里<b>更新订阅</b>就行，不用重新发链接。</p>
   <div style="display:flex;gap:16px;align-items:center;margin:12px 0">
     <div style="width:132px;height:132px;flex:none">${x.svg.replace("<svg",'<svg style="width:132px;height:132px;display:block"')}</div>
@@ -1055,9 +1057,9 @@ async function subDlg(tag,reset){
       <div class="row" style="gap:8px"><button class="pri sm" id="scp">复制订阅链接</button><button class="sm" id="scl">复制 Clash 专用链接</button></div>
     </div></div>
   <p class="hint">Shadowrocket 可以直接扫左边二维码。链接泄露了就点「重置」，旧链接立刻失效，再把新链接发给客户。</p>
-  <div class="row" style="margin-top:12px"><button class="danger" id="srs">重置订阅链接</button><button id="scl2">关闭</button></div>`);
+  <div class="row" style="margin-top:12px">${tw?"":'<button class="danger" id="srs">重置订阅链接</button>'}<button id="scl2">关闭</button></div>`);
   bindFixCert();$("#scp").onclick=()=>copy(x.url);$("#scl").onclick=()=>copy(x.clash);$("#scl2").onclick=closeModal;
-  $("#srs").onclick=()=>{if(confirm("重置后旧的订阅链接马上失效，客户需要重新导入新链接。确定重置？"))subDlg(tag,true)};
+  if($("#srs"))$("#srs").onclick=()=>{if(confirm("重置后旧的订阅链接马上失效，客户需要重新导入新链接。确定重置？"))subDlg(tag,true)};
 }
 
 const FIXCERT="bash /opt/relay-helper/https.sh /opt/relay-helper force && systemctl restart relay-helper";
@@ -1069,8 +1071,8 @@ function certWarn(c,name){if(!c)return "";const who=name?`「${esc(name)}」`:"�
   return ""}
 function bindFixCert(){document.querySelectorAll("[data-fixc]").forEach(b=>b.onclick=()=>copy(FIXCERT))}
 async function twinSubDlg(tag,row){
-  let x;try{x=await api("twin_info",{srv:state.srv||"local",okey:row.outbound_tag},{local:true})}catch(e){return toast(e.message)}
-  if(!x.twin){modal(`<h2 style="margin-top:0">订阅链接：${esc(tag)}</h2><p class="hint">这条线路是双中转，但要在<b>主控</b>（当初建双中转的那台面板）里查看订阅和同步。</p><div class="row"><button id="tcl">关闭</button></div>`);$("#tcl").onclick=closeModal;return}
+  let x;try{x=await api("twin_info",{srv:state.srv||"local",okey:row.outbound_tag},{local:true})}catch(e){return subDlg(tag,false,true)}
+  if(!x.twin)return subDlg(tag,false,true);   // 不在主控上（或主控连不上）：显示本机的订阅地址
   const ms=x.members;
   modal(`<h2 style="margin-top:0">双中转订阅：${esc(tag)}</h2>
   <p class="hint">这条线路在 <b>${ms.map(m=>esc(m.label)).join(" + ")}</b> 上各有一组节点。下面几个订阅地址<b>内容一样</b>，都包含所有中转的节点（名字后面带中转名）。

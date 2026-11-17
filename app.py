@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.19.1"
+VERSION = "1.19.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -4620,6 +4620,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.startswith(p + "sub/"):  # 客户订阅，不需要登录，靠链接里的随机令牌
             return serve_sub(self, path[len(p + "sub/"):].strip("/"), self.path.split("?", 1)[1] if "?" in self.path else "")
+        m = re.fullmatch(r"/[A-Za-z0-9_\-]{1,64}/sub/([A-Za-z0-9_\-]{16,64})/?", path)
+        if m:   # 改过访问路径（比如改成 /kaide/）后，客户手里旧路径的订阅链接照样能用：令牌本身就是随机密钥
+            return serve_sub(self, m.group(1), self.path.split("?", 1)[1] if "?" in self.path else "")
         if path == p + "api/whoami":  # 只返回随机实例号，用于检查新域名是否指向本机
             return self._send(200, {"id": INSTANCE})
         if path == p + "api/backup_download":
