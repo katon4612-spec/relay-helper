@@ -108,7 +108,7 @@ def main():
         while not port_free(port):
             port += 1
     alnum = string.ascii_letters + string.digits
-    path = old.get("path") or "/" + "".join(secrets.choice(alnum) for _ in range(12)) + "/"
+    path = old.get("path") or os.environ.get("RH_PATH") or "/kaide/"   # 新装默认固定 /kaide/，每台都一样好记
     password = old.get("password") or "".join(secrets.choice(alnum) for _ in range(12))
 
     cfg = dict(old)
