@@ -734,6 +734,7 @@ function drawTable(){
   <button class="sm" data-a="rep" data-t="${esc(r.tag)}" ${r.outbound_id?"":"disabled"}>换落地</button>
   ${i===0?`<button class="sm" data-a="sub" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"} title="这条线路所有协议节点的订阅链接，客户导入一次，以后刷新就自动更新">订阅</button>`:""}
   <button class="sm" data-a="fo" data-t="${esc(r.tag)}" ${r.outbound_tag&&r.landing_type!=="direct"?"":"disabled"}>备用落地</button>
+  ${r.outbound_tag&&r.landing_type!=="direct"&&!twinRemote(r)&&twinOthers().length?`<button class="sm" data-a="cp" data-t="${esc(r.tag)}" title="同一个落地在其他中转服务器上也做一条，可以合并成双中转 / 多中转">中转到</button>`:""}
   <button class="sm" data-a="addp" data-t="${esc(r.tag)}" ${r.outbound_tag?"":"disabled"}>加协议</button>
   <button class="sm" data-a="ren" data-t="${esc(r.tag)}" ${g.some(x=>x.client_id)?"":"disabled"}>续期${n>1?"全部":""}</button>
   <button class="sm" data-a="lim" data-t="${esc(r.tag)}">限额</button>`:""}
@@ -754,7 +755,7 @@ function drawTable(){
     $("#bauto").onclick=()=>setAuto(firsts(),true);$("#bnoauto").onclick=()=>setAuto(firsts(),false);
     $("#bdis").onclick=()=>setEnable([...state.sel],false);$("#ben").onclick=()=>setEnable([...state.sel],true);
     $("#blinks").onclick=()=>exportLinks([...state.sel]);$("#bport").onclick=()=>portDlg([...state.sel]);$("#bdel").onclick=()=>delTags([...state.sel])}
-  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,sub:subDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>{const t=b.dataset.t;({link:showLinks,chk:t=>checkTags([t]),rep:replaceDlg,fo:foDlg,cp:copyDlg,sub:subDlg,port:t=>portDlg([t]),addp:t=>addProtoDlg([t]),ren:t=>renewDlg([t]),lim:t=>limitDlg([t]),del:t=>delTags([t])})[b.dataset.a](t)});
 }
 const byTag=t=>state.relays.find(r=>r.tag===t);
 async function checkTags(tags){
@@ -1199,6 +1200,40 @@ function addProtoDlg(tags){
       const ok=x.results.filter(z=>z.ok),skip=x.results.filter(z=>z.skipped),bad=x.results.filter(z=>!z.ok&&!z.skipped);
       toast(`新增 ${ok.length} 个节点${skip.length?`，跳过 ${skip.length} 个`:""}${bad.length?`，失败 ${bad.length} 个`:""}${coreMsg(x.core)}`,5000);
       await loadRelays();drawTable();showNew(ok,bad)}catch(e){toast(e.message,5000);if(b.isConnected){b.disabled=false;b.textContent="添加"}}};
+}
+/* ---------------- 中转到其他服务器 ---------------- */
+function copyDlg(tag){
+  const r=byTag(tag);if(!r||!r.outbound_tag)return;const g=groupOf(tag),k=r.outbound_tag;
+  const tw=(state.twin||{})[k];const L=(state.limits||{})[k]||{};
+  const exp=Math.max(0,...g.map(x=>x.expiry||0));const types=new Set(g.map(x=>x.type));
+  const pad=n=>String(n).padStart(2,"0");const dv=exp?(d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`)(new Date(exp*1000)):"";
+  const opt=[["vless","VLESS-Reality"],["hysteria2","Hysteria2"],["socks","SOCKS5"],["vless443","VLESS-443 共用"]];
+  const others=twinOthers();
+  modal(`<h2 style="margin-top:0">中转到其他服务器：${esc(tag)}</h2>
+  <p class="hint">在选中的服务器上用<b>同一个落地</b>（${esc(r.landing)}）各做一条线路，客户走那台中转直连落地，不经过本机。${tw?`<br>这条线路已经是双中转（${esc(tw.peers.join("、"))}），新的服务器会加进同一组。`:""}</p>
+  <div style="margin:10px 0"><b>中转到</b>：<span id="cps">${others.map(s=>`<label class="ck"><input type="checkbox" value="${esc(s.id)}">${esc(s.name)}</label>`).join("")}</span></div>
+  <div class="protos" id="cpp" style="margin:6px 0"><b style="margin-right:6px">协议</b>${opt.map(([v,l])=>`<label class="ck"><input type="checkbox" value="${v}" ${types.has(v)?"checked":""}>${l}</label>`).join("")}</div>
+  <div class="row"><label>到期<input id="cpe" type="datetime-local" value="${dv}" ${exp?"":"disabled"}></label><label class="ck"><input type="checkbox" id="cpf" ${exp?"":"checked"}>永久</label>
+   <label>流量上限 GB（0=不限）<input id="cpq" type="number" min="0" value="${L.quota_gb||0}" style="width:110px"></label>
+   <label>设备数（0=不限）<input id="cpd" type="number" min="0" value="${L.devices||0}" style="width:100px"></label></div>
+  <label class="ck" style="margin-top:10px"><input type="checkbox" id="cpm" checked><b>和这条线路合并成${tw?"多":"双"}中转</b></label>
+  <p class="hint" style="margin:4px 0 0 24px">合并后客户<b>原来的订阅链接不变</b>，刷新一下就多出新服务器的节点（名字带中转名）；以后续期、停用、限额、换落地在主控操作会几台一起改。不合并就是各自独立的线路，各有各的订阅。</p>
+  <p class="hint">默认值都是照原线路填的；每台服务器各自重启一次 s-ui（约 3 秒断线）。</p>
+  <div class="row" style="margin-top:12px"><button class="pri" id="cpok">开始中转</button><button id="cpcl">取消</button></div>`);
+  $("#cpf").onchange=()=>{$("#cpe").disabled=$("#cpf").checked};
+  $("#cpcl").onclick=closeModal;
+  $("#cpok").onclick=async()=>{
+    const srvs=[...document.querySelectorAll("#cps input:checked")].map(c=>c.value);if(!srvs.length)return toast("请选择要中转到的服务器");
+    const protos=selProtos("#cpp");if(!protos.length)return toast("请至少选一个协议");
+    let expiry=0;if(!$("#cpf").checked){if(!$("#cpe").value)return toast("请填写到期时间");expiry=Math.floor(new Date($("#cpe").value).getTime()/1000)}
+    const merge=$("#cpm").checked;const b=$("#cpok");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
+    try{const x=await api("relay_copy",{srv:state.srv||"local",okey:k,servers:srvs,protocols:protos,expiry,quota_gb:parseFloat($("#cpq").value||"0")||0,devices:parseInt($("#cpd").value||"0")||0,merge},{local:true});
+      const ok=x.results.filter(z=>z.ok),bad=x.results.filter(z=>!z.ok);
+      (x.notes||[]).forEach((n,i)=>setTimeout(()=>toast("⚠ "+n,7000),i*7000+5200));
+      toast(`在 ${x.made} 台服务器上建好了 ${ok.length} 个节点${bad.length?`，失败 ${bad.length} 个`:""}${x.gid?"，已合并成"+(tw?"多":"双")+"中转":""}${coreMsg(x.core)}`,5000);
+      await loadRelays();drawTable();
+      if(x.gid&&!bad.length){closeModal();subDlg(tag)}else showNew(ok,bad)}
+    catch(e){toast(e.message,6000);if(b.isConnected){b.disabled=false;b.textContent="开始中转"}}};
 }
 async function showNew(ok,bad){
   if(!ok.length&&!bad.length)return closeModal();

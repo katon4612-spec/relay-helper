@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.19.5"
+VERSION = "1.20.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -3775,7 +3775,19 @@ def op_twin_links(body):
         ob = {kk: v for kk, v in ob.items() if kk not in ("id", "tag")}
     with SUBS_LOCK:
         tok = SUBS.get(k)
-    return {"exists": True, "label": server_label(), "nodes": nodes, "outbound": ob, "sub_url": _sub_url(tok) if tok else ""}
+    res = {"exists": True, "label": server_label(), "nodes": nodes, "outbound": ob, "sub_url": _sub_url(tok) if tok else ""}
+    if body.get("full"):   # 「中转到其他服务器」要复制的信息
+        cl = {c.get("id"): c for c in data.get("clients") or []}
+        res["group"] = next((cl.get(r.get("client_id"), {}).get("group") or "" for r in rs if r.get("client_id")), "")
+        res["types"] = [r["type"] for r in rs]
+        res["token"] = tok or ""
+        with POOL_LOCK:
+            res["auto"] = bool((POOL.get("auto") or {}).get(k))
+        with FO_LOCK:
+            f = FO.get(k)
+            res["fo_backup"] = (landing_info(f["backup"]).get("url") or "") if f and f.get("active") == "primary" and f.get("backup") else ""
+            res["fo_any"] = bool(f)
+    return res
 
 
 def op_twin_peer_set(body):
@@ -4034,6 +4046,89 @@ def op_twin_create(body):
     return {"results": results, "core": core, "groups": groups}
 
 
+def op_relay_copy(body):
+    """把一条中转线路（同一个落地）再做到其他中转服务器上；可以和原线路合并成双中转 / 多中转。"""
+    src_srv = body.get("srv") or "local"
+    okey = body.get("okey") or ""
+    targets = [t for t in dict.fromkeys(body.get("servers") or []) if t and t != src_srv]
+    if not okey:
+        raise SuiError("缺少线路")
+    if not targets:
+        raise SuiError("请选择要中转到的服务器")
+    for t in targets:
+        if t != "local":
+            _server(t)
+    src = _call(src_srv, "twin_links", {"okey": okey, "full": True})
+    if not src.get("ok"):
+        raise SuiError("读取原线路失败：%s" % (src.get("error") or ""))
+    if not src.get("exists") or not src.get("outbound"):
+        raise SuiError("原线路找不到落地")
+    ob = src["outbound"]
+    if ob.get("type") == "direct":
+        raise SuiError("本机直连的线路不能中转到其他服务器")
+    gid, g, _ = _group_of(src_srv, okey)
+    if g:
+        have = {m["srv"] for m in g["members"]}
+        dup = [_srv_name(t) for t in targets if t in have]
+        if dup:
+            raise SuiError("这条线路在 %s 上已经有了（已经是同一组双中转）" % "、".join(dup))
+    protos = [p for p in (body.get("protocols") or []) if p] or list(dict.fromkeys(src.get("types") or ["vless"]))
+    req = {"items": [{"name": okey, "outbound": ob}], "protocols": protos, "expiry": int(body.get("expiry") or 0),
+           "customer": body.get("customer") if body.get("customer") is not None else src.get("group", ""),
+           "quota_gb": body.get("quota_gb") or 0, "devices": body.get("devices") or 0, "to_pool": False,
+           "auto_switch": bool(body.get("auto_switch", src.get("auto")))}
+    per = {}
+
+    def run(t):
+        per[t] = _call(t, "create", req, timeout=600)
+    ths = [threading.Thread(target=run, args=(t,)) for t in targets]
+    [x.start() for x in ths]
+    [x.join() for x in ths]
+    results, cores, made, notes = [], [], [], []
+    for t in targets:
+        r = per.get(t) or {"ok": False, "error": "没有返回"}
+        name = _srv_name(t)
+        if not r.get("ok"):
+            results.append({"name": "（%s）" % name, "ok": False, "error": r.get("error") or "创建失败", "server": name})
+            continue
+        cores.append(r.get("core") or "ok")
+        nk = None
+        for x in r.get("results") or []:
+            x["server"], x["srv"] = name, t
+            results.append(x)
+            if x.get("ok") and x.get("outbound") and not nk:
+                nk = (x["outbound"], x["name"])
+        if nk:
+            made.append({"srv": t, "okey": nk[0], "tag": nk[1], "label": name})
+    if src.get("fo_backup"):
+        for m in made:
+            r = _call(m["srv"], "failover_set", {"tag": m["tag"], "landing": src["fo_backup"]})
+            if not r.get("ok"):
+                notes.append("%s 上备用落地没设置成功：%s" % (m["label"], r.get("error")))
+    elif src.get("fo_any"):
+        notes.append("原线路的备用落地没有复制过去（原线路正在用备用落地，或备用落地不是 socks5），需要的话在新服务器上手动设置")
+    out_gid = None
+    if body.get("merge") and made:
+        with TWIN_LOCK:
+            gid, g, _ = _group_of(src_srv, okey)
+            if g:
+                g["members"].extend({"srv": m["srv"], "okey": m["okey"], "label": m["label"]} for m in made)
+            else:
+                gid = secrets.token_hex(5)
+                # 用原线路现有的订阅令牌：客户手里的旧订阅链接刷新一下就多出新服务器的节点
+                TWIN["groups"][gid] = {"customer": req["customer"] or "", "token": src.get("token") or secrets.token_urlsafe(18),
+                                       "members": [{"srv": src_srv, "okey": okey, "label": _srv_name(src_srv)}] +
+                                                  [{"srv": m["srv"], "okey": m["okey"], "label": m["label"]} for m in made],
+                                       "created": int(time.time()), "snap": {}}
+            save_twins()
+        errs = twin_sync_links(gid)
+        for e in errs:
+            notes.append("%s 同步订阅节点失败（会自动重试）：%s" % (e["server"], e["error"]))
+        out_gid = gid
+    core = next((c for c in cores if c != "ok"), "ok")
+    return {"results": results, "core": core, "made": len(made), "gid": out_gid, "notes": notes}
+
+
 def op_twin_info(body):
     gid, g, i = _group_of(body.get("srv") or "local", body.get("okey"))
     if not g:
@@ -4208,9 +4303,9 @@ def twin_loop():
 
 
 OPS.update({"twin_resolve": op_twin_resolve, "twin_links": op_twin_links, "twin_peer_set": op_twin_peer_set,
-            "twin_apply": op_twin_apply, "twin_state": op_twin_state, "twin_create": op_twin_create, "twin_info": op_twin_info,
+            "twin_apply": op_twin_apply, "twin_state": op_twin_state, "twin_create": op_twin_create, "relay_copy": op_relay_copy, "twin_info": op_twin_info,
             "twin_unlink": op_twin_unlink, "twin_pending": op_twin_pending})
-LOCAL_ONLY.update({"twin_create", "twin_info", "twin_unlink", "twin_pending"})
+LOCAL_ONLY.update({"twin_create", "twin_info", "twin_unlink", "twin_pending", "relay_copy"})
 
 
 # ------------------------------------------------------------ 在线更新 --
