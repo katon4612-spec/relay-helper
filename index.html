@@ -223,6 +223,7 @@ function copy(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.r
 function coreMsg(c){if(c==="restarted")return "，已重启 s-ui 使路由生效（约 3 秒断线）";if(c==="down")return "。⚠ s-ui 内核未能启动，请登录服务器执行 systemctl restart s-ui";return ""}
 const fmtDate=ts=>{if(!ts)return "永久";const d=new Date(ts*1000);const p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`};
 function daysLeft(ts){if(!ts)return null;const d=(ts*1000-Date.now())/86400000;return d<0?-1:Math.ceil(d)}
+function expDate(r){if(!r.expiry)return "";const d=new Date(r.expiry*1000);const p=n=>String(n).padStart(2,"0");const y=d.getFullYear()!==new Date().getFullYear()?d.getFullYear()+"-":"";return `<div class="muted mono" style="font-size:12px;margin-top:4px;white-space:nowrap">${y}${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}</div>`}
 function expTag(r){const d=daysLeft(r.expiry);if(d!==null&&d<0)return '<span class="tag bad">已过期</span>';if(r.enable===false)return '<span class="tag gray">已停用</span>';if(d===null)return '<span class="tag ok">永久</span>';if(d<0)return '<span class="tag bad">已过期</span>';if(d<=7)return `<span class="tag warn">${d} 天</span>`;return `<span class="tag ok">${d} 天</span>`}
 const protoName={vless:"VLESS-Reality",vless443:"VLESS-443共用",hysteria2:"Hysteria2",socks:"SOCKS5",mixed:"Mixed",vmess:"VMess",trojan:"Trojan",shadowsocks:"SS",tuic:"TUIC",anytls:"AnyTLS",http:"HTTP"};
 
@@ -725,7 +726,7 @@ function drawTable(){
   <td class="nm p-${esc(r.type)}" style="word-break:break-all;min-width:150px" title="${esc(protoName[r.type]||r.type)}">${i?'<span class="branch">↳</span>':""}${esc(r.tag)}${i===0&&n>1&&exps(g)?'<div class="sib" style="color:var(--warn)">各协议到期不一致，续期会统一</div>':""}</td>
   <td data-l="入站"><span class="tag p-${esc(r.type)}">${esc(protoName[r.type]||r.type)}</span> <span class="mono">${esc(r.port)}</span></td>
   ${i===0?`<td class="mono" rowspan="${n}" data-l="落地">${r.landing?esc(r.landing):'<span class="muted">无</span>'}${r.landing_type&&!["socks","direct"].includes(r.landing_type)?` <span class="tag gray">${esc(protoName[r.landing_type]||r.landing_type)}</span>`:""}${foCell(r)}${twinCell(r)}</td>`:""}
-  <td title="${esc(fmtDate(r.expiry))}" data-l="到期">${r.client_id?expTag(r):'<span class="muted">-</span>'}</td>
+  <td title="${esc(fmtDate(r.expiry))}" data-l="到期">${r.client_id?expTag(r)+expDate(r):'<span class="muted">-</span>'}</td>
   ${i===0?`<td rowspan="${n}" style="min-width:110px" data-l="流量" class="lnl">${trafficCell(g)}</td><td rowspan="${n}" data-l="设备" class="lnl">${deviceCell(g)}</td>`:""}
   ${i===0?`<td rowspan="${n}" data-l="检测" class="lnl">${healthCell(g)}</td>`:""}
   <td class="actc"><div class="acts"><button class="sm" data-a="link" data-t="${esc(r.tag)}" ${r.client_id?"":"disabled"}>链接</button>
@@ -1019,7 +1020,7 @@ async function renderServers(){
   const all=ov.flatMap(s=>(s.rows||[]).map(r=>Object.assign({srv:s.id,sname:s.name},r)));
   $("#gq").oninput=()=>{const q=$("#gq").value.trim().toLowerCase();if(!q)return H("#gres","");
     const hit=all.filter(r=>(r.tag+" "+r.landing).toLowerCase().includes(q)).slice(0,60);
-    H("#gres",hit.length?`<table style="margin-top:8px"><tr><th>服务器</th><th>节点</th><th>落地</th><th>到期</th><th></th></tr>${hit.map(r=>`<tr><td>${esc(r.sname)}</td><td>${esc(r.tag)}</td><td class="mono">${esc(r.landing)}</td><td>${expTag(r)}</td><td><button class="sm" data-find="${esc(r.srv)}" data-q="${esc(r.tag)}">去管理</button></td></tr>`).join("")}</table>`:'<p class="hint">没有找到</p>');
+    H("#gres",hit.length?`<table style="margin-top:8px"><tr><th>服务器</th><th>节点</th><th>落地</th><th>到期</th><th></th></tr>${hit.map(r=>`<tr><td>${esc(r.sname)}</td><td>${esc(r.tag)}</td><td class="mono">${esc(r.landing)}</td><td>${expTag(r)}${expDate(r)}</td><td><button class="sm" data-find="${esc(r.srv)}" data-q="${esc(r.tag)}">去管理</button></td></tr>`).join("")}</table>`:'<p class="hint">没有找到</p>');
     document.querySelectorAll("[data-find]").forEach(b=>b.onclick=()=>{switchSrv(b.dataset.find,"manage");state.q=b.dataset.q;setTimeout(()=>{if($("#q")){$("#q").value=b.dataset.q;$("#q").dispatchEvent(new Event("input"))}},400)})};
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>switchSrv(b.dataset.go,"manage"));
   document.querySelectorAll("[data-up]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';
