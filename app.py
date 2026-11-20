@@ -2995,6 +2995,9 @@ def _pool_add(entries, defaults=None):
                 dup += 1
                 continue
             have.add(k)
+            tomb = int((POOL.get("deleted") or {}).pop(k, 0) or 0)   # 删过又加回来：新记录要比删除时间新
+            if tomb >= int(e.get("mt") or time.time()):
+                e["mt"] = tomb + 1
             g = lambda f: (str(e.get(f) or "").strip() or str(d.get(f) or "").strip())
             POOL["items"].append({"id": secrets.token_hex(5), "raw": e["raw"], "ob": ob, "host": e["host"], "ip": e["ip"],
                                   "port": ob.get("server_port"), "type": ob.get("type"),
