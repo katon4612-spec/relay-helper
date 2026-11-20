@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.20.0"
+VERSION = "1.21.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2906,6 +2906,7 @@ POOL_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "landings.json")
 POOL = {"items": [], "auto": {}}
 POOL_LOCK = threading.RLock()
 POOL_STATE = {}  # 线路 key -> {"fails", "last_switch", "noalert"}
+POOL_SHARE_EVT = threading.Event()
 
 
 def load_pool():
@@ -3000,10 +3001,12 @@ def _pool_add(entries, defaults=None):
                                   "country": g("country") or geo.get(e["ip"], ""), "net": ip_net(e["ip"]),
                                   "supplier": g("supplier"), "cost": g("cost"),
                                   "expire": int(e.get("expire") or d.get("expire") or 0), "note": g("note"),
-                                  "disabled": bool(e.get("disabled")), "added": int(time.time()), "check": None})
+                                  "disabled": bool(e.get("disabled")), "added": int(time.time()), "mt": int(e.get("mt") or time.time()),
+                                  "check": None})
             added += 1
         if added:
             save_pool()
+            POOL_SHARE_EVT.set()
         missing = any(not it.get("country") for it in POOL["items"])
     if added and missing and CFG.get("geo_lookup", True):
         threading.Thread(target=pool_geo_fill, daemon=True).start()
@@ -3061,8 +3064,10 @@ def op_pool_update(body):
         for it in POOL["items"]:
             if it["id"] in ids:
                 it.update(fields)
+                it["mt"] = int(time.time())
                 n += 1
         save_pool()
+    POOL_SHARE_EVT.set()
     return {"updated": n}
 
 
@@ -3070,9 +3075,16 @@ def op_pool_delete(body):
     ids = set(body.get("ids") or [])
     with POOL_LOCK:
         before = len(POOL["items"])
+        now = int(time.time())
+        dels = POOL.setdefault("deleted", {})
+        for it in POOL["items"]:
+            if it["id"] in ids:
+                dels[landing_key(it["ob"])] = now   # 共用落地库时，删除要同步到其他服务器
         POOL["items"] = [it for it in POOL["items"] if it["id"] not in ids]
         save_pool()
-        return {"deleted": before - len(POOL["items"])}
+        n = before - len(POOL["items"])
+    POOL_SHARE_EVT.set()
+    return {"deleted": n}
 
 
 def _pool_check_items(items):
@@ -3254,6 +3266,178 @@ def op_pool_auto(body):
         with FO_LOCK:
             fo = len([k for k in done if FO.get(k) and (FO[k].get("backup") or FO[k].get("primary"))])
     return {"updated": len(done), "direct": skip, "failover": fo}
+
+
+# ------------------------------------------------------- 共用落地库 --
+# 主控开启后，主控和所有中转服务器的落地库合成一份：任何一台加的、改的、删的落地，都会同步到所有服务器。
+# 按「落地 key」对齐（同一个落地在各台的 id 不同），字段以最后修改（mt）为准；删除留「墓碑」，防止被别的服务器又同步回来。
+# 检测结果（通不通、延迟）每台各测各的，不同步——同一个落地从不同中转连，结果本来就可能不一样。
+POOL_SHARE_FIELDS = ("raw", "country", "supplier", "cost", "expire", "note", "disabled")
+POOL_SHARE = {"last": 0, "ok": [], "fail": [], "running": False, "items": 0}
+
+
+def _pool_mt(it):
+    return int(it.get("mt") or it.get("added") or 0)
+
+
+def _pool_state():
+    with POOL_LOCK:
+        recs = [dict({f: it.get(f) for f in POOL_SHARE_FIELDS}, key=landing_key(it["ob"]), mt=_pool_mt(it), ip=it.get("ip") or "")
+                for it in POOL["items"]]
+        dels = dict(POOL.get("deleted") or {})
+    return recs, dels
+
+
+def _pool_digest(recs, dels):
+    blob = json.dumps([sorted((r["key"], r["mt"], r.get("country") or "") for r in recs), sorted(dels.items())], ensure_ascii=False)
+    return hashlib.sha1(blob.encode()).hexdigest()
+
+
+def _pool_apply(recs, dels):
+    """把别处来的落地记录合进本机落地库。返回 (新增, 更新, 删除)。"""
+    now = int(time.time())
+    with POOL_LOCK:
+        have = {landing_key(it["ob"]): it for it in POOL["items"]}
+    new = []
+    for r in recs:
+        if r.get("key") in have or not r.get("raw"):
+            continue
+        try:
+            ob, host, _ = parse_landing(str(r["raw"]))
+        except Exception:
+            continue
+        if ob.get("type") == "direct" or landing_key(ob) != r["key"]:
+            continue
+        new.append((r, ob, host, r.get("ip") or resolve(host) or ""))
+    added = updated = removed = 0
+    with POOL_LOCK:
+        D = POOL.setdefault("deleted", {})
+        for k, t in (dels or {}).items():
+            if int(t or 0) > int(D.get(k) or 0):
+                D[k] = int(t)
+        have = {landing_key(it["ob"]): it for it in POOL["items"]}
+        for r in recs:
+            it = have.get(r.get("key"))
+            if not it:
+                continue
+            mt = int(r.get("mt") or 0)
+            if mt > _pool_mt(it):
+                for f in POOL_SHARE_FIELDS:
+                    if f in r and f != "raw":
+                        it[f] = r[f]
+                it["expire"] = int(it.get("expire") or 0)
+                it["disabled"] = bool(it.get("disabled"))
+                it["mt"] = mt
+                updated += 1
+            elif not it.get("country") and r.get("country"):
+                it["country"] = r["country"]
+                updated += 1
+        for r, ob, host, ip in new:
+            k = r["key"]
+            if k in have or int(D.get(k) or 0) >= int(r.get("mt") or 0):
+                continue
+            ob = dict(ob)
+            ob.pop("tag", None)
+            ob.pop("id", None)
+            it = {"id": secrets.token_hex(5), "raw": r["raw"], "ob": ob, "host": host, "ip": ip,
+                  "port": ob.get("server_port"), "type": ob.get("type"), "country": r.get("country") or "", "net": ip_net(ip),
+                  "supplier": r.get("supplier") or "", "cost": r.get("cost") or "", "expire": int(r.get("expire") or 0),
+                  "note": r.get("note") or "", "disabled": bool(r.get("disabled")), "added": now, "mt": int(r.get("mt") or now),
+                  "check": None}
+            POOL["items"].append(it)
+            have[k] = it
+            added += 1
+        keep = []
+        for it in POOL["items"]:
+            t = D.get(landing_key(it["ob"]))
+            if t and int(t) >= _pool_mt(it):
+                removed += 1
+            else:
+                keep.append(it)
+        POOL["items"] = keep
+        for k in [k for k, t in D.items() if now - int(t or 0) > 90 * 86400]:
+            D.pop(k, None)
+        if added or updated or removed:
+            save_pool()
+    if added:
+        threading.Thread(target=pool_bg_check, daemon=True).start()
+    return added, updated, removed
+
+
+def op_pool_sync(body):
+    """主控用：push 给了就先合进来；总是返回本机的落地记录。"""
+    res = {}
+    if body.get("push"):
+        a, u, r = _pool_apply(body["push"].get("items") or [], body["push"].get("deleted") or {})
+        res.update({"added": a, "updated": u, "removed": r})
+    recs, dels = _pool_state()
+    if body.get("digest_only"):
+        return dict(res, digest=_pool_digest(recs, dels))
+    return dict(res, items=recs, deleted=dels, digest=_pool_digest(recs, dels))
+
+
+def pool_share_once():
+    if not CFG.get("pool_share"):
+        return
+    POOL_SHARE["running"] = True
+    try:
+        srvs = [s["id"] for s in SERVERS]
+        got, fail = {}, []
+
+        def pull(sid):
+            r = proxy_json(sid, "pool_sync", {}, 60)
+            if r.get("ok"):
+                got[sid] = r
+            else:
+                fail.append({"server": _srv_name(sid), "error": r.get("error") or ""})
+        ths = [threading.Thread(target=pull, args=(x,)) for x in srvs]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        for r in got.values():   # 先把各台的合进主控
+            _pool_apply(r.get("items") or [], r.get("deleted") or {})
+        recs, dels = _pool_state()
+        dg = _pool_digest(recs, dels)
+        push_fail = []
+
+        def push(sid):
+            if got[sid].get("digest") == dg:
+                return
+            r = proxy_json(sid, "pool_sync", {"push": {"items": recs, "deleted": dels}, "digest_only": True}, 120)
+            if not r.get("ok"):
+                push_fail.append({"server": _srv_name(sid), "error": r.get("error") or ""})
+        ths = [threading.Thread(target=push, args=(x,)) for x in got]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        bad = {f["server"] for f in push_fail}
+        POOL_SHARE.update({"last": int(time.time()), "ok": [_srv_name(x) for x in got if _srv_name(x) not in bad],
+                           "fail": fail + push_fail, "items": len(recs)})
+    finally:
+        POOL_SHARE["running"] = False
+
+
+def pool_share_loop():
+    time.sleep(20)
+    while True:
+        POOL_SHARE_EVT.wait(120)
+        POOL_SHARE_EVT.clear()
+        try:
+            pool_share_once()
+        except Exception as e:
+            sys.stderr.write("pool share: %s\n" % e)
+        time.sleep(3)
+
+
+def op_pool_share(body):
+    """主控：开关「所有服务器共用落地库」/ 查看状态 / 立即同步。"""
+    if "on" in body:
+        save_config({"pool_share": bool(body["on"])})
+    if body.get("sync_now") or "on" in body:
+        if CFG.get("pool_share"):
+            pool_share_once()
+    st = dict(POOL_SHARE)
+    st["on"] = bool(CFG.get("pool_share"))
+    st["servers"] = len(SERVERS)
+    return st
 
 
 def pool_once():
@@ -3603,7 +3787,8 @@ OPS.update({"set_limits": op_set_limits, "reset_traffic": op_reset_traffic, "kic
             "server_save": op_server_save, "server_del": op_server_del, "servers_overview": op_servers_overview,
             "local_token_reset": op_local_token_reset, "pool_list": op_pool_list, "pool_import": op_pool_import,
             "pool_update": op_pool_update, "pool_delete": op_pool_delete, "pool_check": op_pool_check,
-            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto, "pool_geo": op_pool_geo, "pool_export": op_pool_export})
+            "pool_candidates": op_pool_candidates, "pool_switch": op_pool_switch, "pool_auto": op_pool_auto, "pool_geo": op_pool_geo, "pool_export": op_pool_export,
+            "pool_sync": op_pool_sync, "pool_share": op_pool_share})
 
 
 # ------------------------------------------------------------- web server --
@@ -4447,6 +4632,7 @@ def op_update_rollback(body):
 
 OPS.update({"set_path": op_set_path, "servers_unify_path": op_servers_unify_path})
 LOCAL_ONLY.add("servers_unify_path")
+LOCAL_ONLY.add("pool_share")
 OPS.update({"update_check": op_update_check, "update_run": op_update_run, "update_rollback": op_update_rollback})
 
 
@@ -4939,6 +5125,8 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write("twin pre: %s\n" % e)
         if sid and action not in LOCAL_ONLY:
             res = proxy_json(sid, action, body)
+            if action in ("pool_import", "pool_update", "pool_delete", "create") and CFG.get("pool_share") and isinstance(res, dict) and res.get("ok"):
+                POOL_SHARE_EVT.set()   # 在别的服务器上改了落地库，马上同步一轮
             if tctx and isinstance(res, dict) and res.get("ok"):
                 try:
                     twin_post(tctx, res)
@@ -4990,6 +5178,7 @@ def main():
     load_sessions()
     threading.Thread(target=pool_loop, daemon=True).start()
     threading.Thread(target=twin_loop, daemon=True).start()
+    threading.Thread(target=pool_share_loop, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()

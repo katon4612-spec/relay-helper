@@ -875,7 +875,7 @@ function paintPool(x){
   const items=x.items,now=x.now;
   const by={};items.forEach(it=>{const c=it.country||"未知";(by[c]=by[c]||{n:0,idle:0,bad:0}).n++;if(!it.used_by.length&&!it.disabled&&!it.expired)by[c].idle++;if(it.check&&!it.check.ok)by[c].bad++});
   const soon=items.filter(it=>it.expire&&it.expire>now&&it.expire<now+7*86400).length;
-  m.innerHTML=`<div class="card"><h2>落地库</h2>
+  m.innerHTML=`<div id="pshare"></div><div class="card"><h2>落地库</h2>
   <p class="hint">把买来的落地都放在这里：建线路时「从落地库选」，线路落地坏了在「换落地」里一键换（只换同国家的，同网段优先），也可以给线路开「自动换」。一个落地可以多条线路共用，「状态」里标出有几条线路在用、是哪几条。</p>
   <div class="row" style="gap:6px;margin:10px 0"><button class="sm" data-pc="">全部（${items.length}）</button>${Object.entries(by).map(([c,v])=>`<button class="sm" data-pc="${esc(c)}">${esc(c)} ${v.n}<span class="muted">（空闲 ${v.idle}${v.bad?`，<span class="err">不通 ${v.bad}</span>`:""}）</span></button>`).join("")}</div>
   <div class="toolbar"><input id="pq" class="grow" placeholder="搜 IP / 网段 / 供应商 / 备注 / 使用的线路" value="${esc(state.pf.q)}">
@@ -889,8 +889,25 @@ function paintPool(x){
   $("#pst").value=state.pf.s;$("#pst").onchange=()=>{state.pf.s=$("#pst").value;drawPool()};
   $("#pq").oninput=()=>{state.pf.q=$("#pq").value;clearTimeout(state.pqT);state.pqT=setTimeout(()=>{state.plim=200;drawPool()},180)};
   $("#pimp").onclick=poolImportDlg;$("#pexp").onclick=poolExportDlg;
-  drawPool();
+  drawPool();drawShare();
   clearTimeout(state.poolT);if(x.bg_check&&x.bg_check.running)state.poolT=setTimeout(()=>{if(state.tab==="pool"&&!document.querySelector("#modal.show")&&!state.psel.size)renderPool()},20000);
+}
+async function drawShare(st){
+  const box=$("#pshare");if(!box||!(state.servers||[]).length)return;
+  if(!st){if(state.shareSt)drawShare(state.shareSt);try{st=await api("pool_share",{},{local:true})}catch(e){return}state.shareSt=st;if(!$("#pshare"))return}
+  const ago=st.last?Math.max(0,Math.round(Date.now()/1000-st.last)):0,agoT=!st.last?"还没同步过":ago<90?ago+" 秒前":Math.round(ago/60)+" 分钟前";
+  H("#pshare",`<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2 style="margin:0">所有服务器共用落地库</h2>
+   <label class="ck"><input type="checkbox" id="pshon" ${st.on?"checked":""}><b>${st.on?"已开启":"未开启"}</b></label></div>
+  <p class="hint">开启后，本机和「服务器」页里的 ${st.servers} 台服务器用同一份落地库：任何一台加的、改的、删的落地，约 2 分钟内同步到所有服务器（在这里操作会马上同步）。每台各自检测通不通（从不同中转连，结果可能不一样）。${state.srv!=="local"?"<br>现在看的是「"+esc((state.servers.find(x=>x.id===state.srv)||{}).name||"")+"」上的落地库，开关和同步状态以主控（本机）为准。":""}</p>
+  ${st.on?`<div class="row" style="align-items:center;gap:10px"><span>上次同步：${agoT}，共 ${st.items} 个落地，成功 ${st.ok.length} 台${st.fail.length?`，<span class="err">失败 ${st.fail.length} 台</span>`:""}</span><button class="sm" id="pshnow">立即同步</button></div>
+   ${st.fail.map(f=>`<p class="err" style="margin:4px 0">✗ ${esc(f.server)}：${esc(/unknown action/.test(f.error)?"版本太旧，请先在「服务器」页更新到最新版":f.error)}</p>`).join("")}`:""}</div>`);
+  $("#pshon").onchange=async e=>{const on=e.target.checked;
+    if(on&&!confirm(`开启后会把本机和 ${st.servers} 台服务器的落地库合并成一份（重复的自动去掉），以后各台的落地库保持一致。继续？`)){e.target.checked=false;return}
+    if(!on&&!confirm("关闭后各台的落地库不再同步（已经同步过去的落地保留）。继续？")){e.target.checked=true;return}
+    e.target.disabled=true;toast(on?"正在合并各台落地库…":"已关闭");
+    try{const x=await api("pool_share",{on},{local:true});state.shareSt=x;if(on)toast(`已开启共用：现在共 ${x.items} 个落地，同步成功 ${x.ok.length} 台${x.fail.length?`，失败 ${x.fail.length} 台`:""}`,5000);state.poolX=null;renderPool()}catch(err){toast(err.message);e.target.checked=!on;e.target.disabled=false}};
+  const nb=$("#pshnow");if(nb)nb.onclick=async()=>{nb.disabled=true;nb.innerHTML='<span class="spin"></span> 同步中';
+    try{const x=await api("pool_share",{sync_now:true},{local:true});state.shareSt=x;toast(`同步完成：共 ${x.items} 个落地`);state.poolX=null;renderPool()}catch(err){toast(err.message);nb.disabled=false;nb.textContent="立即同步"}};
 }
 function poolFiltered(){const f=state.pf,q=f.q.trim().toLowerCase(),now=Date.now()/1000;
   return state.pool.filter(it=>(!f.c||(it.country||"未知")===f.c)&&
