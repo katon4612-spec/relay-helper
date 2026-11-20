@@ -3067,7 +3067,7 @@ def op_pool_update(body):
         for it in POOL["items"]:
             if it["id"] in ids:
                 it.update(fields)
-                it["mt"] = int(time.time())
+                it["mt"] = max(int(time.time()), _pool_mt(it) + 1)
                 n += 1
         save_pool()
     POOL_SHARE_EVT.set()
