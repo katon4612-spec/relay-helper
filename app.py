@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.22.1"
+VERSION = "1.22.2"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2970,7 +2970,8 @@ def speed_cmds(dev, want):
         cid = "7a:%x" % (16 + i)
         kb = max(64, int(w["mb"] * 1000))
         out.append("class add dev %s parent 7a: classid %s htb rate %dkbit ceil %dkbit" % (dev, cid, kb, kb))
-        out.append("qdisc add dev %s parent %s fq_codel" % (dev, cid))
+        # 叶子队列给约 0.5 秒的缓冲：fq_codel 默认按低延迟调的，跨境 200～400ms 的线路上会过早丢包，TCP 跑不满
+        out.append("qdisc add dev %s parent %s bfifo limit %d" % (dev, cid, max(65536, int(kb * 1000 / 8 * 0.5))))
         burst = "%dk" % max(128, int(kb * 1000 / 8 / 1024))   # 上传 police 桶：约 1 秒的量
         for port in sorted(w["ports"]):
             out.append("filter add dev %s parent 7a: protocol ip prio 10 u32 match ip sport %d 0xffff flowid %s" % (dev, port, cid))
