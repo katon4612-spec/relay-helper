@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.22.3"
+VERSION = "1.22.4"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2980,7 +2980,7 @@ def speed_cmds(dev, want):
            "qdisc add dev %s clsact" % dev]
     for i, (k, w) in enumerate(sorted(want.items())):
         cid = "7a:%x" % (16 + i)
-        kb = max(64, int(w["mb"] * 1000))
+        kb = max(64, int(w["mb"] * 1000 * TCP_COMP))
         out.append("class add dev %s parent 7a: classid %s htb rate %dkbit ceil %dkbit" % (dev, cid, kb, kb))
         # 叶子队列给约 0.5 秒的缓冲：fq_codel 默认按低延迟调的，跨境 200～400ms 的线路上会过早丢包，TCP 跑不满
         out.append("qdisc add dev %s parent %s bfifo limit %d" % (dev, cid, max(65536, int(kb * 1000 / 8 * 0.5))))
@@ -2990,7 +2990,7 @@ def speed_cmds(dev, want):
             if not hy:   # Hysteria2 的下载由它自己的服务端限速（down/up_mbps）控制，排队整形反而会让它跑不满、忽快忽慢
                 out.append("filter add dev %s parent 7a: protocol ip prio 10 u32 match ip sport %d 0xffff flowid %s" % (dev, port, cid))
                 out.append("filter add dev %s parent 7a: protocol ipv6 prio 11 u32 match ip6 sport %d 0xffff flowid %s" % (dev, port, cid))
-            pkb = int(kb * 1.25) if hy else kb   # Hysteria2 客户端会按服务端给的速度发，这里只是兜底，放宽一点
+            pkb = int(w["mb"] * 1000 * HY2_COMP * 1.25) if hy else kb   # Hysteria2 客户端会按服务端给的速度发，这里只是兜底，放宽一点
             pol = "action police rate %dkbit burst %s drop" % (pkb, burst)
             out.append("filter add dev %s ingress protocol ip prio 10 u32 match ip dport %d 0xffff %s" % (dev, port, pol))
             out.append("filter add dev %s ingress protocol ipv6 prio 11 u32 match ip6 dport %d 0xffff %s" % (dev, port, pol))
@@ -3072,6 +3072,8 @@ def speed_apply(force=False):
 
 
 HY2_BW = {}   # 入站 id -> 已经设好的 Mbps（省得每分钟去读入站）
+HY2_COMP = 1.17   # Hysteria2 速度补偿：填 20，客户测速约 19～20
+TCP_COMP = 1.06   # VLESS/SOCKS（TCP）速度补偿：包头开销约 5%
 
 
 def hy2_speed_sync(keys=None):
@@ -3079,7 +3081,8 @@ def hy2_speed_sync(keys=None):
     客户端会按这个速度收发，速度稳。不限速时恢复成 ignore_client_bandwidth（BBR）。改入站会让 s-ui 重启约 3 秒。
     keys=None 只检查有限速的线路（后台用）；给了 keys 就检查这些线路（改限速时用）。"""
     with LIM_LOCK:
-        lim = {k: max(1, int(round(float(v.get("speed_mbps") or 0)))) for k, v in LIMITS.items() if v.get("speed_mbps")}
+        # 补偿协议开销：限速是按网络里传的总量算的，测速网站只算净数据，Hysteria2（UDP+QUIC+重传）大约只剩 85%
+        lim = {k: max(1, int(round(float(v.get("speed_mbps") or 0) * HY2_COMP))) for k, v in LIMITS.items() if v.get("speed_mbps")}
     if keys is None and not lim:
         return 0
     data = SUI.load_all()

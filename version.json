@@ -1,6 +1,10 @@
 {
- "version": "1.22.3",
+ "version": "1.22.4",
  "changes": [
+  {
+   "version": "1.22.4",
+   "notes": "限速补偿协议开销：客户测速更接近填的数（Hysteria2 补约 17%，VLESS/SOCKS 补约 6%）；已设限速的线路更新后自动生效"
+  },
   {
    "version": "1.22.3",
    "notes": "限速：Hysteria2 节点改用它自带的服务端限速（up/down_mbps），速度稳定贴近设定值；系统 tc 只管 VLESS/SOCKS 的下载"
