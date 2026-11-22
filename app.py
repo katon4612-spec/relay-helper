@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -976,7 +976,7 @@ def op_create(body):
             results.extend(made)
         core = _apply_rules(results, new_outbounds)
         init_group_limits([o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)],
-                          body.get("quota_gb"), body.get("devices"))
+                          body.get("quota_gb"), body.get("devices"), body.get("speed_mbps"))
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
@@ -1070,7 +1070,7 @@ def op_list(body):
     return {"relays": build_relays(data), "now": int(time.time()), "public_host": CFG["public_host"],
             "unprotected": [t for t, _ in unprotected_inbounds(data)], "limits": lim, "online": dict(ONLINE),
             "health": dict(HEALTH), "health_last": HEALTH_META.get("last", 0), "failover": fo_summary(),
-            "fw_error": FW_STATE["error"], "version": VERSION, "pool_auto": [k for k, v in (POOL.get("auto") or {}).items() if v], "twin": _twin_list_info()}
+            "fw_error": FW_STATE["error"], "version": VERSION, "pool_auto": [k for k, v in (POOL.get("auto") or {}).items() if v], "twin": _twin_list_info(), "speed": dict(SPEED_ST)}
 
 
 def op_links(body):
@@ -1899,15 +1899,19 @@ def op_set_limits(body):
                 L["quota_gb"] = max(0.0, float(body.get("quota_gb") or 0))
             if "devices" in body:
                 L["devices"] = max(0, int(body.get("devices") or 0))
+            if "speed_mbps" in body:
+                L["speed_mbps"] = max(0.0, round(float(body.get("speed_mbps") or 0), 1))
             q = float(L.get("quota_gb") or 0)
             if L.get("over") and (q == 0 or group_usage(groups.get(k, [])) < q * 1024 ** 3):
                 L["over"] = False
                 reenable.append(k)
-            if not L.get("quota_gb") and not L.get("devices") and not L.get("over"):
+            if not L.get("quota_gb") and not L.get("devices") and not L.get("over") and not L.get("speed_mbps"):
                 LIMITS.pop(k, None)
         save_limits()
     _reenable(reenable, groups)
-    return {"updated": len(keys)}
+    if "speed_mbps" in body:
+        speed_apply()
+    return {"updated": len(keys), "speed": dict(SPEED_ST)}
 
 
 def _reenable(keys, groups):
@@ -1942,13 +1946,18 @@ def op_reset_traffic(body):
     return {"reset": len(keys)}
 
 
-def init_group_limits(okeys, quota_gb, devices):
-    if not (quota_gb or devices):
+def init_group_limits(okeys, quota_gb, devices, speed_mbps=0):
+    speed_mbps = max(0.0, round(float(speed_mbps or 0), 1))
+    if not (quota_gb or devices or speed_mbps):
         return
     with LIM_LOCK:
         for k in okeys:
             LIMITS[k] = {"quota_gb": float(quota_gb or 0), "devices": int(devices or 0), "over": False}
+            if speed_mbps:
+                LIMITS[k]["speed_mbps"] = speed_mbps
         save_limits()
+    if speed_mbps:
+        speed_apply()
 
 
 def drop_group_limits(okeys):
@@ -2896,6 +2905,146 @@ def op_servers_overview(body):
     for s, r in res:
         out.append(dict(_summary(r), id=s["id"], name=s.get("name", ""), url=s["url"]))
     return {"servers": out}
+
+
+# ------------------------------------------------------------- 限速 --
+# 每条线路有自己的端口，按端口用 Linux tc 限速（443 共用端口不限）。
+# 用 clsact 钩子 + police：不替换网卡原来的队列，没设限速的流量完全不经过这些规则；全部删掉就是 `tc qdisc del dev 网卡 clsact`。
+#   发给客户（下载）：egress 上 源端口 = 线路端口；客户发来（上传）：ingress 上 目的端口 = 线路端口。上传、下载用同一个数。
+SPEED_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "speed-tc.json")
+SPEED_ST = {"ok": True, "error": "", "ports": 0, "devs": [], "applied": None}
+SPEED_LOCK = threading.Lock()
+
+
+def _tc(args, stdin=None):
+    try:
+        p = subprocess.run(["tc"] + args, input=stdin, capture_output=True, text=True, timeout=30)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, "服务器上没有 tc 命令（Debian/Ubuntu 运行：apt install -y iproute2）"
+    except Exception as e:
+        return 1, str(e)
+
+
+def _default_devs():
+    devs = []
+    for fam in ("-4", "-6"):
+        try:
+            out = subprocess.run(["ip", fam, "route", "show", "default"], capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            continue
+        for m in re.finditer(r"\bdev\s+(\S+)", out):
+            if m.group(1) not in devs and m.group(1) != "lo":
+                devs.append(m.group(1))
+    return devs
+
+
+def speed_wanted(data=None):
+    """端口 -> Mbps"""
+    with LIM_LOCK:
+        lim = {k: float(v.get("speed_mbps") or 0) for k, v in LIMITS.items() if v.get("speed_mbps")}
+    if not lim:
+        return {}
+    data = data or SUI.load_all()
+    want = {}
+    for r in build_relays(data):
+        if r.get("shared") or not r.get("port"):
+            continue
+        mb = lim.get(okey_of(r))
+        if mb:
+            want[int(r["port"])] = mb
+    return want
+
+
+def speed_cmds(dev, want):
+    """一个网卡要执行的 tc batch 命令（不含删除）。"""
+    out = ["qdisc add dev %s clsact" % dev]
+    for port, mb in sorted(want.items()):
+        rate = "%dkbit" % max(64, int(mb * 1000))
+        burst = "%dk" % max(64, int(mb * 1000 * 1000 / 8 * 0.2 / 1024))   # 约 200ms 的量
+        pol = "action police rate %s burst %s drop" % (rate, burst)
+        for hook, d in (("egress", "sport"), ("ingress", "dport")):
+            out.append("filter add dev %s %s protocol ip prio 10 u32 match ip %s %d 0xffff %s" % (dev, hook, d, port, pol))
+            out.append("filter add dev %s %s protocol ipv6 prio 11 u32 match ip6 %s %d 0xffff %s" % (dev, hook, d, port, pol))
+    return out
+
+
+def _speed_load():
+    try:
+        with open(SPEED_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _speed_save(st):
+    try:
+        with open(SPEED_PATH, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
+def speed_apply(force=False):
+    """按 LIMITS 里的 speed_mbps 重建 tc 规则；没变化就什么都不做。"""
+    with SPEED_LOCK:
+        try:
+            want = speed_wanted()
+        except Exception as e:
+            SPEED_ST.update({"ok": False, "error": "读取线路失败：%s" % e})
+            return SPEED_ST
+        if want and not (shutil.which("tc") and shutil.which("ip")):
+            SPEED_ST.update({"ok": False, "error": "服务器上没有 tc/ip 命令，限速没法生效（Debian/Ubuntu 运行：apt install -y iproute2）",
+                             "ports": 0, "applied": None})
+            return SPEED_ST
+        devs = _default_devs() if want else []
+        key = json.dumps([sorted(want.items()), devs])
+        if not force and SPEED_ST.get("applied") == key and SPEED_ST.get("ok"):
+            return SPEED_ST
+        old = _speed_load()
+        errs = []
+        for dev in sorted(set(old.get("devs") or []) | set(devs)):
+            if dev in (old.get("devs") or []):
+                _tc(["qdisc", "del", "dev", dev, "clsact"])
+            elif dev in devs:
+                rc, o = _tc(["qdisc", "show", "dev", dev])
+                if "clsact" in o:
+                    errs.append("网卡 %s 上已经有别的程序设的 clsact 规则，没有动它" % dev)
+                    devs.remove(dev)
+        mine = []
+        for dev in devs:
+            cmds = speed_cmds(dev, want)
+            rc, o = _tc(["-batch", "-"], "\n".join(cmds) + "\n")
+            mine.append(dev)
+            if rc != 0:
+                errs.append("%s：%s" % (dev, o.strip()[-300:]))
+                _tc(["qdisc", "del", "dev", dev, "clsact"])   # 失败就整个撤掉，不留半套规则
+                mine.remove(dev)
+                continue
+            rc, o = _tc(["filter", "show", "dev", dev, "egress"])
+            n = o.count("police")
+            if n < len(want) * 2:
+                errs.append("%s：规则数量不对（%d/%d）" % (dev, n, len(want) * 2))
+        _speed_save({"devs": mine})
+        if want and not devs and not errs:
+            errs.append("找不到默认网卡")
+        SPEED_ST.update({"ok": not errs, "error": "；".join(errs), "ports": len(want) if mine else 0, "devs": mine,
+                         "applied": key if not errs else None})
+        if errs:
+            sys.stderr.write("speed: %s\n" % SPEED_ST["error"])
+        return SPEED_ST
+
+
+def speed_loop():
+    time.sleep(15)
+    n = 0
+    while True:
+        try:
+            speed_apply(force=(n == 0))   # 启动后第一次强制重建（服务器重启后 tc 规则会丢）
+        except Exception as e:
+            sys.stderr.write("speed: %s\n" % e)
+        n += 1
+        time.sleep(60)   # 换端口、删线路、加协议后，最多一分钟内规则跟上
 
 
 # ------------------------------------------------------------- 落地库 --
@@ -4263,7 +4412,7 @@ def op_relay_copy(body):
     protos = [p for p in (body.get("protocols") or []) if p] or list(dict.fromkeys(src.get("types") or ["vless"]))
     req = {"items": [{"name": okey, "outbound": ob}], "protocols": protos, "expiry": int(body.get("expiry") or 0),
            "customer": body.get("customer") if body.get("customer") is not None else src.get("group", ""),
-           "quota_gb": body.get("quota_gb") or 0, "devices": body.get("devices") or 0, "to_pool": False,
+           "quota_gb": body.get("quota_gb") or 0, "devices": body.get("devices") or 0, "speed_mbps": body.get("speed_mbps") or 0, "to_pool": False,
            "auto_switch": bool(body.get("auto_switch", src.get("auto")))}
     per = {}
 
@@ -4397,7 +4546,7 @@ def twin_post(ctx, res):
         if action == "update_clients":
             params = {x: body[x] for x in ("expiry", "enable", "reset_traffic") if x in body}
         elif action == "set_limits":
-            params = {x: body[x] for x in ("quota_gb", "devices") if x in body}
+            params = {x: body[x] for x in ("quota_gb", "devices", "speed_mbps") if x in body}
         elif action == "pool_auto":
             params = {"on": body.get("on")}
         elif action == "add_protocol":
@@ -5143,6 +5292,8 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             res = fn(body)
             res["ok"] = res.get("ok", True)
+            if action in ("change_port", "add_protocol", "replace", "delete", "update_clients") and res["ok"] and SPEED_ST.get("ports"):
+                threading.Thread(target=speed_apply, daemon=True).start()
             if tctx and res["ok"]:
                 try:
                     twin_post(tctx, res)
@@ -5182,6 +5333,7 @@ def main():
     threading.Thread(target=pool_loop, daemon=True).start()
     threading.Thread(target=twin_loop, daemon=True).start()
     threading.Thread(target=pool_share_loop, daemon=True).start()
+    threading.Thread(target=speed_loop, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()

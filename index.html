@@ -285,6 +285,7 @@ function renderCreate(){
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
     <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
     <label>设备数（0=不限）<input id="qdev" type="number" min="0" step="1" value="${esc(saved.qdev??0)}" style="width:110px"></label>
+    <label title="上传、下载都限这个速度；每个协议节点各限这个速度，连同一节点的几台设备一起分；VLESS-443 共用节点不限速">限速 Mbps（0=不限）<input id="qspd" type="number" min="0" step="1" value="${esc(saved.qspd??0)}" style="width:110px"></label>
   </div>
   <div id="dcnt" class="row" style="margin-top:12px;display:none"><label>创建几条直连线路<input id="dn" type="number" min="1" max="100" value="1" style="width:110px"></label>
     <span class="hint">每条线路单独计流量、设备和到期；出口 IP 都是本服务器（${esc(state.host||"")}）。</span></div>
@@ -314,7 +315,7 @@ function selProtos(sel="#protos"){return [...document.querySelectorAll(sel+" inp
 function expiryTs(){const v=$("#days").value;if(v==="0")return 0;if(v==="custom"){const d=$("#cdate").value;if(!d)throw new Error("请选择到期日期");return Math.floor(new Date(d).getTime()/1000)}if(v==="ndays"){const n=parseInt($("#ndays").value);if(!(n>=1))throw new Error("请填写到期天数（大于 0 的整数）");return Math.floor(Date.now()/1000)+n*86400}return Math.floor(Date.now()/1000)+parseInt(v)*86400}
 async function doPreview(){
   const b=$("#pv");b.disabled=true;b.innerHTML='<span class="spin"></span> 解析中';
-  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value,ndays:$("#ndays").value,qgb:$("#qgb").value,qdev:$("#qdev").value,mode:curMode()}));
+  localStorage.setItem("rh_form",JSON.stringify({cust:$("#cust").value,protos:selProtos(),days:$("#days").value,ndays:$("#ndays").value,qgb:$("#qgb").value,qdev:$("#qdev").value,qspd:$("#qspd").value,mode:curMode()}));
   try{const r=await api("preview",curMode()==="direct"?{direct:true,count:parseInt($("#dn").value||"1"),customer:$("#cust").value.trim()}:{text:$("#txt").value,customer:$("#cust").value.trim()});state.preview=r.items;state.pvcheck={};state.results=null;H("#resbox","");renderPreview()}
   catch(e){toast(e.message)}finally{const bb=$("#pv");if(bb){bb.disabled=false;bb.textContent="解析预览"}}
 }
@@ -376,7 +377,7 @@ async function doCreate(){
   if(!confirm(`${badN?`⚠ 有 ${badN} 条落地检测不通，仍会一起处理。\n\n`:""}${lines.join("\n")}\n\n完成后会重启 s-ui 让路由生效，所有线路约断 3 秒。确定？`))return;
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 处理中…';
   try{let results=[],core="ok",poolAdded=0;
-    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"});results=results.concat(r.results);core=r.core;poolAdded=r.pool_added||0}
+    if(items.length){const r=await api("create",{items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,speed_mbps:parseFloat($("#qspd").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"});results=results.concat(r.results);core=r.core;poolAdded=r.pool_added||0}
     let skipped=0;
     if(attach.length){const r=await api("add_protocol",{tags:attach,protocols:protos});skipped=r.results.filter(z=>z.skipped).length;results=results.concat(r.results.filter(z=>!z.skipped));if(r.core!=="ok")core=r.core}
     state.results=results;const ok=results.filter(x=>x.ok).length;
@@ -393,7 +394,7 @@ async function doTwinCreate(){
   const srvs=[state.srv||"local",...state.twinSel],names=srvs.map(id=>id==="local"?((state.local||{}).public_host||"本机"):((state.servers.find(s=>s.id===id)||{}).name||id));
   if(!confirm(`双中转：在 ${names.join("、")} 上各新建 ${items.length} 条线路 × ${protos.length} 种协议。\n（已有线路的落地也会新建，不会挂到原线路上）\n\n每台完成后会重启 s-ui，约断 3 秒。确定？`))return;
   const b=$("#mk");b.disabled=true;b.innerHTML='<span class="spin"></span> 正在几台服务器上创建…';
-  try{const r=await api("twin_create",{servers:srvs,items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"},{local:true});
+  try{const r=await api("twin_create",{servers:srvs,items,protocols:protos,expiry,customer:$("#cust").value.trim(),quota_gb:parseFloat($("#qgb").value||"0")||0,devices:parseInt($("#qdev").value||"0")||0,speed_mbps:parseFloat($("#qspd").value||"0")||0,to_pool:LS.get("rh_topool")!=="0",auto_switch:LS.get("rh_newauto")==="1"&&curMode()!=="direct"},{local:true});
     state.results=r.results;const ok=r.results.filter(x=>x.ok).length;
     state.preview=null;H("#pvbox","");state.text="";const tx=$("#txt");if(tx)tx.value="";
     toast(`成功 ${ok} 个节点，组成 ${r.groups} 条双中转线路${ok<r.results.length?`，失败 ${r.results.length-ok} 个`:""}${coreMsg(r.core)}。去「线路管理」点「订阅」把订阅链接发给客户`,8000);
@@ -420,7 +421,7 @@ const fmtB=b=>{b=b||0;const u=["B","KB","MB","GB","TB"];let i=0;while(b>=1024&&i
 const okeyOf=r=>r.outbound_tag||("#"+r.tag);
 function trafficCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},used=g.reduce((s,r)=>s+(r.up||0)+(r.down||0),0),q=(L.quota_gb||0)*1073741824;
   const pct=q?Math.min(100,used/q*100):0,col=L.over||pct>=100?"var(--bad)":pct>=80?"var(--warn)":"var(--ok)";
-  return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}`}
+  return `<div class="mono" style="font-size:12px">${fmtB(used)}${q?` / ${fmtB(q)}`:""}</div>${q?`<div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`:'<div class="sib">不限</div>'}${L.over?'<span class="tag bad">超流量</span>':""}${L.speed_mbps&&g.some(r=>!r.shared)?`<div class="sib" title="上传、下载都限 ${L.speed_mbps} Mbps（VLESS-443 共用节点不限）">限速 ${L.speed_mbps}M</div>`:""}`}
 function deviceCell(g){const k=okeyOf(g[0]),L=(state.limits||{})[k]||{},O=(state.online||{})[k]||{},n=(O.active||[]).length,lim=L.devices||0;
   const tip=(O.active||[]).map(ip=>ip+((O.rejected||[]).includes(ip)?"（被拒）":"")).join("\n");
   const nb=Object.keys(O.banned||{}).length;
@@ -643,15 +644,16 @@ function renderBackup(){
 }
 
 /* ---------------- 线路管理 ---------------- */
-async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv=srv;state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.twin=r.twin||{};state.fwerr=r.fw_error||"";$("#hostinfo").textContent=r.public_host;drawSecure()}
+async function loadRelays(){const srv=state.srv,r=await api("list");state.relSrv=srv;state.relays=r.relays;state.host=r.public_host;state.unprot=r.unprotected||[];state.limits=r.limits||{};state.online=r.online||{};state.health=r.health||{};state.fo=r.failover||{};state.pauto=new Set(r.pool_auto||[]);state.twin=r.twin||{};state.fwerr=r.fw_error||"";state.spd=r.speed||{};$("#hostinfo").textContent=r.public_host;drawSecure()}
 function drawSecure(){
   const n=(state.unprot||[]).length;
   const fw=state.fwerr?`<div class="warnbox"><b>⚠ 防火墙不可用</b><div>${esc(state.fwerr)}</div></div>`:"";
+  const sp=state.spd||{};const fw2=sp.error?`<div class="warnbox"><b>⚠ 限速没有生效</b><div>${esc(sp.error)}</div></div>`:"";
   const tw=Object.values(state.twin||{}).filter(t=>t.main&&!t.is_main),local=(state.srv||"local")==="local";
   const twb=tw.length&&local?`<div class="warnbox"><b>⚠ 这台有 ${tw.length} 条双中转线路，主控是「${esc(tw[0].main)}」</b>
    <div>在这里直接续期、停用、删除、改限额等<b>不会同步</b>到另一台。请到主控面板操作（顶部下拉选这台服务器）：<a href="${esc(tw[0].main_url)}" target="_blank" rel="noopener">${esc(tw[0].main_url)}</a></div>
    <div class="hint">换落地、落地自动切换在哪台做都会同步（主控约 20 秒内对齐）。主控连不上时才在这里应急操作，恢复后在主控上补一遍。</div></div>`:"";
-  H("#secbox",twb+fw+(n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
+  H("#secbox",twb+fw+fw2+(n?`<div class="warnbox"><b>⚠ 安全提醒：${n} 个中转节点缺少兜底规则</b>
   <div>节点停用或过期后，SOCKS5 入站会变成免密码，任何人都能连上并从<b>中转机自己的 IP</b> 直接出网。补上规则后，停用/过期的节点会直接连不上。</div>
   <div class="hint" style="margin:6px 0">${(state.unprot||[]).slice(0,8).map(esc).join("、")}${n>8?` 等 ${n} 个`:""}</div>
   <button class="pri sm" id="secfix">一键修复（会重启 s-ui，约 3 秒断线）</button></div>`:""));
@@ -1232,7 +1234,8 @@ function copyDlg(tag){
   <div class="protos" id="cpp" style="margin:6px 0"><b style="margin-right:6px">协议</b>${opt.map(([v,l])=>`<label class="ck"><input type="checkbox" value="${v}" ${types.has(v)?"checked":""}>${l}</label>`).join("")}</div>
   <div class="row"><label>到期<input id="cpe" type="datetime-local" value="${dv}" ${exp?"":"disabled"}></label><label class="ck"><input type="checkbox" id="cpf" ${exp?"":"checked"}>永久</label>
    <label>流量上限 GB（0=不限）<input id="cpq" type="number" min="0" value="${L.quota_gb||0}" style="width:110px"></label>
-   <label>设备数（0=不限）<input id="cpd" type="number" min="0" value="${L.devices||0}" style="width:100px"></label></div>
+   <label>设备数（0=不限）<input id="cpd" type="number" min="0" value="${L.devices||0}" style="width:100px"></label>
+   <label>限速 Mbps（0=不限）<input id="cps2" type="number" min="0" value="${L.speed_mbps||0}" style="width:110px"></label></div>
   <label class="ck" style="margin-top:10px"><input type="checkbox" id="cpm" checked><b>和这条线路合并成${tw?"多":"双"}中转</b></label>
   <p class="hint" style="margin:4px 0 0 24px">合并后客户<b>原来的订阅链接不变</b>，刷新一下就多出新服务器的节点（名字带中转名）；以后续期、停用、限额、换落地在主控操作会几台一起改。不合并就是各自独立的线路，各有各的订阅。</p>
   <p class="hint">默认值都是照原线路填的；每台服务器各自重启一次 s-ui（约 3 秒断线）。</p>
@@ -1244,7 +1247,7 @@ function copyDlg(tag){
     const protos=selProtos("#cpp");if(!protos.length)return toast("请至少选一个协议");
     let expiry=0;if(!$("#cpf").checked){if(!$("#cpe").value)return toast("请填写到期时间");expiry=Math.floor(new Date($("#cpe").value).getTime()/1000)}
     const merge=$("#cpm").checked;const b=$("#cpok");b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中…';
-    try{const x=await api("relay_copy",{srv:state.srv||"local",okey:k,servers:srvs,protocols:protos,expiry,quota_gb:parseFloat($("#cpq").value||"0")||0,devices:parseInt($("#cpd").value||"0")||0,merge},{local:true});
+    try{const x=await api("relay_copy",{srv:state.srv||"local",okey:k,servers:srvs,protocols:protos,expiry,quota_gb:parseFloat($("#cpq").value||"0")||0,devices:parseInt($("#cpd").value||"0")||0,speed_mbps:parseFloat($("#cps2").value||"0")||0,merge},{local:true});
       const ok=x.results.filter(z=>z.ok),bad=x.results.filter(z=>!z.ok);
       (x.notes||[]).forEach((n,i)=>setTimeout(()=>toast("⚠ "+n,7000),i*7000+5200));
       toast(`在 ${x.made} 台服务器上建好了 ${ok.length} 个节点${bad.length?`，失败 ${bad.length} 个`:""}${x.gid?"，已合并成"+(tw?"多":"双")+"中转":""}${coreMsg(x.core)}`,5000);
@@ -1273,13 +1276,15 @@ function limitDlg(tags){
   <p class="hint">按整条线路算：同一落地的几个协议节点流量合计、设备合计。流量用完整条线路自动停用；设备满了以后新设备连不上，旧设备断开约 3～4 分钟后释放名额。设备按客户的 IP 地址算，同一网络下的多台电脑算 1 台。</p>
   ${used!==null?`<p>当前已用：<b>${fmtB(used)}</b>${L.over?' <span class="tag bad">超流量，已停用</span>':""}</p>`:""}
   <div class="row"><label>流量上限 GB（0=不限）<input id="lq" type="number" min="0" step="1" value="${gs.length===1?(L.quota_gb||0):""}" placeholder="不修改" style="width:140px"></label>
-  <label>设备数（0=不限）<input id="ld" type="number" min="0" step="1" value="${gs.length===1?(L.devices||0):""}" placeholder="不修改" style="width:120px"></label></div>
+  <label>设备数（0=不限）<input id="ld" type="number" min="0" step="1" value="${gs.length===1?(L.devices||0):""}" placeholder="不修改" style="width:120px"></label>
+  <label>限速 Mbps（0=不限）<input id="lsp" type="number" min="0" step="1" value="${gs.length===1?(L.speed_mbps||0):""}" placeholder="不修改" style="width:130px"></label></div>
+  <p class="hint">限速：上传、下载都限这个速度。线路下每个协议节点各限这个速度，连同一个节点的几台设备一起分；VLESS-443 共用节点不限速。改限速不用重启，客户不断线。</p>
   <div class="row" style="margin-top:14px"><button class="pri" id="lok">保存</button><button id="lrst">流量清零</button><button id="lcl">取消</button></div>`);
   $("#lcl").onclick=closeModal;
   const tagsOf=()=>gs.map(g=>g[0].tag);
-  $("#lok").onclick=async()=>{const body={tags:tagsOf()};if($("#lq").value!=="")body.quota_gb=parseFloat($("#lq").value)||0;if($("#ld").value!=="")body.devices=parseInt($("#ld").value)||0;
-    if(!("quota_gb" in body)&&!("devices" in body))return toast("没有要修改的");
-    try{await api("set_limits",body);closeModal();toast("已保存限额");await loadRelays();drawTable()}catch(e){toast(e.message)}};
+  $("#lok").onclick=async()=>{const body={tags:tagsOf()};if($("#lq").value!=="")body.quota_gb=parseFloat($("#lq").value)||0;if($("#ld").value!=="")body.devices=parseInt($("#ld").value)||0;if($("#lsp").value!=="")body.speed_mbps=parseFloat($("#lsp").value)||0;
+    if(!("quota_gb" in body)&&!("devices" in body)&&!("speed_mbps" in body))return toast("没有要修改的");
+    try{const x=await api("set_limits",body);closeModal();if(x.speed&&!x.speed.ok&&x.speed.error)toast("限额已保存，但限速没生效："+x.speed.error,9000);else toast("已保存限额");await loadRelays();drawTable()}catch(e){toast(e.message)}};
   $("#lrst").onclick=async()=>{if(!confirm(`把 ${gs.length} 条线路的已用流量清零？超流量停用的会自动恢复（未过期的）。`))return;
     try{await api("reset_traffic",{tags:tagsOf()});closeModal();toast("已清零流量");await loadRelays();drawTable()}catch(e){toast(e.message)}};
 }
