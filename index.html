@@ -285,7 +285,7 @@ function renderCreate(){
     <label id="cdl" style="display:none">到期日期 <input id="cdate" type="datetime-local"></label>
     <label>流量上限 GB（0=不限）<input id="qgb" type="number" min="0" step="1" value="${esc(saved.qgb??0)}" style="width:120px"></label>
     <label>设备数（0=不限）<input id="qdev" type="number" min="0" step="1" value="${esc(saved.qdev??0)}" style="width:110px"></label>
-    <label title="上传、下载都限这个速度；每个协议节点各限这个速度，连同一节点的几台设备一起分；VLESS-443 共用节点不限速">限速 Mbps（0=不限）<input id="qspd" type="number" min="0" step="1" value="${esc(saved.qspd??0)}" style="width:110px"></label>
+    <label title="上传、下载都限这个速度；按整条线路算，几个协议、几台设备一起分；VLESS-443 共用节点不限速">限速 Mbps（0=不限）<input id="qspd" type="number" min="0" step="1" value="${esc(saved.qspd??0)}" style="width:110px"></label>
   </div>
   <div id="dcnt" class="row" style="margin-top:12px;display:none"><label>创建几条直连线路<input id="dn" type="number" min="1" max="100" value="1" style="width:110px"></label>
     <span class="hint">每条线路单独计流量、设备和到期；出口 IP 都是本服务器（${esc(state.host||"")}）。</span></div>
@@ -1278,7 +1278,7 @@ function limitDlg(tags){
   <div class="row"><label>流量上限 GB（0=不限）<input id="lq" type="number" min="0" step="1" value="${gs.length===1?(L.quota_gb||0):""}" placeholder="不修改" style="width:140px"></label>
   <label>设备数（0=不限）<input id="ld" type="number" min="0" step="1" value="${gs.length===1?(L.devices||0):""}" placeholder="不修改" style="width:120px"></label>
   <label>限速 Mbps（0=不限）<input id="lsp" type="number" min="0" step="1" value="${gs.length===1?(L.speed_mbps||0):""}" placeholder="不修改" style="width:130px"></label></div>
-  <p class="hint">限速：上传、下载都限这个速度。线路下每个协议节点各限这个速度，连同一个节点的几台设备一起分；VLESS-443 共用节点不限速。改限速不用重启，客户不断线。</p>
+  <p class="hint">限速：上传、下载都限这个速度。按整条线路算（几个协议节点、几台设备一起分这个速度）；VLESS-443 共用节点不限速。改限速不用重启，客户不断线。</p>
   <div class="row" style="margin-top:14px"><button class="pri" id="lok">保存</button><button id="lrst">流量清零</button><button id="lcl">取消</button></div>`);
   $("#lcl").onclick=closeModal;
   const tagsOf=()=>gs.map(g=>g[0].tag);

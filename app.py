@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.22.0"
+VERSION = "1.22.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -2908,9 +2908,11 @@ def op_servers_overview(body):
 
 
 # ------------------------------------------------------------- 限速 --
-# 每条线路有自己的端口，按端口用 Linux tc 限速（443 共用端口不限）。
-# 用 clsact 钩子 + police：不替换网卡原来的队列，没设限速的流量完全不经过这些规则；全部删掉就是 `tc qdisc del dev 网卡 clsact`。
-#   发给客户（下载）：egress 上 源端口 = 线路端口；客户发来（上传）：ingress 上 目的端口 = 线路端口。上传、下载用同一个数。
+# 每条线路有自己的端口，按端口用 Linux tc 限速（443 共用端口不限）。上传、下载用同一个数。
+#   发给客户（下载）：网卡出口换成 HTB 排队整形，每条线路一个类（线路下几个协议端口共用这一个速度），
+#     没设限速的流量走默认类（10Gbit，等于不限）。整形不丢包，高延迟线路也能跑满限速值。
+#   客户发来（上传）：clsact ingress 上按目的端口 police（超速丢包），桶给 1 秒的量，对 TCP 友好。
+#   全部删掉：`tc qdisc del dev 网卡 root` + `tc qdisc del dev 网卡 clsact`，网卡恢复系统默认队列。
 SPEED_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "speed-tc.json")
 SPEED_ST = {"ok": True, "error": "", "ports": 0, "devs": [], "applied": None}
 SPEED_LOCK = threading.Lock()
@@ -2940,7 +2942,7 @@ def _default_devs():
 
 
 def speed_wanted(data=None):
-    """端口 -> Mbps"""
+    """线路 key -> {"mb": Mbps, "ports": [端口...]}"""
     with LIM_LOCK:
         lim = {k: float(v.get("speed_mbps") or 0) for k, v in LIMITS.items() if v.get("speed_mbps")}
     if not lim:
@@ -2950,22 +2952,32 @@ def speed_wanted(data=None):
     for r in build_relays(data):
         if r.get("shared") or not r.get("port"):
             continue
-        mb = lim.get(okey_of(r))
-        if mb:
-            want[int(r["port"])] = mb
+        k = okey_of(r)
+        if lim.get(k):
+            w = want.setdefault(k, {"mb": lim[k], "ports": []})
+            if int(r["port"]) not in w["ports"]:
+                w["ports"].append(int(r["port"]))
     return want
 
 
 def speed_cmds(dev, want):
     """一个网卡要执行的 tc batch 命令（不含删除）。"""
-    out = ["qdisc add dev %s clsact" % dev]
-    for port, mb in sorted(want.items()):
-        rate = "%dkbit" % max(64, int(mb * 1000))
-        burst = "%dk" % max(64, int(mb * 1000 * 1000 / 8 * 0.2 / 1024))   # 约 200ms 的量
-        pol = "action police rate %s burst %s drop" % (rate, burst)
-        for hook, d in (("egress", "sport"), ("ingress", "dport")):
-            out.append("filter add dev %s %s protocol ip prio 10 u32 match ip %s %d 0xffff %s" % (dev, hook, d, port, pol))
-            out.append("filter add dev %s %s protocol ipv6 prio 11 u32 match ip6 %s %d 0xffff %s" % (dev, hook, d, port, pol))
+    out = ["qdisc replace dev %s root handle 7a: htb default ffff r2q 100" % dev,
+           "class add dev %s parent 7a: classid 7a:ffff htb rate 10gbit ceil 10gbit" % dev,
+           "qdisc add dev %s parent 7a:ffff handle 7b: fq_codel" % dev,
+           "qdisc add dev %s clsact" % dev]
+    for i, (k, w) in enumerate(sorted(want.items())):
+        cid = "7a:%x" % (16 + i)
+        kb = max(64, int(w["mb"] * 1000))
+        out.append("class add dev %s parent 7a: classid %s htb rate %dkbit ceil %dkbit" % (dev, cid, kb, kb))
+        out.append("qdisc add dev %s parent %s fq_codel" % (dev, cid))
+        burst = "%dk" % max(128, int(kb * 1000 / 8 / 1024))   # 上传 police 桶：约 1 秒的量
+        for port in sorted(w["ports"]):
+            out.append("filter add dev %s parent 7a: protocol ip prio 10 u32 match ip sport %d 0xffff flowid %s" % (dev, port, cid))
+            out.append("filter add dev %s parent 7a: protocol ipv6 prio 11 u32 match ip6 sport %d 0xffff flowid %s" % (dev, port, cid))
+            pol = "action police rate %dkbit burst %s drop" % (kb, burst)
+            out.append("filter add dev %s ingress protocol ip prio 10 u32 match ip dport %d 0xffff %s" % (dev, port, pol))
+            out.append("filter add dev %s ingress protocol ipv6 prio 11 u32 match ip6 dport %d 0xffff %s" % (dev, port, pol))
     return out
 
 
@@ -2985,6 +2997,14 @@ def _speed_save(st):
         pass
 
 
+def _speed_clear(dev):
+    rc, o = _tc(["qdisc", "show", "dev", dev])
+    if re.search(r"qdisc htb 7a: root", o):
+        _tc(["qdisc", "del", "dev", dev, "root"])
+    if "clsact" in o:
+        _tc(["qdisc", "del", "dev", dev, "clsact"])
+
+
 def speed_apply(force=False):
     """按 LIMITS 里的 speed_mbps 重建 tc 规则；没变化就什么都不做。"""
     with SPEED_LOCK:
@@ -2998,37 +3018,37 @@ def speed_apply(force=False):
                              "ports": 0, "applied": None})
             return SPEED_ST
         devs = _default_devs() if want else []
-        key = json.dumps([sorted(want.items()), devs])
+        key = json.dumps([sorted((k, w["mb"], sorted(w["ports"])) for k, w in want.items()), devs])
         if not force and SPEED_ST.get("applied") == key and SPEED_ST.get("ok"):
             return SPEED_ST
         old = _speed_load()
         errs = []
-        for dev in sorted(set(old.get("devs") or []) | set(devs)):
-            if dev in (old.get("devs") or []):
-                _tc(["qdisc", "del", "dev", dev, "clsact"])
-            elif dev in devs:
+        for dev in sorted(set(old.get("devs") or []) - set(devs)):
+            _speed_clear(dev)
+        for dev in list(devs):
+            if dev not in (old.get("devs") or []):
                 rc, o = _tc(["qdisc", "show", "dev", dev])
                 if "clsact" in o:
                     errs.append("网卡 %s 上已经有别的程序设的 clsact 规则，没有动它" % dev)
                     devs.remove(dev)
         mine = []
+        nports = sum(len(w["ports"]) for w in want.values())
         for dev in devs:
-            cmds = speed_cmds(dev, want)
-            rc, o = _tc(["-batch", "-"], "\n".join(cmds) + "\n")
-            mine.append(dev)
+            _speed_clear(dev)
+            rc, o = _tc(["-batch", "-"], "\n".join(speed_cmds(dev, want)) + "\n")
             if rc != 0:
                 errs.append("%s：%s" % (dev, o.strip()[-300:]))
-                _tc(["qdisc", "del", "dev", dev, "clsact"])   # 失败就整个撤掉，不留半套规则
-                mine.remove(dev)
+                _speed_clear(dev)   # 失败就整个撤掉，不留半套规则
                 continue
-            rc, o = _tc(["filter", "show", "dev", dev, "egress"])
+            mine.append(dev)
+            rc, o = _tc(["filter", "show", "dev", dev, "ingress"])
             n = o.count("police")
-            if n < len(want) * 2:
-                errs.append("%s：规则数量不对（%d/%d）" % (dev, n, len(want) * 2))
+            if n < nports * 2:
+                errs.append("%s：上传规则数量不对（%d/%d）" % (dev, n, nports * 2))
         _speed_save({"devs": mine})
         if want and not devs and not errs:
             errs.append("找不到默认网卡")
-        SPEED_ST.update({"ok": not errs, "error": "；".join(errs), "ports": len(want) if mine else 0, "devs": mine,
+        SPEED_ST.update({"ok": not errs, "error": "；".join(errs), "ports": nports if mine else 0, "devs": mine,
                          "applied": key if not errs else None})
         if errs:
             sys.stderr.write("speed: %s\n" % SPEED_ST["error"])
