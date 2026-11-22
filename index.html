@@ -1278,7 +1278,7 @@ function limitDlg(tags){
   <div class="row"><label>流量上限 GB（0=不限）<input id="lq" type="number" min="0" step="1" value="${gs.length===1?(L.quota_gb||0):""}" placeholder="不修改" style="width:140px"></label>
   <label>设备数（0=不限）<input id="ld" type="number" min="0" step="1" value="${gs.length===1?(L.devices||0):""}" placeholder="不修改" style="width:120px"></label>
   <label>限速 Mbps（0=不限）<input id="lsp" type="number" min="0" step="1" value="${gs.length===1?(L.speed_mbps||0):""}" placeholder="不修改" style="width:130px"></label></div>
-  <p class="hint">限速：上传、下载都限这个速度。按整条线路算（几个协议节点、几台设备一起分这个速度）；VLESS-443 共用节点不限速。改限速不用重启，客户不断线。</p>
+  <p class="hint">限速：上传、下载都限这个速度。按整条线路算（几个协议节点、几台设备一起分这个速度）；VLESS-443 共用节点不限速。VLESS/SOCKS 改限速不断线；Hysteria2 节点会重连一下（约 3 秒）。</p>
   <div class="row" style="margin-top:14px"><button class="pri" id="lok">保存</button><button id="lrst">流量清零</button><button id="lcl">取消</button></div>`);
   $("#lcl").onclick=closeModal;
   const tagsOf=()=>gs.map(g=>g[0].tag);

@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.22.2"
+VERSION = "1.22.3"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -934,6 +934,7 @@ def op_create(body):
         raise SuiError("没有可创建的线路")
     if not protos:
         raise SuiError("请至少选择一个入站协议")
+    spd, lim_keys = 0, []
     with LOCK:
         data = SUI.load_all()
         tls, taken_names, taken_ports = _prepare(data, protos)
@@ -975,8 +976,14 @@ def op_create(body):
                 m["item"] = idx
             results.extend(made)
         core = _apply_rules(results, new_outbounds)
-        init_group_limits([o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)],
-                          body.get("quota_gb"), body.get("devices"), body.get("speed_mbps"))
+        lim_keys = [o for o in new_outbounds if any(r.get("ok") and r.get("outbound") == o for r in results)]
+        spd = init_group_limits(lim_keys, body.get("quota_gb"), body.get("devices"), body.get("speed_mbps"))
+    if spd:   # 出了 LOCK 再弄（hy2_speed_sync 自己要拿 LOCK）
+        try:
+            hy2_speed_sync(set(lim_keys))
+        except Exception as e:
+            sys.stderr.write("hy2 speed: %s\n" % e)
+        speed_apply()
     for r in results:
         if r.get("ok") and r.get("client_id"):
             r["links"] = client_links(r["client_id"])
@@ -1910,6 +1917,10 @@ def op_set_limits(body):
         save_limits()
     _reenable(reenable, groups)
     if "speed_mbps" in body:
+        try:
+            hy2_speed_sync(keys)
+        except Exception as e:
+            sys.stderr.write("hy2 speed: %s\n" % e)
         speed_apply()
     return {"updated": len(keys), "speed": dict(SPEED_ST)}
 
@@ -1956,8 +1967,7 @@ def init_group_limits(okeys, quota_gb, devices, speed_mbps=0):
             if speed_mbps:
                 LIMITS[k]["speed_mbps"] = speed_mbps
         save_limits()
-    if speed_mbps:
-        speed_apply()
+    return speed_mbps
 
 
 def drop_group_limits(okeys):
@@ -2954,9 +2964,11 @@ def speed_wanted(data=None):
             continue
         k = okey_of(r)
         if lim.get(k):
-            w = want.setdefault(k, {"mb": lim[k], "ports": []})
+            w = want.setdefault(k, {"mb": lim[k], "ports": [], "hy2": []})
             if int(r["port"]) not in w["ports"]:
                 w["ports"].append(int(r["port"]))
+            if r.get("type") == "hysteria2" and int(r["port"]) not in w["hy2"]:
+                w["hy2"].append(int(r["port"]))
     return want
 
 
@@ -2974,9 +2986,12 @@ def speed_cmds(dev, want):
         out.append("qdisc add dev %s parent %s bfifo limit %d" % (dev, cid, max(65536, int(kb * 1000 / 8 * 0.5))))
         burst = "%dk" % max(128, int(kb * 1000 / 8 / 1024))   # 上传 police 桶：约 1 秒的量
         for port in sorted(w["ports"]):
-            out.append("filter add dev %s parent 7a: protocol ip prio 10 u32 match ip sport %d 0xffff flowid %s" % (dev, port, cid))
-            out.append("filter add dev %s parent 7a: protocol ipv6 prio 11 u32 match ip6 sport %d 0xffff flowid %s" % (dev, port, cid))
-            pol = "action police rate %dkbit burst %s drop" % (kb, burst)
+            hy = port in (w.get("hy2") or [])
+            if not hy:   # Hysteria2 的下载由它自己的服务端限速（down/up_mbps）控制，排队整形反而会让它跑不满、忽快忽慢
+                out.append("filter add dev %s parent 7a: protocol ip prio 10 u32 match ip sport %d 0xffff flowid %s" % (dev, port, cid))
+                out.append("filter add dev %s parent 7a: protocol ipv6 prio 11 u32 match ip6 sport %d 0xffff flowid %s" % (dev, port, cid))
+            pkb = int(kb * 1.25) if hy else kb   # Hysteria2 客户端会按服务端给的速度发，这里只是兜底，放宽一点
+            pol = "action police rate %dkbit burst %s drop" % (pkb, burst)
             out.append("filter add dev %s ingress protocol ip prio 10 u32 match ip dport %d 0xffff %s" % (dev, port, pol))
             out.append("filter add dev %s ingress protocol ipv6 prio 11 u32 match ip6 dport %d 0xffff %s" % (dev, port, pol))
     return out
@@ -3019,7 +3034,7 @@ def speed_apply(force=False):
                              "ports": 0, "applied": None})
             return SPEED_ST
         devs = _default_devs() if want else []
-        key = json.dumps([sorted((k, w["mb"], sorted(w["ports"])) for k, w in want.items()), devs])
+        key = json.dumps([sorted((k, w["mb"], sorted(w["ports"]), sorted(w["hy2"])) for k, w in want.items()), devs])
         if not force and SPEED_ST.get("applied") == key and SPEED_ST.get("ok"):
             return SPEED_ST
         old = _speed_load()
@@ -3056,12 +3071,60 @@ def speed_apply(force=False):
         return SPEED_ST
 
 
+HY2_BW = {}   # 入站 id -> 已经设好的 Mbps（省得每分钟去读入站）
+
+
+def hy2_speed_sync(keys=None):
+    """Hysteria2 节点用它自带的服务端限速：入站 up_mbps/down_mbps = 限速值（不再忽略客户端带宽）；
+    客户端会按这个速度收发，速度稳。不限速时恢复成 ignore_client_bandwidth（BBR）。改入站会让 s-ui 重启约 3 秒。
+    keys=None 只检查有限速的线路（后台用）；给了 keys 就检查这些线路（改限速时用）。"""
+    with LIM_LOCK:
+        lim = {k: max(1, int(round(float(v.get("speed_mbps") or 0)))) for k, v in LIMITS.items() if v.get("speed_mbps")}
+    if keys is None and not lim:
+        return 0
+    data = SUI.load_all()
+    n = 0
+    with LOCK:
+        seen = set()
+        for r in build_relays(data):
+            if r.get("type") != "hysteria2" or r.get("shared") or not r.get("inbound_id") or r["inbound_id"] in seen:
+                continue
+            k = okey_of(r)
+            if keys is not None and k not in keys:
+                continue
+            if keys is None and k not in lim:
+                continue
+            seen.add(r["inbound_id"])
+            mb = lim.get(k, 0)
+            if keys is None and HY2_BW.get(r["inbound_id"]) == mb:
+                continue
+            try:
+                inb = full_inbound(r["inbound_id"])
+                cur = (int(inb.get("up_mbps") or 0), int(inb.get("down_mbps") or 0), bool(inb.get("ignore_client_bandwidth")))
+                if cur != ((mb, mb, False) if mb else (0, 0, True)):
+                    if mb:
+                        inb["up_mbps"] = inb["down_mbps"] = mb
+                        inb["ignore_client_bandwidth"] = False
+                    else:
+                        inb.pop("up_mbps", None)
+                        inb.pop("down_mbps", None)
+                        inb["ignore_client_bandwidth"] = True
+                    SUI.save("inbounds", "edit", inb)
+                    n += 1
+                HY2_BW[r["inbound_id"]] = mb
+            except Exception as e:
+                sys.stderr.write("hy2 speed %s: %s\n" % (r.get("tag"), e))
+    return n
+
+
 def speed_loop():
     time.sleep(15)
     n = 0
     while True:
         try:
             speed_apply(force=(n == 0))   # 启动后第一次强制重建（服务器重启后 tc 规则会丢）
+            if n % 5 == 0:
+                hy2_speed_sync()          # 有限速的线路新加了 Hysteria2 节点时补上
         except Exception as e:
             sys.stderr.write("speed: %s\n" % e)
         n += 1
