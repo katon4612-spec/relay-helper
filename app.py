@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.22.4"
+VERSION = "1.23.0"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -831,13 +831,9 @@ def _prepare(data, protos):
     tls = {}
     for proto in protos:
         if proto in ("vless", "vless443"):
-            tls[proto] = find_tls(data, "reality")
-            if not tls[proto]:
-                raise SuiError("s-ui 里没有 Reality 配置。请先在面板「TLS 设置」里添加一个 reality 类型的配置")
+            tls[proto] = find_tls(data, "reality") or auto_tls("reality")   # 新服务器没有就自动生成
         elif proto == "hysteria2":
-            tls[proto] = find_tls(data, "cert")
-            if not tls[proto]:
-                raise SuiError("s-ui 里没有证书类 TLS 配置（hysteria2 需要）。请先在面板「TLS 设置」里添加")
+            tls[proto] = find_tls(data, "cert") or auto_tls("cert")
         elif proto == "socks":
             tls[proto] = 0
         else:
@@ -4964,6 +4960,70 @@ def op_gateway_check(body):
             "running": GW["running"]}
 
 
+def _save_tls(tls):
+    SUI.save("tls", "new", tls)
+    tid = next((t["id"] for t in SUI.load_all().get("tls") or [] if t.get("name") == tls["name"]), None)
+    if not tid:
+        raise SuiError("创建 TLS 配置「%s」失败" % tls["name"])
+    return tid
+
+
+def auto_tls(kind):
+    """新服务器 s-ui 里还没有 TLS 配置时自动建：
+    reality：随机生成密钥对和 short_id，伪装站 www.apple.com；
+    cert（Hysteria2 用）：有正规证书（https.sh 申请的）就直接用证书文件，否则生成 10 年自签名证书（客户端跳过证书校验）。"""
+    if kind == "reality":
+        k = bytearray(secrets.token_bytes(32))
+        k[0] &= 248
+        k[31] &= 127
+        k[31] |= 64
+        priv = base64.urlsafe_b64encode(bytes(k)).decode().rstrip("=")
+        return _save_tls({"name": "自动-reality",
+                          "server": {"enabled": True, "server_name": "www.apple.com",
+                                     "reality": {"enabled": True, "handshake": {"server": "www.apple.com", "server_port": 443},
+                                                 "private_key": priv, "short_id": [secrets.token_hex(4)]}},
+                          "client": {"reality": {"public_key": x25519_pub(priv)}, "utls": {"enabled": True, "fingerprint": "chrome"}}})
+    host = CFG.get("public_host") or ""
+    if cert_status().get("mode") == "ok" and CFG.get("key_file"):
+        return _save_tls({"name": "自动-证书", "server": {"enabled": True, "server_name": host,
+                                                        "certificate_path": CFG["cert_file"], "key_path": CFG["key_file"]},
+                          "client": {"server_name": host}})
+    td = tempfile.mkdtemp(prefix="rh-tls-")
+    try:
+        kf, cf = os.path.join(td, "k.pem"), os.path.join(td, "c.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", "/CN=" + (host or "localhost"),
+                        "-keyout", kf, "-out", cf], capture_output=True, timeout=60, check=True)
+        key = open(kf).read().strip().splitlines()
+        cert = open(cf).read().strip().splitlines()
+    except Exception as e:
+        raise SuiError("生成 Hysteria2 证书失败：%s" % e)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return _save_tls({"name": "自动-自签证书", "server": {"enabled": True, "certificate": cert, "key": key},
+                      "client": {"insecure": True}})
+
+
+def tls_bootstrap():
+    """启动后：s-ui 里缺 Reality / 证书配置就先建好，新服务器装完直接能用。"""
+    for _ in range(60):
+        try:
+            with LOCK:
+                data = SUI.load_all()
+                made = []
+                if not find_tls(data, "reality"):
+                    auto_tls("reality")
+                    made.append("reality")
+                if not find_tls(data, "cert"):
+                    auto_tls("cert")
+                    made.append("cert")
+            if made:
+                sys.stderr.write("tls bootstrap: created %s\n" % ",".join(made))
+            return
+        except Exception as e:
+            sys.stderr.write("tls bootstrap: %s\n" % e)
+            time.sleep(10)
+
+
 def _gw_reality_tls(data, r):
     """用旧网关的 Reality 密钥建（或找到已有的）s-ui TLS 配置，返回 id。"""
     pk = r.get("private_key")
@@ -5421,6 +5481,7 @@ def main():
     threading.Thread(target=twin_loop, daemon=True).start()
     threading.Thread(target=pool_share_loop, daemon=True).start()
     threading.Thread(target=speed_loop, daemon=True).start()
+    threading.Thread(target=tls_bootstrap, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()

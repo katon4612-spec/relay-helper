@@ -1,6 +1,10 @@
 {
- "version": "1.22.4",
+ "version": "1.23.0",
  "changes": [
+  {
+   "version": "1.23.0",
+   "notes": "新服务器自动生成 TLS：s-ui 里没有 Reality 配置就自动生成密钥对；没有证书配置就自动建（有正规证书直接用，没有就生成自签名证书），装完直接能建 VLESS-Reality 和 Hysteria2"
+  },
   {
    "version": "1.22.4",
    "notes": "限速补偿协议开销：客户测速更接近填的数（Hysteria2 补约 17%，VLESS/SOCKS 补约 6%）；已设限速的线路更新后自动生效"

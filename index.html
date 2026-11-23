@@ -1334,7 +1334,7 @@ async function delTags(tags){
 async function init(){
   shell();await loadServers();
   try{const s=await api("status");state.host=s.public_host;state.ver=s.version;$("#hostinfo").textContent=s.public_host;
-    if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，VLESS-Reality 入站暂时不能用",6000);
+    if(!s.reality_tls)toast("提示：s-ui 里还没有 Reality 配置，创建 VLESS 线路时会自动生成",6000);
     if((s.unprotected||[]).length){state.tab="manage";setTimeout(()=>toast(`⚠ ${s.unprotected.length} 个节点有安全风险，见页面顶部提醒`,6000),300)}}catch(e){return}
   let au="";try{au=sessionStorage.getItem("rh_after_upd")||"";sessionStorage.removeItem("rh_after_upd")}catch(e){}
   if(au){const[v,t]=au.split("|");state.tab=t||"settings";setTimeout(()=>toast(`已更新到 v${v}`,5000),300)}
