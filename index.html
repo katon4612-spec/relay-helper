@@ -819,12 +819,17 @@ async function poolSection(tag){
   box.innerHTML=`<b>从落地库换</b> <span class="hint">当前：${esc(c.addr)}　${esc(c.country||"国家未知")}　网段 ${esc(c.net||"-")}${c.in_pool?"":"（不在落地库里）"}</span>
   <div class="row" style="margin-top:8px;align-items:center"><button class="pri sm" id="pauto1">自动挑一个能通的换上</button>
   <label class="ck"><input type="checkbox" id="pautochk" ${x.auto?"checked":""} ${x.has_failover?"disabled":""}>落地不通时自动从库里换${x.has_failover?"（已设备用落地，由备用落地负责）":""}</label></div>
-  <p class="hint">只在<b>同国家</b>的落地里挑，<b>同网段优先</b>，再看最近检测能通、在用线路少的（落地可以多条线路共用）；换之前会先检测，不通的会跳过。客户链接不变。</p>
-  ${x.candidates.length?`<table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th><th></th></tr>${x.candidates.slice(0,8).map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
+  <p class="hint">只在<b>同国家</b>的落地里挑：<b>能通的排前面</b>，能通的里面同网段优先、在用线路少的优先（落地可以多条线路共用）；换之前会先检测，不通的跳过、继续往下找。客户链接不变。共 ${x.total||x.candidates.length} 个候选。
+  <button class="sm" id="precheck">重新检测这些</button></p>
+  ${x.candidates.length?`<div style="max-height:52vh;overflow:auto"><table style="margin-top:6px"><tr><th>候选落地</th><th>网段</th><th>检测</th><th>使用</th><th>到期</th><th></th></tr>${x.candidates.map(it=>`<tr><td class="mono">${esc(it.host)}:${esc(it.port)}</td>
     <td class="mono">${esc(it.net||"-")}${it.net&&it.net===c.net?' <span class="tag ok">同网段</span>':""}</td><td>${chkTag(it.check)}</td><td>${useTag(it)}</td><td>${it.expire?esc(fmtD(it.expire)):'<span class="muted">-</span>'}</td>
-    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table>`:`<p class="hint">落地库里没有别的${esc(c.country||"国家未知的")}落地，可以到「落地库」页导入（国家识别不出来时可以在落地库里手动填）。</p>`}
+    <td><button class="sm" data-use="${esc(it.id)}">换这个</button></td></tr>`).join("")}</table></div>`:`<p class="hint">落地库里没有别的${esc(c.country||"国家未知的")}落地，可以到「落地库」页导入（国家识别不出来时可以在落地库里手动填）。</p>`}
   <p id="pmsg"></p>`;
   const done=async(p)=>{const r=await p;state.checks[tag]=r.check;H("#pmsg",`<span class="tag ${r.check&&r.check.ok?"ok":"bad"}">已换成 ${esc(r.to)}（${esc(r.country||"")} ${esc(r.net||"")}）${r.check&&r.check.ok?"，连通 "+r.check.delay+"ms":"，但检测不通"}</span>${r.same_net?' <span class="tag ok">同网段</span>':""}`);await loadRelays();drawTable();setTimeout(()=>{if($("#poolbox"))replaceDlg(tag)},1800)};
+  const rc=$("#precheck");if(rc)rc.onclick=async()=>{rc.disabled=true;rc.innerHTML='<span class="spin"></span> 检测中…';
+    try{await api("pool_check",{ids:x.candidates.slice(0,60).map(it=>it.id)});poolSection(tag)}catch(e){toast(e.message);rc.disabled=false;rc.textContent="重新检测这些"}};
+  const stale=x.candidates.slice(0,20).some(it=>!it.check||Date.now()/1000-(it.check.ts||0)>3600);
+  if(stale&&!state["pstale_"+tag]){state["pstale_"+tag]=1;api("pool_check",{ids:x.candidates.slice(0,20).map(it=>it.id)}).then(()=>{if($("#poolbox"))poolSection(tag)}).catch(()=>{})}
   $("#pauto1").onclick=async()=>{const b=$("#pauto1");b.disabled=true;b.innerHTML='<span class="spin"></span> 检测并更换中…';try{await done(api("pool_switch",{tag}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`);b.disabled=false;b.textContent="自动挑一个能通的换上"}};
   document.querySelectorAll("#poolbox [data-use]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.innerHTML='<span class="spin"></span>';try{await done(api("pool_switch",{tag,id:b.dataset.use}))}catch(e){H("#pmsg",`<span class="err">${esc(e.message)}</span>`)}});
   $("#pautochk").onchange=async()=>{try{await api("pool_auto",{tags:[tag],on:$("#pautochk").checked});toast($("#pautochk").checked?"已开启：落地不通时自动从落地库换":"已关闭自动换");await loadRelays();drawTable()}catch(e){toast(e.message)}};

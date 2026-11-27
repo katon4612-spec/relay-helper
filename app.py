@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import qrencoder  # noqa: E402  (vendored, MIT)
 
 CONFIG_PATH = os.environ.get("RELAY_HELPER_CONFIG", os.path.join(HERE, "config.json"))
-VERSION = "1.23.0"
+VERSION = "1.23.1"
 
 DEFAULTS = {
     "listen": "0.0.0.0",
@@ -3340,6 +3340,19 @@ BG_CHECK = {"running": False, "done": 0, "total": 0}
 BG_CHECK_LOCK = threading.Lock()
 
 
+POOL_RECHECK_SEC = 6 * 3600   # 落地库检测结果超过 6 小时就重新测（后台慢慢测，不影响别的操作）
+
+
+def pool_recheck_loop():
+    time.sleep(120)
+    while True:
+        try:
+            pool_bg_check()
+        except Exception as e:
+            sys.stderr.write("pool recheck: %s\n" % e)
+        time.sleep(1800)
+
+
 def pool_bg_check():
     """后台检测落地库里还没检测过的落地（从别的服务器复制过来、导入 .json、新建线路自动入库之后）。"""
     if not BG_CHECK_LOCK.acquire(blocking=False):
@@ -3349,7 +3362,9 @@ def pool_bg_check():
         tried = set()
         while True:
             with POOL_LOCK:
-                todo = [dict(it) for it in POOL["items"] if not it.get("check") and it["id"] not in tried and not it.get("disabled")]
+                old = time.time() - POOL_RECHECK_SEC
+                todo = [dict(it) for it in POOL["items"] if it["id"] not in tried and not it.get("disabled")
+                        and (not it.get("check") or (it["check"].get("ts") or 0) < old)]
             if not todo:
                 break
             BG_CHECK["total"] = BG_CHECK["done"] + len(todo)
@@ -3414,10 +3429,11 @@ def _candidates(cur, use, country=None):
         if it.get("id") == cur.get("rec_id"):
             continue
         c = it.get("check") or {}
-        recent_fail = bool(c) and not c.get("ok") and now - (c.get("ts") or 0) < 600
         same_net = bool(cur.get("net")) and it.get("net") == cur["net"]
         n_use = len([u for u in use.get(landing_key(it["ob"]), []) if not u.endswith("（备用）")])
-        score = (not same_net, recent_fail, not c.get("ok"), n_use, c.get("delay") or 99999)
+        st = 0 if c.get("ok") else (1 if not c else 2)   # 能通 → 没检测过 → 检测不通
+        # 先看能不能用，能用的里面再同网段优先：不能让一堆不通的同网段落地把别的能用的挤到后面
+        score = (st, not same_net, n_use, c.get("delay") or 99999)
         out.append((score, it))
     out.sort(key=lambda x: x[0])
     return [it for _, it in out]
@@ -3436,7 +3452,7 @@ def op_pool_candidates(body):
         auto = bool(POOL["auto"].get(k))
     return {"current": {"addr": cur["addr"], "country": cur["country"], "net": cur["net"], "in_pool": bool(cur["rec_id"])},
             "auto": auto, "has_failover": k in FO, "countries": countries,
-            "candidates": [_rec_public(it, use, now) for it in cands[:30]]}
+            "total": len(cands), "candidates": [_rec_public(it, use, now) for it in cands[:200]]}
 
 
 def _switch_to(row, it, reason):
@@ -3468,8 +3484,8 @@ def op_pool_switch(body):
 
 def _pick_working(cur, use, country=None):
     cands = _candidates(cur, use, country)
-    for i in range(0, min(len(cands), 9), 3):  # 每次检测 3 个，最多 9 个
-        batch = cands[i:i + 3]
+    for i in range(0, min(len(cands), 40), 8):  # 每次检测 8 个，最多 40 个
+        batch = cands[i:i + 8]
         by = _pool_check_items(batch)
         for it in batch:
             if (by.get(it["id"]) or {}).get("ok"):
@@ -5482,6 +5498,7 @@ def main():
     threading.Thread(target=pool_share_loop, daemon=True).start()
     threading.Thread(target=speed_loop, daemon=True).start()
     threading.Thread(target=tls_bootstrap, daemon=True).start()
+    threading.Thread(target=pool_recheck_loop, daemon=True).start()
     if not CFG.get("api_token"):
         save_config({"api_token": secrets.token_urlsafe(24)})
     threading.Thread(target=monitor_loop, daemon=True).start()
